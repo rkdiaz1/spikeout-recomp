@@ -85,6 +85,13 @@ Spikeout is one player per cabinet; multiplayer means linked boards.
 - [ ] Linked boards (`LinkRing`) in a state; a recording that starts from a state
 - [x] F10 after a restart: the newest save in the saves folder (0.1.0-preview5.1, issue 27)
 - [ ] **Release 6:** F10 opens a list of saves to choose from, newest first (a page of the Esc menu; keyboard or pad). Each row: a small picture of the moment (F9 saves one beside the state), the stage (read from the game's memory when saving), time played, the date. Saves from another version marked and confirmed, damaged ones greyed out; the version and checksum checks as now; loading keeps the game left (F9 within 5 s goes back); delete asks first; not in network play. The state header gains the stage and time played (raise `kStateFormat`; older saves still load, shown with "—")
+- [ ] **Safe loading** (states come from files and from other players' computers in public rooms: a bad one must be refused, never read or write outside memory). Pull request 26 (2026-11-14) checks the 3D, SCSP, music board and EEPROM fields after loading, and fixes the 3D update buffer's endless walk and the sibling chain's recursion; to merge after its CI and our picture-hash proofs. On top of it, most useful first:
+  - [ ] A size limit on what a peer's packed state or other packet may unpack to: `net::decompress` takes up to 2 GB (a real state is ~27 MB), so a stranger can make a player's game run out of memory. Around 64 MB, smaller for the other packets
+  - [ ] States taken only when asked for and from the player expected to send them (the start state, resyncs, one-board shadows and backups: each path checked)
+  - [ ] A fuzz test: a real state with random bytes changed, loaded and run a few frames under AddressSanitizer and UBSan (Linux); finds what reading the code misses, across the whole state. Device-only states in CI (no ROM there), whole boards on this PC
+  - [ ] The devices pull request 26 leaves: the network board (its link ring and 68000), the tile generator, `TileSides`, the sound board's 68000, the serial ports, the RTC, JTAG. (`Context::resume_block` is safe already: an unknown address is refused, never jumped to)
+  - [ ] The SCSP's LFO switched on while a slot plays (the game writing PLFOS/ALFOS after key-on) reads a null table and crashes in live play too, not only from a state: set its tables up when the register is written, as Supermodel does
+  - [ ] State tests that find fields by name (a map of each field's place kept by `m3::State`), not by byte offsets that break whenever `kStateFormat` changes
 
 ## 7. Online play
 
