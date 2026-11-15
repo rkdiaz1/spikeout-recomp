@@ -4287,7 +4287,9 @@ int main(int argc, char** argv) {
             // (when: the file's time, as this computer's clock says; how long: the game's frames from its start, as run)
             std::string when;
             {
-                const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(info.when);
+                // (the file clock's time as the system clock's, by both clocks' now: Apple's library has no clock_cast)
+                const auto sys = std::chrono::system_clock::now() + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                                                         info.when - std::filesystem::file_time_type::clock::now());
                 const std::time_t t = std::chrono::system_clock::to_time_t(sys);
                 char text[64] = {};
                 if (const std::tm* tm = std::localtime(&t)) std::strftime(text, sizeof text, "%d %b %Y %H:%M", tm);
