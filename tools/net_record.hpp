@@ -116,4 +116,22 @@ inline void prune(const std::string& folder, std::size_t keep = kKeep) {
     }
 }
 
+// Tests: a network game started near a report's moment (the owner, 2026-11-14: "otherwise we spend too much time to
+// reach the fail point"), one code for gamerun and the window (gamerun --load-state / --net-history; the window's
+// SPIKEOUT_TEST_NET_STATE / SPIKEOUT_TEST_NET_HISTORY):
+// the build id with a starting state's file in it: machines started from different states can't join each other.
+inline uint64_t build_with_state(uint64_t build, std::span<const uint8_t> file_bytes) {
+    return (build ^ Recording::ram_hash(file_bytes)) * 0x100000001B3ull;
+}
+// and the input history a room had, every seat's frames from the recording's first up to `upto` (not included), as
+// net::Session::preload_history takes them: what a room that has played that long sends a player joining it.
+inline std::vector<std::vector<std::array<uint8_t, 4>>> history_frames(const Reader& rec, uint64_t upto, std::size_t seats) {
+    std::vector<std::vector<std::array<uint8_t, 4>>> frames(seats);
+    upto = std::min(upto, rec.end());
+    for (std::size_t s = 0; s < seats; ++s)
+        for (uint64_t f = rec.first; f < upto; ++f)
+            if (const auto in = rec.get(s, f)) frames[s].push_back({in->bank0, in->bank1, in->controls, in->controls2});
+    return frames;
+}
+
 } // namespace tools::net_record

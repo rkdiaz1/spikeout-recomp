@@ -227,13 +227,22 @@ public:
     // Tests: our own inputs sent to the others `frames` frames' time (1/60 s each) after they're set, as a slow
     // network's (the others, with rollback, run on on guesses meanwhile).
     void hold_inputs(uint64_t frames);
+    // Tests (gamerun --net-history): every seat's inputs of frames first .. first + n - 1 as if this machine had
+    // played them (a room that has run a while: what it sends a player joining it), the input callback not told
+    // (its boards start from a state after them). Called once the game has started, before our first input.
+    void preload_history(uint64_t first, const std::vector<std::vector<InputBytes>>& frames);
     // A player joined in progress, its boards caught up with the others':
     // its cabinet is its own from a frame the authority chooses (until
-    // then, none; Callbacks::taken).
-    void take_seat();
+    // then, none; Callbacks::taken). `at`: the frame it asks for instead, where it will have caught up (still
+    // catching up, faster than the game: tools::net_frame::CatchUp::take_at); the authority's own choice if later.
+    // `frame` and `rate` (frames a second): where it is and how fast it runs, for the authority to work the meeting
+    // out from where the room really is (the later of that and `at`).
+    void take_seat(uint64_t at = 0, uint64_t frame = 0, double rate = 0);
     // Joined in progress: the frame our cabinet is ours from, once the authority has said (0: not yet, or not joined
     // in progress).
     uint64_t seat_from() const;
+    // Joined in progress: our cabinet asked for, the authority's answer not here yet.
+    bool seat_pending() const;
     // Seat `seat`'s inputs are in up to (not including) this frame.
     uint64_t inputs_known(uint8_t seat) const;
     // Whether this machine makes seat `seat`'s inputs of `frame` itself (its own; an empty cabinet's, as the

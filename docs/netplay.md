@@ -3988,3 +3988,183 @@ waiting (join_refreshing). Each network game's numbers list the areas and raw st
 stage_ids), so the reports say which unnamed areas players reach. Cost: ~130 RAM reads a second on the host's shown
 board; nothing in the game or what the machines exchange in play changes. Tested: two windows on this PC, the joiner's
 list left open, its row went from "Stage 1" to "Stage 1 · Spiker's Base" by itself.
+
+## Joining a long game: the whole history, the cabinet's frame, one board's empty cabinets (issue 22, 2026-11-13, 0.1.0-preview5.1)
+
+Issue 22 (room F5XD6C, four players in Hong Kong and Macau, 29 minutes in, Stage 3): LINDA left, KKW joined, the whole
+room stood still 16 s, then the host saw the game's "Communication error". Ten problem bundles from five PCs of the
+room (1369-1390; matched by the players' names in the logs) told it; nothing covers the Communication error itself (every
+bundle ends at frame 101,474, during the freeze), so it stays open.
+
+**The whole history (the cause).** A joiner's input streams began unknown (Stream::next() 0), so it told the others it
+needed every seat from frame 0, and each sent its whole game since frame 1 (send_inputs: from = max(acks, first)), 64
+frames a seat a datagram, the next only after the joiner's acknowledgement: ~64 frames a round trip. Its game, at the
+host's state (frame 100,246 for KKW), waited until all 100,000 frames had come (~22 s at 18 ms; KKW's timeline: frame
+75,712 after 16 s). Then CatchUp, after 10 s with no input past the state, took the cabinet anyway; the host gave it from
+its own frame, 101,461, and every machine waited for KKW's inputs there while KKW still received the history. In all
+reports to 2026-11-13: 82 of 236 joins in progress hit (median 16.7 s to catch up, worst 340 s; 42 of them 50,000+
+frames in); 2026-11-12's "joiner catching up toward a wrong target" and most of its "room stands still 10 s at a take"
+were this. Fixed (src/net/session.cpp, the joiner only): no inputs kept before this machine's game has started
+(they come before a joiner has read that it joined in progress, and come again, unacknowledged); until the host's
+state is here a joiner asks for none (acks kNothingYet: a sender's max(ack, first) is past all it has); with the state
+(frame S) every seat's stream starts at S (anything older dropped) and is asked for from there. A joiner a game 29
+minutes in now gets a few seconds of inputs, not 29 minutes. CatchUp (tools/net_frame.hpp) never takes the cabinet
+before an input past the state has come (it couldn't run those frames; the others would only wait).
+
+**The cabinet's frame (option 1, the owner's choice).** A joiner not caught up after 5 s took its cabinet "anyway" from
+the host's frame, hundreds of frames ahead of it, and every machine stood still while it ran them (~4 s at 1.3x).
+Now CatchUp measures its speed by frames run (not by the gap: the inputs of the seconds the state was on its way pour
+in, so the gap grew while it gained, the old test's "not gaining") and, faster than the game by 5% or more, asks for
+its cabinet from where it will meet the room, a second's margin (Session::take_seat(at), kTake carries the frame; the
+host takes it if later than its own choice, a minute ahead at most, kTakeAheadMost; an older host ignores the extra
+bytes). The room plays on, the joiner's character idle meanwhile; its player watches the game run fast a little longer.
+The reports' catch-ups (221): 81% 3x or faster (seated within 5 s, as before), 13% 1.5-3x, 1% 1.05-1.5x, 5% under
+1.05x. Those last still take the cabinet anyway and the others wait (UNDECIDED, the owner: slow the room a little, the
+player watching, or as now; to look at which PCs first).
+The meeting worked out by the authority too (2026-11-14, the final matrix): the room still stood 0.6-1.4 s at an early
+player's cabinet (every board, 4th player's case: the host at frame 100,911, 12 frames past the agreed 100,899). The
+joiner's guess is from the others' inputs it has, still behind the room while those sent as the state was on its way
+come in, so the room was further on than it thought and got to the frame first. Now kTake also carries the joiner's
+frame and speed (Session::take_seat(at, frame, rate), moved on by its speed when asked again), and the authority works
+the meeting out from its own frame, taking the later of that and the joiner's guess. Its margin: the time needed half
+again and a second (with a tenth, a joiner measured at 1.69x averaged ~1.4x after, the other early player catching up
+on the same PC: the host waited 1.4 s at 100,929, 12 frames past the frame worked out, 100,917). A meeting over a
+minute off was handed over at the minute (kTakeAheadMost) and the room stood there 4.3 s for the joiner: now the
+authority says not yet ("seat N's meeting too far off yet") and the joiner asks again 2 s later, and a joiner asks
+only for a meeting 20 s off at most by its own sum (CatchUp::kMeetMost, 60 before). Timed (GAMERUN_NET_TIMES, gamerun's
+"at our cabinet's frame" line): a joiner measured at 1.51x ran on at 1.36x after asking, alone on the PC; at 1.63x, with
+the other early player catching up on the same PC, 1.19x (the room waited 1.6 s: the test's PC, five machines on six
+cores). The window drew the game again from the ask (its 3D, at the render scale, and the 2D), slower still: now the
+loading screen stays ("Taking your cabinet") and nothing is drawn until the cabinet's frame (the owner's idea: the
+game shown once it's ours), also while the authority's answer is on its way (Session::seat_pending,
+tools::net_frame::behind_own_seat; the window's shared.to_seat; Auto's timing leaves those frames out, gamerun too).
+(not gaining on it after all: a minute ahead, nobody waits). It logs each ask ("seat N asks for its cabinet from frame
+A, at frame F, R x; we're at H: from X").
+
+**One board's empty cabinets (fix 1).** A one-board host with an empty cabinet stood still for good at its hand-back to
+side runs (frame 100,294 in issue 22's state; every one-board room test, 5 of 5, before; the join only showed it, the
+host can't make a state then): its side runs read the empty cabinet's next frame's inputs, which the host itself fills
+only as far as its own, set at the end of that frame with input delay 0 (gdb on the host: the staying board in
+InputTable::wait from a side run; ONEBOARD_WAIT_LOG=1 named it: seat 2 frame 100,295, the table to 100,294). The tests
+before never had an empty cabinet on one board. Now the authority fills empty cabinets kOpenAhead (8) frames past its
+own (safe: none whatever comes; a player taking one gets it past what was filled).
+
+**A leave froze the room (fix 2).** In every test a player leaving with its goodbye stood the room still 7-46 s
+(today's code the same). Three causes, found with timestamps (gamerun GAMERUN_NET_TIMES=1) and a new log line:
+- gamerun's --net-leave-at, on every board too, told a parting, sent its board's state and waited up to 30 s for its
+  whole reliable queue (hundreds of backup pieces, tools/board_backup.hpp, every 2 s to every player) before its
+  goodbye, its game stopped meanwhile. The window does that only on one board (parting(), 3 s at most); on every board
+  it leaves at once (net_leave). gamerun now does the same (Machine::leave_plain; one board: 3 s at most, as the window).
+- Session::leave sent the whole reliable queue again three times, filling a slow upload just as its goodbye's
+  datagrams went out (lost behind it, as a full router drops them), and the others, still hearing those pieces, never
+  took it for gone. Now a leaving player sends its goodbye's datagram, then again every 60 ms for 0.3 s, and nothing
+  else; a goodbye lost, it's silent and dropped in kDropInGame (3 s). (The relay's allocation given back after them.)
+- The drop asked the others how far they had the player's inputs once, and waited for every present player's answer:
+  one who joined after the question, or whose answer was lost, held it for good. Now those who haven't answered are
+  asked again each second, and the wait is logged ("seat N's drop waits: no answer yet from seat ...").
+The leave alone (issue 22's state, two players, the player leaving 30 s in): today's code 6.8-11.8 s; now 0 ms (the
+goodbye at 30.042 s, the cabinet idle the same millisecond, 1,619 reliable pieces left unsent).
+Found by the suite after (2026-11-14, onepc-net-tests leave and leave3, now and then): a one-board player leaving sends
+its board's whole state first (5.4 MB packed, paced on the reliable channel) and waited for it 3 s at most; before,
+whatever was left went on being sent after leaving, now nothing is, and the others, dropping it at its goodbye, never
+had its board whole: the next joiner of that seat waited for good ("every board whole here first", the leaver's
+machine asked for ever). Now the wait is 10 s at most (gamerun and the window's parting(); gamerun logs "our state's
+sending done in N s"). Proved with every machine's uplink at 1 MB/s (SPIKEOUT_TEST_LINK=1000,0): the 3 s wait failed
+leave, the 10 s one passed (4.83 s to send). Open: on an uplink slower than ~0.5 MB/s the state still takes over 10 s;
+the others should then fall back to the player's last backup (as for a player gone without a parting), not tried.
+
+**A dropped player's seat taken, the "taken" heard late (fix 3, issue 24's tests).** Issue 24's room (recording
+2213, from power-on to 101,765, its joiner's 2214 the same byte for byte over 2,833 frames; its state not uploaded, so
+issue 22's state with 2213's history: a history is only sent, never run) went out of sync once in eight runs: one
+machine's copy of the seat a slow joiner took, just after its player (HIN) had left. Every machine holds a dropped
+seat's inputs at none from the drop on (InputTable::hold_from: settled, never waited for nor guessed), and the
+authority's "taken from frame X" ends the hold (hold_until). X is the authority's frame + ~16 for a cabinet taken
+anyway; a machine that hears it after it has run past X (the message behind others on the reliable channel: 0.34 s
+in the run that broke) ran the new player's first frames as none, and when the player's own came nothing compared
+them: its board stayed out of step until a whole state put it back (30 s, the room standing 15.7 s for it). Proved:
+SPIKEOUT_TEST_TAKEN_LATE_MS=600 on one machine, the joiner slow (SPIKEOUT_TEST_CATCHUP_MS, taken anyway) and its coin
+and start at once (gamerun GAMERUN_PRESS_AT_SEAT=1; a player not yet in the game changes it only by those), the new
+log line "inputs: board N's hold cut at frame X, frames to Y already read as held" each time (17-18 frames): the old
+way (INPUTS_HOLD_OLD=1) out of sync twice in two (40 and 7-8 hash checks), the fix in step twice in two (0 on every
+machine). The fix (tools/input_table.hpp, the window's and gamerun's table): the furthest frame read as held is kept,
+and at hold_until the frames from X so read are guesses of the held inputs (checked as the player's come, gone back
+for if they differ) and any set already that differ are wrong at once. Not from this hotfix: the hold and its end
+are as old as drops (rare: the player taken anyway, the message later than ~16 frames, and a coin or start in them);
+a "taken" later than rollback's kept frames (~40) still can't be gone back for (the out-of-step state then, as now).
+Without rollback (delay-based, LAN) the frames can't be run again either: there the cure would be the hold ending at
+X before it's run, not tried.
+
+**The Communication error: not reproduced.** gamerun --watch-text and the window's SPIKEOUT_TEST_WATCH_TEXT (one reader,
+tools::tile_text_row: the system font's tiles 0x20-0x7E on the four layers; proven on the link screen's "THIS IS MASTER
+SITE") watched every machine's screens in issue 22's sequence: its room from frame 99,000 with its history, two players
+there all along, one leaving, a late player joining at Stage 3's start; gamerun and windows (a window hosting from the
+state: SPIKEOUT_TEST_NET_STATE, SPIKEOUT_TEST_NET_HISTORY; a window joining by the room's code), a far player through
+the relay (95 ms each way, SPIKEOUT_TEST_RELAY_ONLY), today's code (the freeze) and the hotfix: never. Release 6
+saves a bundle when it shows.
+
+**Tests (build/t-i22, not committed).** gamerun --net-history FILE.inputs@FRAME (the host's input history preloaded from
+a recording: a room as long as a report's without playing it; Session::preload_history), started from issue 22's own
+game at frame 99,000 (its host's recording replayed; below) with bots on every machine, latencies near the report's
+(SPIKEOUT_TEST_LATENCY 8/9/2/10 ms a machine), uplinks 2 MB/s with 0.5% loss (SPIKEOUT_TEST_LINK), the late join 90 s
+in (issue22.ps1). Today's code first, each must show the problem:
+
+| The late player | Today's code | History fix | + option 1 | + fix 1 | Final (all of the above) |
+|---|---|---|---|---|---|
+| #2 | stuck, never played | 2 ms | 1 ms | | 25 ms |
+| #3 | room stood 35-70 s | 2.1 s | 33 ms | | 55 ms |
+| #4 (issue 22's) | 46-74 s | 4.4 s | 0.6 s | 0.16 s | 0.15 s |
+| all one board | stood for good | for good | for good | plays through (8-12 s holds) | a joiner into an empty seat never gets in (open) |
+| room on one board | stood for good | for good | for good | plays through, out of sync | the same (open) |
+| one-board joiner | 53-74 s | out of sync | 4.5 s (1.02x) | 12-13 s (0.94x: undecided case) | 39 ms |
+
+(the longest any machine waited for inputs; every run 0 hash checks differed but those noted). The final column's
+early players join one at a time, each in its seat before the next comes (two catching up at once on this one PC
+halved each other's speed: GAMERUN_CATCH_LOG's seconds showed one at 1.6-1.7x falling to ~1.0x as the other began,
+a test's artefact, each player having their own PC; alone, a joiner kept 1.9-2.0x from its ask to its cabinet).
+"For good" on one board before fix 1; after it, the one-board rooms' holds there were this PC running four one-board
+machines (21 frames a second for all); the same case over the internet (three machines) held 0.22 s at most. Also the realistic run:
+a room played 29 minutes from power-on with bots, the 4th player joining at 87,769 on today's code: it caught up from
+"the others at 19,585", waited 50 s, the room stood 22-31 s, as issue 22.
+
+**Found on the way.** gamerun --net-replay never wrote the boards' link role (0x10019E, written over the first 3,000
+frames in play): a host's recording (from frame 3) replayed as four games alone; now written (a joiner's, from later,
+was right). With it, issue 22's host's recording replayed to 101,460: its per-board lines (now printed by the replay
+every 3,600 frames, as the window logs them) the same as the host's log, 110 of 112, the other 2 only a guessed button
+printed live; no Communication error up to the freeze. gamerun runs a joiner from the host's state even with
+--load-state (there it only names the room's state for the build id; it ran from its own file before, a test's joiner
+out of step once inputs started at the state's frame). --net-history also on a joiner (the room's players there all
+along). The test steps shared with the window (gamerun = window): tools::net_record::build_with_state and
+history_frames, tools::tile_text_row. tools/internet-tests.sh sends a Codespace the changed sources as one archive (one
+gh codespace cp a file took ~15 minutes) and gives its build 15 minutes (cs()'s 3 left a run waiting on an ssh for good).
+tools/fetch-reports.ps1 fetches 16 at a time (curl --parallel), its progress bar off, -Only problems|inputs|stats.
+gamerun's joins logged: "at our cabinet's frame F, the others' inputs to X; since the ask Rx" (a joiner late at its
+cabinet shows X past F), GAMERUN_CATCH_LOG=1 its frames a second each second to there (catching up / asked / to its
+cabinet), GAMERUN_ROLLBACK_AT_SEAT=1 rollback only from the cabinet's frame (measured: not the slowdown's cause).
+
+**Open, not fixed here:**
+- The Communication error after issue 22's (and issue 24's) freeze: not reproduced (above); release 6 saves a bundle
+  when it shows (the owner).
+- Issue 23 (a joiner's host gone silent ~10 s in, twice, 3 ms apart but "direct", 57 sends failed): most likely two
+  PCs on one home network meeting through the lobby, their router's loop-back route failing; not a game bug as far as
+  one side's log shows. Logging each link's address kind and the sends' error codes would settle it.
+- One board, a joiner's hand-back to side runs while catching up: out of step (made packets differ from the real
+  ones); today's code the same (control runs, 21/52 hash checks both). The side runs' family (above, 2026-11-06/07);
+  quick repro now: issue22.ps1 -JoinerOne -NoHistory, ~3 minutes.
+- All one board: once (of two runs with fix 1) the room stood at the frame a one-board joiner's cabinet began
+  (103,262); not found yet.
+- One board, a player joining an empty seat in play never gets the game (found 2026-11-14, the early players joining
+  one at a time): an empty cabinet has no machine running it whole (only every machine's side runs), so the host,
+  making every board whole for the joiner's state, asks the seat's machine for its shadow, and that machine is the
+  joiner, waiting for the host's state: each waits for the other ("a shadow of board 2 wanted ... its machine's state
+  asked for"), the room plays on. Not from this hotfix (before fix 1 such a room froze earlier, at its first
+  hand-back); the earlier matrix's early players joined at the start, the cabinets still held whole. Rare: 9 of 1,251
+  network problem reports were on one board. The fix (owner: later, with the one-board work): the authority runs
+  every empty cabinet whole and is its machine for shadows; exact side runs alone wouldn't do it (nobody owns the
+  cabinet). With open bug 3 of 2026-11-11 (an empty seat keeps one board from handing over).
+- The joiner slower than the game (under 1.05x): undecided (above).
+- A player on a slow device still makes the room stutter in play (not only at a join): time sync slows everyone to
+  its pace, and rollback's catch-ups over a frame show as hitches (21% of them in the 2026-11-12 reports). Not fixed
+  or improved by this hotfix; the slow-PC steps of the network plan (who holds the room, frame skip, gentler time
+  sync, one board for weak PCs, the host moving a player to watching) are for it.
+- Every-board join desyncs in the reports: 8 of 13 desync events within ~3 s of a seat taken (bundles 1016,
+  764/1271, 584/1259, 539, 1465, 904, 1281/1352, 736/1241); a cause apart from this one.

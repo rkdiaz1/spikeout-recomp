@@ -19,6 +19,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -196,16 +198,36 @@ public:
             b.hold_from = frame;
             b.hold_until.reset();
             b.held = in;
+            b.held_read_to = 0;
             for (auto it = b.guesses.lower_bound(frame); it != b.guesses.end(); it = b.guesses.erase(it)) // (guessed: held now)
                 if (!same(it->second, in)) wrong_ = std::min(wrong_, it->first);
         }
         changed_.notify_all();
     }
-    // And up to `frame` only (a player taking the cabinet from there: theirs, as they are set).
+    // And up to `frame` only (a player taking the cabinet from there: theirs, as they are set). Frames from there already
+    // read as held (the cabinet's taking heard after this machine ran past its frame: the "taken" message behind others
+    // on the reliable channel, 0.34 s, past the 16 frames' lead) were run on the held inputs, settled: the player's own,
+    // when they came, were never compared, nothing went back, and this machine's board of that cabinet stayed out of
+    // step until a whole state put it back (2026-11-14, issue 24's tests: 1 run in 8). Now those frames are guesses of
+    // the held inputs, checked as the player's come (gone back for if they differ), and any already set that differ
+    // from what was read, wrong at once.
     void hold_until(std::size_t board, uint64_t frame) {
         std::lock_guard guard(lock_);
         Board& b = boards_[board];
-        if (b.hold_from) b.hold_until = frame;
+        if (!b.hold_from) return;
+        b.hold_until = frame;
+        if (b.held_read_to >= frame) // (the case below: said, for the logs)
+            std::printf("inputs: board %zu's hold cut at frame %llu, frames to %llu already read as held\n", board + 1,
+                        static_cast<unsigned long long>(frame), static_cast<unsigned long long>(b.held_read_to));
+        static const bool old = std::getenv("INPUTS_HOLD_OLD") != nullptr; // (tests: as before, those frames unchecked)
+        if (old) return;
+        for (uint64_t f = std::max(frame, *b.hold_from); f <= b.held_read_to; ++f) {
+            if (b.known && f >= b.first && f < b.next) {
+                if (!same(b.frames[static_cast<std::size_t>(f - b.first)], b.held)) wrong_ = std::min(wrong_, f);
+            } else if (!b.known || f >= b.next) {
+                b.guesses.emplace(f, b.held);
+            }
+        }
     }
 
     // Every board's frames let go, and open again after a close (a run
@@ -268,6 +290,7 @@ private:
         bool known = false; // any set yet
         std::optional<uint64_t> hold_from, hold_until;
         Inputs held;
+        mutable uint64_t held_read_to = 0; // (the furthest frame read as held: hold_until's guesses)
         std::map<uint64_t, Inputs> guesses; // (rollback: frames read before they were set, as guessed)
         bool quiet = false; // (its player's machine not heard from for a while: guessed as far as the long window)
         struct Wrong {
@@ -300,7 +323,10 @@ private:
         ++b.next;
     }
     static std::optional<Inputs> find(const Board& b, uint64_t frame) {
-        if (b.hold_from && frame >= *b.hold_from && (!b.hold_until || frame < *b.hold_until)) return b.held;
+        if (b.hold_from && frame >= *b.hold_from && (!b.hold_until || frame < *b.hold_until)) {
+            b.held_read_to = std::max(b.held_read_to, frame);
+            return b.held;
+        }
         if (!b.known || frame >= b.next || frame < b.first) return std::nullopt;
         return b.frames[static_cast<std::size_t>(frame - b.first)];
     }

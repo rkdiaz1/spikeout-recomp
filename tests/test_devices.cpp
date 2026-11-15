@@ -1207,6 +1207,24 @@ TEST_CASE("input table: each board's inputs by frame, gaps held, a frame waited 
     closer.join();
 }
 
+TEST_CASE("input table: a held cabinet taken, its frames already run held are checked against the player's") {
+    tools::InputTable t(2);
+    using In = tools::InputTable::Inputs;
+    const In none{0xFF, 0xFF, 0xFF, 0xFF}, punch{0xFE, 0xFF, 0xFF, 0xFF};
+    for (uint64_t f = 1; f <= 100; ++f) t.set(1, f, none);
+    t.hold_from(1, 101, none); // (its player dropped: none from 101)
+    bool guessed = true;
+    for (uint64_t f = 101; f <= 120; ++f) CHECK(t.guess(1, f, 12, guessed).has_value()); // (run on as held)
+    CHECK(!guessed);
+    t.hold_until(1, 110); // (taken from 110, heard after 120 was run)
+    CHECK_EQ(t.wrong_from(), ~0ull);
+    for (uint64_t f = 101; f <= 109; ++f) t.set(1, f, none); // (the authority's filling, as held)
+    t.set(1, 110, none);
+    CHECK_EQ(t.wrong_from(), ~0ull); // (as run)
+    t.set(1, 111, punch);             // (the player's: not what was run)
+    CHECK_EQ(t.wrong_from(), 111u);   // (gone back for: before, never)
+}
+
 TEST_CASE("arcade settings: the EEPROM checksum and both copies, as the game writes them") {
     // The game's EEPROM after its test menu: the defaults, then the
     // difficulty raised a step (the checksum and the count of saves change).

@@ -149,7 +149,7 @@ Change them in the menu (<kbd>Esc</kbd>), under Controls.
 | <kbd>Z</kbd> <kbd>X</kbd> <kbd>C</kbd> <kbd>V</kbd> | Beat, charge, jump, shift |
 | <kbd>5</kbd> / <kbd>1</kbd> | Coin / start |
 | <kbd>Esc</kbd> | The menu (a pad: Guide, the touchpad, or Back + Start) |
-| <kbd>F9</kbd> / <kbd>F10</kbd> | Save state / load the last (press twice; <kbd>F9</kbd> within 5 seconds undoes it) |
+| <kbd>F9</kbd> / <kbd>F10</kbd> | Save state / load the last, also one saved before the game was restarted (press twice; <kbd>F9</kbd> within 5 seconds undoes it) |
 | <kbd>F12</kbd> | A screenshot (in the folder the game was started from) |
 | <kbd>Tab</kbd> (held) | As fast as it goes |
 | <kbd>F2</kbd> / <kbd>F1</kbd> | The arcade's test and service buttons |

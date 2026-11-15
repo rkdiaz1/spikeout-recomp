@@ -115,7 +115,8 @@ TEST_CASE("net session: a host alone, a player joining the game in progress and 
     host.start(StartInfo{}); // alone: seat 2 empty
     CHECK(host_seen.wait([&] { return host_seen.started; }));
     for (uint64_t f = 1; f <= 100; ++f) host.local_input(f, {static_cast<uint8_t>(f), 0xFF, 0xFF, 0xFF});
-    CHECK(host_seen.wait([&] { return host_seen.inputs[1].size() == 100; })); // (none for the empty cabinet, made by the host)
+    // (none for the empty cabinet, made by the host: 8 frames past its own, kOpenAhead)
+    CHECK(host_seen.wait([&] { return host_seen.inputs[1].size() == 108; }));
     CHECK(host_seen.inputs[1].back().second == (InputBytes{0xFF, 0xFF, 0xFF, 0xFF}));
 
     GameInfo game{host.session_id(), 42, "host", 2, 1, true, Address{0x7F000001u, host.port()}, {}};
@@ -128,12 +129,15 @@ TEST_CASE("net session: a host alone, a player joining the game in progress and 
     CHECK_EQ(guest_seen.start.my_seat, 1);
     CHECK(guest_seen.start.state_frame.has_value() && *guest_seen.start.state_frame == 60u);
     CHECK(guest_seen.start.state == std::vector<uint8_t>(5000, 0x77));
-    // Every input since the start comes to it: the host's, and none for its cabinet.
-    CHECK(guest_seen.wait([&] { return guest_seen.inputs[0].size() == 100 && guest_seen.inputs[1].size() == 100; }));
+    // Every input from the state's frame on comes to it (issue 22: never the game's whole history, frame 1 on): the
+    // host's to 100, and none for its cabinet, 8 past the host's.
+    CHECK(guest_seen.wait([&] { return guest_seen.inputs[0].size() == 41 && guest_seen.inputs[1].size() == 49; }));
+    CHECK_EQ(guest_seen.inputs[0].front().first, 60u);
+    CHECK_EQ(guest_seen.inputs[1].front().first, 60u);
     guest.local_input(101, {0x00, 0x00, 0x00, 0x00}); // (not its cabinet yet: dropped)
     guest.take_seat();
     CHECK(guest_seen.wait([&] { return taken_at != 0; }));
-    CHECK_EQ(taken_at, 101u + 8u); // the host's next frame for it, and a margin
+    CHECK_EQ(taken_at, 109u + 8u); // the host's next frame for it (8 past its own), and a margin
     for (uint64_t f = 101; f <= 130; ++f) {
         host.local_input(f, {static_cast<uint8_t>(f), 0xFF, 0xFF, 0xFF});
         guest.local_input(f, {0x10, 0xFF, 0xFE, 0xFF});
@@ -143,6 +147,51 @@ TEST_CASE("net session: a host alone, a player joining the game in progress and 
     for (const auto& [f, in] : host_seen.inputs[1])
         right = right && (f < taken_at ? in == InputBytes{0xFF, 0xFF, 0xFF, 0xFF} : in == InputBytes{0x10, 0xFF, 0xFE, 0xFF});
     CHECK(right); // none up to the hand-over, the player's from it
+}
+
+// A joiner still catching up asks for its cabinet from where it will meet the others (0.1.0-preview5.1): the host hands
+// it over from that frame, never before its own choice (its next frame for it and a margin), at most a minute ahead.
+static uint64_t taken_when_asked(uint64_t asked, uint64_t at = 0, double rate = 0) {
+    Seen host_seen, guest_seen;
+    std::atomic<bool> wanted{false};
+    auto host_cb = host_seen.callbacks();
+    host_cb.state_wanted = [&] { wanted = true; };
+    uint64_t taken_at = 0;
+    auto guest_cb = guest_seen.callbacks();
+    guest_cb.taken = [&](uint8_t seat, uint64_t frame) {
+        std::lock_guard g(guest_seen.lock);
+        if (seat == 1) taken_at = frame;
+        guest_seen.changed.notify_all();
+    };
+    Session host(std::move(host_cb), 42);
+    CHECK(host.host("host", 2));
+    host.start(StartInfo{});
+    CHECK(host_seen.wait([&] { return host_seen.started; }));
+    for (uint64_t f = 1; f <= 100; ++f) host.local_input(f, {static_cast<uint8_t>(f), 0xFF, 0xFF, 0xFF});
+    GameInfo game{host.session_id(), 42, "host", 2, 1, true, Address{0x7F000001u, host.port()}, {}};
+    Session guest(std::move(guest_cb), 42);
+    CHECK(guest.join(game, "guest"));
+    for (int i = 0; i < 300 && !wanted; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    host.send_state(90, std::vector<uint8_t>(1000, 0x11));
+    CHECK(guest_seen.wait([&] { return guest_seen.started; }));
+    guest.take_seat(asked, at, rate);
+    CHECK(guest_seen.wait([&] { return taken_at != 0; }));
+    return taken_at;
+}
+
+TEST_CASE("net session: a joiner catching up asks for its cabinet from a later frame") {
+    CHECK_EQ(taken_when_asked(0), 117u);          // (none asked: the host's own choice, 109 + 8)
+    CHECK_EQ(taken_when_asked(2000), 2000u);      // (where it will have caught up)
+    CHECK_EQ(taken_when_asked(50), 117u);         // (never before the host's own choice)
+    CHECK_EQ(taken_when_asked(99999), 117u + 3600u); // (a minute ahead at most)
+}
+
+TEST_CASE("net session: the meeting worked out where the room really is, from the joiner's frame and speed") {
+    // (the host at 101; a joiner at 50 running twice the game's speed: 51 frames to gain at 57.52 a second, 0.89 s,
+    // half again and a second's margin: 101 + 134. Its own guess (120) was too early: the room would have waited)
+    CHECK_EQ(taken_when_asked(120, 50, 2 * 57.52), 235u);
+    CHECK_EQ(taken_when_asked(2000, 50, 2 * 57.52), 2000u);       // (its own guess later: that one)
+    CHECK_EQ(taken_when_asked(120, 50, 1.02 * 57.52), 117u + 3600u); // (not gaining on the room: as late as allowed)
 }
 
 TEST_CASE("net session: two machines on this one, inputs each frame, a hash, a goodbye") {
@@ -259,7 +308,7 @@ TEST_CASE("net session: a late joiner asking for its cabinet as the host leaves 
         host->local_input(f, {static_cast<uint8_t>(f), 0xFF, 0xFF, 0xFF});
         a.local_input(f, {0x22, 0xFF, 0xFF, 0xFF});
     }
-    CHECK(a_seen.wait([&] { return a_seen.inputs[0].size() == 50 && a_seen.inputs[2].size() == 50; }));
+    CHECK(a_seen.wait([&] { return a_seen.inputs[0].size() == 50 && a_seen.inputs[2].size() == 58; })); // (the empty one 8 ahead)
 
     // b joins the game in progress through the host and runs on from its state.
     Session b(std::move(b_cb), 42);
@@ -343,7 +392,9 @@ TEST_CASE("net session: the host leaving a game in progress, the room goes on: a
     CHECK(b_seen.wait([&] { return b_seen.started; }));
     CHECK_EQ(b_seen.start.my_seat, 0); // the old host's cabinet
     CHECK(b_seen.start.state_frame.has_value() && *b_seen.start.state_frame == 70u);
-    CHECK(b_seen.wait([&] { return b_seen.inputs[1].size() == 80 && b_seen.inputs[0].size() >= 80; }));
+    // (from the state's frame, 70: a's to 80, and the old host's cabinet, none, filled by a 8 past its own)
+    CHECK(b_seen.wait([&] { return b_seen.inputs[1].size() == 11 && b_seen.inputs[0].size() >= 11; }));
+    CHECK_EQ(b_seen.inputs[1].front().first, 70u);
     b.take_seat();
     CHECK(b_seen.wait([&] { return b_taken != 0; }));
     for (uint64_t f = 81; f <= 120; ++f) {

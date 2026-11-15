@@ -211,6 +211,12 @@ public:
                 if (!in && frame >= table->next(seat)) {
                     const auto waited = std::chrono::steady_clock::now(); // (held_wait_seconds)
                     const bool guess = rolling() && may_guess(frame);
+                    static const bool wait_log = std::getenv("ONEBOARD_WAIT_LOG") != nullptr; // (tests: a wait that never ends, named)
+                    if (wait_log && !guess)
+                        std::printf("held: waiting for seat %zu frame %llu (board at %llu; the table %llu-%llu)\n", seat,
+                                    (unsigned long long)frame, (unsigned long long)here->timing.frames(),
+                                    (unsigned long long)table->first(seat), (unsigned long long)table->next(seat)),
+                            std::fflush(stdout);
                     if (!guess && settings_.feed) settings_.feed(seat, frame);
                     in = guess ? table->guess(seat, frame, settings_.guess_ahead, guessed) : table->wait(seat, frame);
                     held_wait_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - waited).count();

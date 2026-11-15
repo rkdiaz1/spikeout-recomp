@@ -1,5 +1,14 @@
 # Hand-off, 2026-11-08 (one board a PC, network play)
 
+**0.1.0-preview5.1 hotfix (2026-11-13/15, issues 22, 24, 27; docs/netplay.md "Joining a long game").** A late joiner
+gets the inputs from the host's state's frame, not from frame 1; asks for its cabinet where it will meet the room (the
+authority works it out from its own frame; a meeting over a minute off "not yet"); keeps the loading screen until
+then; the authority fills empty cabinets ahead (one board's hand-back deadlock); a leaver's goodbye as datagrams
+(a one-board leaver's state awaited 10 s first); a dropped seat's hold cut after it was run past is checked
+(tools/input_table.hpp); F10 finds the newest save after a restart. Test kit in build/t-i22 (not committed):
+issue22.ps1 (issue 22's and issue 24's rooms from their recordings, early players one at a time), the switches in
+docs/netplay.md. Open, one board: docs/ROADMAP.md's list.
+
 **Latest (2026-11-11).** Done since 8490611 (input timing, stick, #8): the macOS crash after leaving a network game
 (rollback kept across `start_games`); a one-board machine's 30 s wait per gone player; spectators' channels paced as
 players' (issue #9: a 2 Mbit/s host's game never reached a spectator); the spectator's screen (progress, Esc hint, a

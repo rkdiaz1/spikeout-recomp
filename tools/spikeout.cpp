@@ -57,7 +57,8 @@
 // Save states (one board): F9 saves the game as it is at the end of the
 // frame (spikeout-<frame>.state, the same as gamerun --save-state writes,
 // so gamerun --load-state runs on from it exactly); F10 starts again from
-// the last one saved; --load-state FILE starts from FILE. In a network game
+// the last one saved (after a restart, the newest in the saves folder: issue
+// 27); --load-state FILE starts from FILE. In a network game
 // F9 saves every cabinet together (spikeout-net-<frame>.state, as gamerun
 // --save-state writes linked boards: gamerun --boards N --parallel
 // --load-state FILE runs on from it); F10 doesn't load those.
@@ -292,6 +293,9 @@ struct Shared {
     std::vector<std::string> game_recordings; // (this network game's NAME.inputs files: sent when it ends, if allowed)
     std::vector<uint8_t> net_state;
     std::atomic<bool> catching_up{false};
+    // (and caught up as far as asking for the cabinet, short of its frame yet (tools::net_frame::behind_own_seat): the
+    // loading screen's "Taking your cabinet" kept, nothing drawn, as catching up; the shown board's)
+    std::atomic<bool> to_seat{false};
     // Auto, the board mode by speed (tools/net_frame.hpp, gamerun --net-auto-board the same): made anew each start
     std::unique_ptr<tools::net_frame::AutoBoard> auto_board = std::make_unique<tools::net_frame::AutoBoard>();
     std::atomic<uint64_t> catch_up_behind{0}; // (frames still to catch up, the shown board's; 0 not known yet)
@@ -938,7 +942,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             came_into_view = now && !pictured;
             pictured = now;
         }
-        if (pictured && !shared.catching_up && !(shared.rollback && shared.rollback->quiet(index, timing.frames() + 1))) { // (a board not shown needn't draw its 2D: the game never reads it back)
+        if (pictured && !shared.catching_up && !shared.to_seat && !(shared.rollback && shared.rollback->quiet(index, timing.frames() + 1))) { // (a board not shown needn't draw its 2D: the game never reads it back)
             if (line == 0) tilegen.begin_frame();
             tilegen.draw_line(bus, static_cast<int>(line));
         }
@@ -1003,6 +1007,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         }
         // (catching up: run on from a state, behind the others; and on to our seat's frame: tools/net_frame.hpp)
         const bool to_seat = shared.netplay && tools::net_frame::behind_own_seat(*shared.netplay, timing.frames());
+        if (index == shown) shared.to_seat = to_seat;
         if (shared.fast || shared.catching_up || to_seat || repace) {
             start = clock::now();
             paced_from = timing.frames();
@@ -1114,7 +1119,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         // (rollback: a frame run again after going back, drawn and heard nothing: shown and heard the first time)
         const bool quiet = shared.rollback && shared.rollback->quiet(index, timing.frames());
         // (and catching up with the others, run on from a state: nobody looks; the sound still plays, so the music goes on)
-        const bool unseen = quiet || shared.catching_up;
+        const bool unseen = quiet || shared.catching_up || shared.to_seat; // (and on to our cabinet's frame: still the loading screen)
         bool paced_after = false; // (a picture: held after it is shown, below)
         // (tests: SPIKEOUT_EARLY_INPUTS=1, the old order: the picture held before it is shown, the inputs read after it)
         static const bool early_inputs = std::getenv("SPIKEOUT_EARLY_INPUTS") != nullptr;
@@ -1135,7 +1140,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             const bool switched = shared.one_board_frame != ~0ull;
             const bool timed = switched ? tools::one_board::Game::on_side_runs(part) : !shared.one_board_wanted;
             double ms = 0;
-            const auto verdict = auto_board.decide(timing.frames(), switched, timed, shared.fast || shared.catching_up, ms);
+            const auto verdict = auto_board.decide(timing.frames(), switched, timed, shared.fast || shared.catching_up || shared.to_seat, ms);
             tools::net_frame::auto_board_said(verdict, ms, auto_board.every_board_ms(), "spikeout");
             if (verdict == tools::net_frame::AutoBoard::Verdict::one_board) shared.one_board_wanted = true;
             if (verdict == tools::net_frame::AutoBoard::Verdict::every_board_again)
@@ -1161,6 +1166,19 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                         side ? "; on side runs (one board)" : "");
             logic_before2 = logic;
             std::fflush(stdout);
+        }
+        // (tests: SPIKEOUT_TEST_WATCH_TEXT=STRING, every 30 frames this board's tile layers searched for it: the frame it
+        // shows and goes, printed, as gamerun --watch-text (one reader, tools::tile_text_row): issues 22 and 24's
+        // "Communication error" on a window's own screens)
+        if (static const char* watch = std::getenv("SPIKEOUT_TEST_WATCH_TEXT"); watch && *watch && timing.frames() % 30 == 0) {
+            static thread_local bool seen = false;
+            const std::string row = tools::tile_text_row(bus.tile_ram(), watch);
+            if (!row.empty() != seen) {
+                seen = !row.empty();
+                std::printf("watch-text: board %zu frame %llu: %s%s\n", index, static_cast<unsigned long long>(timing.frames()),
+                            seen ? "shown: " : "gone", seen ? row.c_str() : "");
+                std::fflush(stdout);
+            }
         }
         if (timing_debug && index == shown) {
             const auto now = clock::now();
@@ -1193,7 +1211,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             textures_whole = true; // (texture RAM put back as it was: the GPU takes it afresh)
             // (catching up: not paced, but the pacing's start kept current: else the first frame after waited out, at
             // the game's speed, every frame caught up (13-21 s after a join over the internet, everyone held))
-            if (shared.catching_up) pace();
+            if (shared.catching_up || shared.to_seat) pace();
         } else if (!pictured) {
             pace(); // (no picture: another player's board)
         } else if (shared.gpu_3d && index == shown) { // the scene and layers for the window to draw
@@ -1391,7 +1409,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                 if (done) {
                     shared.rollback_from = frame + 2; // (rollback: snapshots and guesses again, every board from there)
                     shared.catching_up = false;
-                    shared.netplay->session().take_seat(); // (a cabinet joined in progress; else nothing)
+                    shared.netplay->session().take_seat(catch_up.take_at, catch_up.take_frame, catch_up.take_rate); // (a cabinet joined in progress; else nothing)
                 }
             }
             if (index == shown) {
@@ -2722,6 +2740,24 @@ int main(int argc, char** argv) {
     shared.saves_dir = data_folder + "saves/", shared.shots_dir = data_folder + "screenshots/"; // (issue #12)
     SDL_CreateDirectory(shared.saves_dir.c_str());
     SDL_CreateDirectory(shared.shots_dir.c_str());
+    // F10's last save: the newest spikeout-<frame>.state saved before (issue 27: after a restart it said none yet, the
+    // files still there), unless --load-state named one; not the undo file nor a network game's (F10 doesn't load
+    // those). Checked as ever when F10 is pressed (version, checksum, twice to load).
+    if (shared.last_state.empty()) {
+        std::error_code ec;
+        std::filesystem::file_time_type newest{};
+        for (const auto& e : std::filesystem::directory_iterator(tools::net_record::u8path(shared.saves_dir), ec)) {
+            const auto u8 = e.path().filename().u8string();
+            const std::string name(u8.begin(), u8.end());
+            if (name.size() <= 15 || name.rfind("spikeout-", 0) != 0 || name.substr(name.size() - 6) != ".state") continue;
+            const std::string number = name.substr(9, name.size() - 15);
+            if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos) continue;
+            const auto when = e.last_write_time(ec);
+            if (ec || !e.is_regular_file(ec)) continue;
+            if (shared.last_state.empty() || when > newest) newest = when, shared.last_state = shared.saves_dir + name;
+        }
+        if (!shared.last_state.empty()) std::printf("spikeout: F10's last save: %s\n", shared.last_state.c_str());
+    }
     if (!test_run) load_nvram(data_folder, shared, boards);
     start_games();
 
@@ -2828,7 +2864,20 @@ int main(int argc, char** argv) {
     const std::size_t own_boards = boards; // (--boards: what runs when not in a network game)
     m3::CommBoardOptions link; // (as run_game makes the boards')
     if (shared.old_link) link.use_old_link();
-    const uint64_t build = tools::build_id(roms, tools::game_functions().size(), shared.real_netboard ? &link : nullptr);
+    uint64_t build = tools::build_id(roms, tools::game_functions().size(), shared.real_netboard ? &link : nullptr);
+    // Tests (the owner, 2026-11-14: start near a report's moment, not half an hour of play before it):
+    // SPIKEOUT_TEST_NET_STATE=FILE, a linked state (gamerun --save-state's) this window's network game starts from when
+    // it hosts, as gamerun --net-host --load-state; in the build id the same way (tools/net_record.hpp), so gamerun
+    // players with the same --load-state join it. SPIKEOUT_TEST_NET_HISTORY=FILE.inputs@FRAME: the room's input history
+    // preloaded, as gamerun --net-history.
+    static const char* test_net_state = std::getenv("SPIKEOUT_TEST_NET_STATE");
+    std::vector<uint8_t> test_state_file;
+    if (test_net_state && *test_net_state) {
+        test_state_file = tools::read_file(test_net_state);
+        build = tools::net_record::build_with_state(build, test_state_file);
+        std::printf("spikeout: SPIKEOUT_TEST_NET_STATE: a hosted game starts from %s (%zu KB)\n", test_net_state,
+                    test_state_file.size() / 1024);
+    }
     std::unique_ptr<NetGame> netgame;
     // (the network game's start, for its numbers when it ends: tools/problem_report.hpp, part 2)
     std::chrono::steady_clock::time_point net_game_began{};
@@ -3062,6 +3111,23 @@ int main(int argc, char** argv) {
         if (start.state_frame) {
             if (auto unpacked = net::decompress(start.state)) state = std::move(*unpacked);
             else std::printf("spikeout: the host's state doesn't unpack\n");
+        } else if (!test_state_file.empty() && netgame->host) { // (tests: SPIKEOUT_TEST_NET_STATE, above, as gamerun's)
+            std::vector<uint8_t> bytes = test_state_file;
+            if (bytes.size() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD)
+                if (auto unpacked = net::decompress(bytes)) bytes = std::move(*unpacked);
+            state = tools::read_state_file(std::move(bytes)).state;
+        }
+        // (tests: SPIKEOUT_TEST_NET_HISTORY=FILE.inputs@FRAME, the room's history, as gamerun --net-history)
+        if (const char* h = std::getenv("SPIKEOUT_TEST_NET_HISTORY"); h && *h) {
+            const std::string spec = h;
+            const std::size_t at = spec.rfind('@');
+            tools::net_record::Reader rec;
+            if (at != std::string::npos && rec.load(spec.substr(0, at)).empty()) {
+                const uint64_t upto = std::strtoull(spec.c_str() + at + 1, nullptr, 0);
+                netgame->session().preload_history(rec.first, tools::net_record::history_frames(rec, upto, start.seats));
+                std::printf("spikeout: the room's history preloaded: frames %llu-%llu (SPIKEOUT_TEST_NET_HISTORY)\n",
+                            static_cast<unsigned long long>(rec.first), static_cast<unsigned long long>(std::min(upto, rec.end()) - 1));
+            }
         }
         reset_game([&] {
             shared.netplay = netgame->play.get();
@@ -3124,7 +3190,10 @@ int main(int argc, char** argv) {
         shared.parting_wanted = true;
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (!shared.parted && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        while (netgame->session().sending() && std::chrono::steady_clock::now() < until)
+        // (its sending awaited 10 s at most, as gamerun: leaving sends nothing more since 0.1.0-preview5.1, and a state
+        // not finished by then left the others without this board whole, a joiner of our seat waiting for good)
+        const auto sent_by = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (netgame->session().sending() && std::chrono::steady_clock::now() < sent_by)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         std::printf("spikeout: %s\n", shared.parted ? "this board's state sent, leaving" : "leaving without this board's state sent");
         shared.parting_wanted = false, shared.parted = false, shared.parting_frame = 0;
@@ -5257,7 +5326,8 @@ int main(int argc, char** argv) {
             const bool watcher = shared.spectating || (netgame && netgame->spectator);
             using Stage = net::Session::JoinProgress::Stage;
             const bool catching = netgame && netgame->running && shared.catching_up;
-            if (join.stage == Stage::receiving || join.stage == Stage::seating || catching) {
+            const bool to_seat = netgame && netgame->running && !watcher && shared.to_seat; // ("Taking your cabinet" on to its frame)
+            if (join.stage == Stage::receiving || join.stage == Stage::seating || catching || to_seat) {
                 if (join.stage == Stage::receiving && !join_shown) { // (once: the room page closed for the screen)
                     join_shown = true;
                     if (menu_ready && menu.is_open()) menu.close();

@@ -343,16 +343,21 @@ inline void auto_board_said(AutoBoard::Verdict v, double ms, double every_ms, co
 // own frame then), run unpaced until there, as catching up (2026-11-10: the inputs come in order, behind the state and
 // the rest, so the furthest of them lag the others' game; caught up by them, a joiner took its seat ~300 frames short
 // and ran to it at the time sync's pace, 5 s, the others held all that time).
+// Also while the cabinet is asked for and the answer not here yet (a far meeting: not yet, asked again). The window
+// keeps its loading screen meanwhile and draws nothing (2026-11-14, the owner: the game shown once ours; drawing
+// slowed a joiner still catching up: measured at 1.6x, it ran on at ~1.2-1.4x to the frame and the room waited for it).
 inline bool behind_own_seat(NetPlay& net, uint64_t frame) {
+    if (net.session().seat_pending()) return true;
     const uint64_t from = net.session().seat_from();
     return from && frame + 2 < from;
 }
 
 // Joined in progress (run on from a state): caught up with the others (as far as the furthest of their inputs: one
 // seat alone may be a cabinet whose player left, its inputs stopped where they did); our cabinet then (the caller:
-// Session::take_seat, rollback's guesses and snapshots from frame + 2). Not gaining on them after a few seconds (a PC
-// that can't run every board faster than the game): the cabinet taken anyway; the others then wait for this machine as
-// for any slow player. A spectator runs net::kWatchLag behind every seat.
+// Session::take_seat, rollback's guesses and snapshots from frame + 2). Not caught up after a few seconds but faster
+// than the game: the cabinet asked for from where we'll meet the others (take_at), they play on. Not faster than the
+// game: the cabinet taken anyway; the others then wait for this machine as for any slow player. A spectator runs
+// net::kWatchLag behind every seat.
 struct CatchUp {
     uint64_t from = 0; // (the first frame run here; 0: not started)
     std::chrono::steady_clock::time_point at{};
@@ -371,25 +376,87 @@ struct CatchUp {
         if (test_catchup_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(test_catchup_ms));
         const auto now = std::chrono::steady_clock::now();
         if (!from) { // (how long it takes: from the first frame run here to the others)
-            from = frame, at = now, start_behind = behind;
+            from = frame, at = now, start_behind = behind, said_waiting = false;
             std::printf("%s: catching up from frame %llu, the others at %llu\n", tag, static_cast<unsigned long long>(frame),
                         static_cast<unsigned long long>(front));
         }
         const double so_far = std::chrono::duration<double>(now - at).count();
         // (no input from past the state yet: the others' inputs since come after the state, queued behind it on the
         // way, so the furthest known is still older than the state: not caught up whatever it says (2026-11-09: taken
-        // at once, the seat came 390 frames ahead, run to at the game's pace: the others held 6.2 s). 10 s at most:
-        // the others quiet, the cabinet taken as before)
-        if (front < from && so_far < 10) return false;
-        const bool given_up = so_far > 5 && front > frame + 4 && front - frame + 30 >= start_behind;
-        if (given_up)
-            std::printf("%s: not gaining on the others (%llu frames behind after %.0f s): the cabinet taken anyway\n", tag,
-                        static_cast<unsigned long long>(front - frame), so_far);
-        if (frame + 4 < front && !given_up) return false;
+        // at once, the seat came 390 frames ahead, run to at the game's pace: the others held 6.2 s). Never taken
+        // before: this machine can't run its frames past the state yet, so the others would only wait for it (issue 22,
+        // 2026-11-13: it was taken after 10 s anyway, the joiner still receiving the inputs, the room stood still 16 s);
+        // the others quiet meanwhile, nobody waits either way)
+        if (front < from) {
+            if (so_far >= 10 && !said_waiting) {
+                said_waiting = true;
+                std::printf("%s: no inputs past the state yet after %.0f s (the others at %llu, the state at %llu): our "
+                            "cabinet not taken until they come\n", tag, so_far, static_cast<unsigned long long>(front),
+                            static_cast<unsigned long long>(from));
+            }
+            return false;
+        }
+        take_at = 0, take_frame = 0, take_rate = 0;
+        if (!running) running = true, run_from = frame, run_at = now; // (its speed: from the first frame it could run)
+        if (frame + 4 >= front) { // caught up
+            std::printf("%s: caught up at frame %llu: %llu frames in %.1f s (%.2fx the game's speed)\n", tag,
+                        static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame - from), so_far,
+                        so_far > 0 ? static_cast<double>(frame - from) / so_far / recomp::FrameTiming::kRefreshHz : 0.0);
+            return finish();
+        }
+        // (5 s of running: from the first frame it could run, not from the first here: a far joiner's inputs past the state
+        // come late (through the relay, ~95 ms each way: after 4.6 s), so 5 s from the first frame left it half a second
+        // of running, its speed none, and the cabinet was taken anyway, the room stood 8-10 s (2026-11-14, the window test))
+        if (std::chrono::duration<double>(now - run_at).count() <= 5) return false;
+        // Not caught up after 5 s. Gaining on the room (this machine runs the game faster than the arcade's pace): the
+        // cabinet asked for from the frame where we'll meet the room, by our speed, a second's margin; the others play
+        // on meanwhile, nobody waits (2026-11-13, the owner's choice for 0.1.0-preview5.1: before, it was taken at once,
+        // hundreds of frames ahead of us, and every machine stood still while we ran them: ~4 s at 1.3x). Measured by
+        // frames run, not by the gap: the others' inputs from the seconds the state was on its way still pour in, so the
+        // gap can grow while we gain (the old test called that "not gaining").
+        if (!spectating) {
+            constexpr double game = recomp::FrameTiming::kRefreshHz;
+            const double running_s = std::chrono::duration<double>(now - run_at).count();
+            const double rate = running_s > 0.5 ? static_cast<double>(frame - run_from) / running_s : 0.0; // (frames a second)
+            const double gain = rate - game;
+            if (gain >= 0.05 * game) {
+                const double seconds = static_cast<double>(front - frame) / gain;
+                if (seconds > kMeetMost) return false; // (too far yet: on catching up, nobody waits)
+                take_at = front + static_cast<uint64_t>((seconds + 1.0) * game);
+                take_frame = frame, take_rate = rate; // (for the authority's own sum: the room may be further on)
+                std::printf("%s: catching up at %.2fx, %llu frames behind after %.0f s: our cabinet asked for from frame %llu, "
+                            "where we'll be in %.0f s (the others play on)\n",
+                            tag, rate / game, static_cast<unsigned long long>(front - frame), so_far,
+                            static_cast<unsigned long long>(take_at), seconds + 1.0);
+                return finish();
+            }
+        }
+        // Not faster than the game (or a spectator not gaining): as before, the cabinet taken anyway; the others then
+        // wait for this machine as for any slow player (what to do for those is still open: memory taken-anyway-rule)
+        if (front - frame + 30 < start_behind) return false; // (a spectator still gaining: on)
+        std::printf("%s: not gaining on the others (%llu frames behind after %.0f s): the cabinet taken anyway\n", tag,
+                    static_cast<unsigned long long>(front - frame), so_far);
         std::printf("%s: caught up at frame %llu: %llu frames in %.1f s (%.2fx the game's speed)\n", tag,
                     static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame - from), so_far,
                     so_far > 0 ? static_cast<double>(frame - from) / so_far / recomp::FrameTiming::kRefreshHz : 0.0);
-        from = 0;
+        return finish();
+    }
+    bool said_waiting = false; // (the wait for inputs past the state logged)
+    // When true came back: the frame to ask our cabinet from (Session::take_seat), 0 for the authority's own choice.
+    uint64_t take_at = 0;
+    uint64_t take_frame = 0; // (and with it: our frame then, and our speed, frames a second: Session::take_seat)
+    double take_rate = 0;
+    // (seconds: a meeting further off isn't asked for yet. The authority's own sum, from where the room really is, comes
+    // out later than ours, then half again and a second, and it hands a cabinet over at most a minute ahead (it says not
+    // yet past that): 20 s here keeps the ask inside it)
+    static constexpr double kMeetMost = 20;
+
+private:
+    bool running = false;
+    uint64_t run_from = 0;
+    std::chrono::steady_clock::time_point run_at{};
+    bool finish() {
+        from = 0, said_waiting = false, running = false;
         return true;
     }
 };

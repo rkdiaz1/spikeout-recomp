@@ -186,6 +186,24 @@ inline std::vector<uint8_t> state_file_bytes(uint64_t frame, const std::vector<u
     out.insert(out.end(), state.begin(), state.end());
     return out;
 }
+// Tests: the row of a board's tile layers (as gamerun --text reads them: four layers' 64 x 64 name tables at 0xF8000,
+// the system font's letters tiles 0x20-0x7E, any colour) that holds `needle`, empty if none: a message the game draws
+// ("Communication error", issues 22 and 24), watched by gamerun --watch-text and the window's SPIKEOUT_TEST_WATCH_TEXT
+// alike.
+inline std::string tile_text_row(std::span<const uint8_t> tile, const std::string& needle) {
+    for (uint32_t layer = 0; layer < 4; ++layer)
+        for (uint32_t row = 0; row < 64; ++row) {
+            std::string line;
+            for (uint32_t col = 0; col < 64; ++col) {
+                const uint32_t off = 0xF8000 + layer * 0x2000 + row * 128 + (col ^ 1) * 2;
+                const uint32_t code = tile[off];
+                line += code >= 0x20 && code < 0x7F ? static_cast<char>(code) : ' ';
+            }
+            if (line.find(needle) != std::string::npos) return line;
+        }
+    return {};
+}
+
 inline StateFile read_state_file(std::vector<uint8_t> bytes) {
     StateFile f;
     if (bytes.size() < 32 || !std::equal(kStateMagic, kStateMagic + 8, bytes.begin())) {

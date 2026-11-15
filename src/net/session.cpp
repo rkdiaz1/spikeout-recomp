@@ -46,6 +46,15 @@ constexpr auto kWatchInfoEvery = std::chrono::milliseconds(1000);
 constexpr std::size_t kFragment = 1000;    // reliable payload a datagram
 constexpr std::size_t kWindow = 256;       // reliable fragments in flight (a save state: some MB)
 constexpr uint64_t kTakeMargin = 8;        // frames ahead a cabinet is handed to the player taking it
+constexpr uint64_t kTakeAheadMost = 3600;  // (and asked for further ahead, by a joiner still catching up: a minute at most)
+constexpr double kMeetGame = 57.52;        // (the game's frames a second, recomp::FrameTiming::kRefreshHz: the meeting's sum)
+// The authority fills the cabinets no player has (none pressed) this many frames past its own inputs. A one-board
+// machine's side runs read a cabinet's next frame's inputs before this machine's own of it are set (input delay 0:
+// at the end of that frame), so a one-board authority waited for its own filling for good (2026-11-13, issue 22's
+// tests: a one-board room with an empty seat stood still at its hand-back, frame 100,294, waiting for seat 2's 100,295).
+// Safe: an empty cabinet's inputs are none whatever comes, and a player taking one gets it past what was filled (kTake:
+// its stream's next + kTakeMargin).
+constexpr uint64_t kOpenAhead = 8;
 constexpr auto kResend = std::chrono::milliseconds(150);
 constexpr std::size_t kChunkFrames = 64;   // input frames a seat a datagram
 constexpr auto kInputResend = std::chrono::milliseconds(4);
@@ -396,13 +405,28 @@ struct Session::Impl {
     Clock::time_point watch_since{}, watch_told{}; // (a spectator: let in then; the wait for the game last logged then)
     std::optional<StartInfo> late_start;
     std::optional<uint64_t> mine_from;
+    // A game joined in progress: the frame of the host's state, once it has come. Every seat's inputs are kept from
+    // there, none before (issue 22, 2026-11-13: a joiner's streams began unknown, so it asked from frame 0 and every
+    // player sent its whole game since frame 1, ~64 frames a round trip, before the frames after the state could
+    // come: a joiner 29 minutes in waited ~22 s, took its cabinet stuck, and the room stood still 16 s). Until then
+    // it asks for none (kNothingYet).
+    std::optional<uint64_t> history_from;
+    static constexpr uint64_t kNothingYet = UINT64_MAX; // (an ack: nothing of that seat wanted yet; a sender's
+                                                         // from = max(ack, first) is then past all it has)
+    bool history_waits() const { return late && !watch_mode && !history_from; }
     // Our cabinet asked for (kTake), until it's handed over (kTaken): asked
     // again of whoever is the authority then, now and then and whenever the
     // authority changes, since an authority that has left, or that a
     // machine only took for one a moment, never answers.
     bool take_wanted = false;
+    uint64_t take_at = 0; // (the frame asked for with it: 0, the authority's choice)
+    uint64_t take_frame = 0; // (and the frame we were at then, at take_rate frames a second: the authority's own sum)
+    double take_rate = 0;
+    Clock::time_point take_measured{};
     uint8_t take_asked = kNoSeat;
     Clock::time_point take_sent{};
+    struct TakenLate { uint8_t seat; uint64_t frame; Clock::time_point due; }; // (SPIKEOUT_TEST_TAKEN_LATE_MS)
+    std::vector<TakenLate> taken_late;
     std::optional<uint64_t> state_at; // (the frame of the last state we ran on from: hashes before it not compared)
     std::map<uint64_t, InputBytes> pending_local;
     std::array<bool, kMaxSeats> quiet_told{}; // (Callbacks::quiet: as last told, each seat)
@@ -412,6 +436,7 @@ struct Session::Impl {
         uint8_t asked_by = kNoSeat;
         std::map<uint8_t, uint64_t> answers;
         bool announced = false;
+        Clock::time_point said{}; // (what it waits for, last logged)
     };
     std::array<Drop, kMaxSeats> drops;
     // A seat whose player went (Session::seats): their name and country, and whether they said goodbye.
@@ -708,7 +733,10 @@ struct Session::Impl {
             static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - p.their_time_at).count());
         w.u32(now_ms()), w.u32(p.their_time), w.u16(static_cast<uint16_t>(std::min<uint32_t>(held, 65535)));
         w.u8(seats);
-        for (uint8_t s = 0; s < seats; ++s) w.u64(s == my_seat ? held_back(streams[s].next()) : streams[s].next());
+        for (uint8_t s = 0; s < seats; ++s)
+            w.u64(history_waits() && !streams[s].known ? kNothingYet // (joined in progress: none before the state's frame)
+                  : s == my_seat                       ? held_back(streams[s].next())
+                                                       : streams[s].next());
         uint8_t chunks = 0;
         const std::size_t count_at = w.out.size();
         w.u8(0);
@@ -1320,7 +1348,7 @@ struct Session::Impl {
     // (as far as our own inputs go)
     void fill_open_to_mine() {
         const Stream& mine = streams[my_seat];
-        if (my_seat < kMaxSeats && mine.known && mine.next() > 0) fill_open(mine.next() - 1);
+        if (my_seat < kMaxSeats && mine.known && mine.next() > 0) fill_open(mine.next() - 1 + kOpenAhead);
     }
 
     // A late joiner's (or our) inputs, held until the frames before them are in.
@@ -1481,6 +1509,25 @@ struct Session::Impl {
                 StartInfo info = *late_start;
                 info.state_frame = frame, info.state = std::move(state);
                 log("every board's state from the host: frame " + std::to_string(frame));
+                // (every seat's inputs from the state's frame: what the boards run on from there; the host has them all,
+                // as it made the state there. Asked for at once: the acks below go out with our next datagram)
+                // Any older ones dropped: the others send to a new player from the moment it's in, before it has read
+                // that it joined in progress (KKW's timeline: inputs at 0.580 s, "joined" 0.581), so a stream may have
+                // begun at frame 1 already (2026-11-13's first try kept it: the history still from 1)
+                // (a player only: a spectator, also "late" here, keeps its streams its own way, deliver_watched, as before)
+                if (!history_from && !watch_mode) {
+                    history_from = frame;
+                    for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s) {
+                        Stream& st = streams[s];
+                        if (st.known && st.first <= frame && st.next() > frame)
+                            st.frames.erase(st.frames.begin(), st.frames.begin() + static_cast<std::ptrdiff_t>(frame - st.first));
+                        else
+                            st.frames.clear();
+                        st.known = true, st.first = frame;
+                    }
+                    for (uint8_t s = 0; s < kMaxSeats; ++s)
+                        if (peers[s].present) peers[s].inputs_due = true;
+                }
                 begin(info);
             } else if (started && cb.resync) {
                 StartInfo info = start_info;
@@ -1545,7 +1592,39 @@ struct Session::Impl {
                 break;
             }
             if (!cabinets[from].open) break;
-            const uint64_t x = streams[from].next() + kTakeMargin;
+            // (from the frame it asks for, if it asked for one: where a joiner still catching up will meet us, so
+            // nobody waits for it; never earlier than our own choice, nor over a minute ahead)
+            uint64_t asked = r.left() >= 8 ? r.u64() : 0;
+            const uint64_t ours = streams[from].next() + kTakeMargin, here = streams[my_seat].next();
+            // (with the joiner's frame and speed: the meeting worked out here too, from where the room really is. The
+            // joiner's own guess is from the others' inputs it has, still behind the room while those sent as its state
+            // was on its way come in: the room reached the frame first and waited for it, 0.6-1.4 s (2026-11-14, issue
+            // 22's tests). Its time to us, and its speed varying, in the margin: half again and a second (a joiner measured
+            // at 1.69x then averaged ~1.4x, another catching up on its PC: a tenth was 1.4 s short); the later of the two)
+            if (asked && r.left() >= 12) {
+                const uint64_t at = r.u64();
+                const double rate = r.u32() / 1000.0, gain = rate - kMeetGame;
+                uint64_t meet = asked;
+                if (gain >= 0.05 * kMeetGame && here > at) {
+                    const double seconds = static_cast<double>(here - at) / gain;
+                    meet = here + static_cast<uint64_t>((seconds * 1.5 + 1.0) * kMeetGame);
+                } else if (here > at) // (not gaining on us after all: as late as allowed (below), nobody waits)
+                    meet = ours + kTakeAheadMost;
+                log("seat " + std::to_string(from + 1) + " asks for its cabinet from frame " + std::to_string(asked) +
+                    ", at frame " + std::to_string(at) + ", " + std::to_string(rate / kMeetGame).substr(0, 4) +
+                    "x; we're at " + std::to_string(here) + ": from " + std::to_string(std::max(asked, meet)));
+                asked = std::max(asked, meet);
+                // (further off than we hand a cabinet over ahead: not yet, else it would be given at the limit and the
+                // room wait there for it (2026-11-14: a joiner's guess 45 s, the room's 61 s, the room stood 4.3 s);
+                // it asks again in kTakeRetry, nearer)
+                if (asked > ours + kTakeAheadMost) {
+                    log("seat " + std::to_string(from + 1) + "'s meeting too far off yet: not handed over");
+                    break;
+                }
+            } else if (asked)
+                log("seat " + std::to_string(from + 1) + " asks for its cabinet from frame " + std::to_string(asked) +
+                    ", we're at " + std::to_string(here));
+            const uint64_t x = asked > ours ? std::min(asked, ours + kTakeAheadMost) : ours;
             Writer w;
             w.u8(kTaken), w.u8(from), w.u64(x);
             send_all(w.out);
@@ -1555,7 +1634,15 @@ struct Session::Impl {
         case kTaken: {
             const uint8_t s = r.u8();
             const uint64_t x = r.u64();
-            if (r.ok() && s < seats) taken(s, x);
+            if (!r.ok() || s >= seats) break;
+            // (tests: SPIKEOUT_TEST_TAKEN_LATE_MS=N, another's cabinet taken acted on N ms after it comes: the message
+            // behind others on the way, past the frame it's taken from, as issue 24's tests had it once)
+            static const int late_ms = std::getenv("SPIKEOUT_TEST_TAKEN_LATE_MS") ? std::atoi(std::getenv("SPIKEOUT_TEST_TAKEN_LATE_MS")) : 0;
+            if (late_ms > 0 && s != my_seat) {
+                taken_late.push_back({s, x, Clock::now() + std::chrono::milliseconds(late_ms)});
+                break;
+            }
+            taken(s, x);
             break;
         }
         case kSuspect: {
@@ -1636,6 +1723,10 @@ struct Session::Impl {
                     }
                 continue;
             }
+            // (none kept before our game has started: a joiner's come before it even reads that it joined in progress, and
+            // its streams start at the state's frame; unacknowledged, they come again. Joined in progress, the state not
+            // here yet: its frame is where we start)
+            if (!started || history_waits()) continue;
             // Our own: only a cabinet taken in progress, its frames before it was ours (none).
             if (s == my_seat && !late) continue;
             if (s == from && drops[s].suspected) continue; // (frozen while its drop is settled)
@@ -1722,6 +1813,14 @@ struct Session::Impl {
         if (a == my_seat || a >= seats) return;
         Writer w;
         w.u8(kTake);
+        if (take_at) { // (the frame we'll have caught up by: none, the authority's choice)
+            w.u64(take_at);
+            if (take_frame && take_rate > 0) { // (where we are now, by our speed (asked again later: moved on), and it)
+                const double since = std::chrono::duration<double>(now - take_measured).count();
+                w.u64(take_frame + static_cast<uint64_t>(take_rate * since));
+                w.u32(static_cast<uint32_t>(take_rate * 1000.0));
+            }
+        }
         send_reliable(a, w.out);
     }
 
@@ -1814,13 +1913,32 @@ struct Session::Impl {
             }
             uint64_t x = streams[s].next();
             bool all = true;
+            std::string waiting; // (who hasn't answered: said once a second while the drop waits, for reports)
+            std::vector<uint8_t> unanswered;
             for (uint8_t o = 0; o < seats; ++o) {
                 if (o == my_seat || o == s || !peers[o].present || peers[o].dropped || drops[o].suspected) continue;
                 const auto it = d.answers.find(o);
-                if (it == d.answers.end()) all = false;
+                if (it == d.answers.end()) all = false, waiting += " seat " + std::to_string(o + 1), unanswered.push_back(o);
                 else x = std::max(x, it->second);
             }
-            if (!all || streams[s].next() < x) continue; // (still to hear, or the frames still to come)
+            if (!all || streams[s].next() < x) { // (still to hear, or the frames still to come)
+                const auto now_said = Clock::now();
+                if (now_said - d.said >= std::chrono::seconds(1)) {
+                    d.said = now_said;
+                    // (asked again, those who haven't answered: the question went once, at the drop's start, so a
+                    // player joined since was never asked and one whose answer was lost never asked again, and the
+                    // drop waited for them for good: issue 22's tests, 2026-11-14, a room stood 18-46 s)
+                    for (const uint8_t o : unanswered) {
+                        Writer w;
+                        w.u8(kSuspect), w.u8(s);
+                        send_urgent(o, w.out);
+                    }
+                    log("seat " + std::to_string(s + 1) + "'s drop waits: " +
+                        (!all ? "no answer yet from" + waiting : "its frames to " + std::to_string(x) + " (here to " +
+                                                                     std::to_string(streams[s].next()) + ")"));
+                }
+                continue;
+            }
             d.announced = true;
             Writer w;
             w.u8(kIdle), w.u8(s), w.u64(x);
@@ -1902,6 +2020,13 @@ struct Session::Impl {
             if (my_seat != kNoSeat && !leaving && my_status != Session::Status{} && now - status_sent > kStatusEvery) send_status();
             if (take_wanted && !mine_from && !leaving && (authority() != take_asked || now - take_sent > kTakeRetry))
                 ask_take(now);
+            for (auto it = taken_late.begin(); it != taken_late.end();) // (tests: a cabinet's taking acted on late)
+                if (now >= it->due) {
+                    const TakenLate t = *it;
+                    it = taken_late.erase(it);
+                    taken(t.seat, t.frame);
+                } else
+                    ++it;
             if (!started && !is_host && my_seat != kNoSeat && !room_closed && peers[host_seat].present &&
                 now - peers[host_seat].heard > kDropAfter) { // (before the start, a host gone quiet: the room is gone)
                 room_closed = true;
@@ -1917,8 +2042,7 @@ struct Session::Impl {
             for (uint8_t s = 0; s < kMaxSeats; ++s) {
                 Peer& p = peers[s];
                 if (s == my_seat || !p.present || p.dropped) continue;
-                if (leaving) { // (gone: only the goodbye still to get through)
-                    pump_reliable(s, p);
+                if (leaving) { // (gone: nothing more but the goodbye, Session::leave; a goodbye lost, quiet: dropped in 3 s)
                     continue;
                 }
                 if ((p.inputs_due || inputs_pending(s, p)) && now - p.inputs_sent >= kInputResend) send_inputs(s, p);
@@ -2172,7 +2296,7 @@ void Session::local_input(uint64_t frame, const InputBytes& in) {
         return;
     }
     m.append_local(frame, in);
-    m.fill_open(frame); // (the authority: the cabinets no player has, as far as ours)
+    m.fill_open(frame + kOpenAhead); // (the authority: the cabinets no player has, a little past ours)
     for (uint8_t s = 0; s < kMaxSeats; ++s) { // out at once
         Impl::Peer& p = m.peers[s];
         if (s != m.my_seat && p.present && !p.dropped) m.send_inputs(s, p);
@@ -2292,6 +2416,16 @@ void Session::hold_inputs(uint64_t frames) {
     impl_->send_hold = frames;
 }
 
+void Session::preload_history(uint64_t first, const std::vector<std::vector<InputBytes>>& frames) {
+    Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    for (uint8_t s = 0; s < m.seats && s < frames.size(); ++s) {
+        Stream& st = m.streams[s];
+        st.known = true, st.first = first, st.frames = frames[s];
+    }
+    if (m.send_hold && m.my_seat < kMaxSeats) m.set_at.assign(m.streams[m.my_seat].frames.size(), Clock::time_point{});
+}
+
 void Session::want_backup(uint8_t seat) {
     Impl& m = *impl_;
     std::lock_guard guard(m.lock);
@@ -2301,17 +2435,24 @@ void Session::want_backup(uint8_t seat) {
     m.send_reliable(seat, w.out);
 }
 
-void Session::take_seat() {
+void Session::take_seat(uint64_t at, uint64_t frame, double rate) {
     Impl& m = *impl_;
     std::lock_guard guard(m.lock);
     if (!m.late || m.mine_from || m.my_seat == kNoSeat || m.take_wanted) return;
+    const auto now = Clock::now();
     m.take_wanted = true;
-    m.ask_take(Clock::now());
+    m.take_at = at, m.take_frame = frame, m.take_rate = rate, m.take_measured = now;
+    m.ask_take(now);
 }
 
 uint64_t Session::seat_from() const {
     std::lock_guard guard(impl_->lock);
     return impl_->late && impl_->mine_from ? *impl_->mine_from : 0;
+}
+
+bool Session::seat_pending() const {
+    std::lock_guard guard(impl_->lock);
+    return impl_->late && impl_->take_wanted && !impl_->mine_from;
 }
 
 uint64_t Session::inputs_known(uint8_t seat) const {
@@ -2374,17 +2515,18 @@ void Session::leave() {
         Writer w;
         w.u8(kBye);
         m.send_all(w.out);
-        for (uint8_t s = 0; s < kMaxSeats; ++s) // (no waiting for acknowledgements: sent a few times)
+        // A player's goodbye: its datagram, a few times, and nothing else (0.1.0-preview5.1, issue 22's tests: its whole
+        // reliable queue, hundreds of backup pieces, was sent again three times here, filling a slow upload; the
+        // goodbye's datagrams were lost behind it, the reliable one waited its turn, and the others, still hearing those
+        // pieces, waited 15-46 s for inputs that would never come. Now nothing more is sent after leaving: a goodbye
+        // lost, its silence drops it in kDropInGame. The reliable goodbye stays queued, for whoever has room for it.)
+        for (uint8_t s = 0; s < kMaxSeats; ++s)
             if (s != m.my_seat && m.peers[s].present && !m.peers[s].dropped) {
-                for (int k = 0; k < 3; ++k) {
-                    for (auto& f : m.peers[s].rel.out) f.ever_sent = false;
-                    m.pump_reliable(s, m.peers[s]);
-                }
-                if (m.my_watch == kNoSeat) // (a player's: its datagram too, past whatever fills the channel's window)
-                    for (int k = 0; k < 3; ++k) m.send_peer(m.peers[s], header(kGoodbye, m.session, m.me()));
+                if (m.my_watch == kNoSeat) m.send_peer(m.peers[s], header(kGoodbye, m.session, m.me()));
+                else m.pump_reliable(s, m.peers[s]); // (a spectator's: reliable, as before)
                 if (const std::size_t queued = m.peers[s].rel.out.size(); queued > 1)
-                    m.log("goodbye to " + m.peers[s].name + ": " + std::to_string(queued) + " reliable pieces still queued to it" +
-                          (queued > kWindow ? " (past the window: the reliable goodbye not sent)" : ""));
+                    m.log("goodbye to " + m.peers[s].name + ": " + std::to_string(queued) +
+                          " reliable pieces left unsent (the goodbye goes as datagrams)");
             }
         if (m.is_host) // (the spectators: theirs too; with a game in progress they wait for the room's next host)
             for (Impl::Watcher& v : m.watchers) {
@@ -2395,8 +2537,21 @@ void Session::leave() {
                     m.pump_reliable(0, v);
                 }
             }
-        if (m.turn) m.turn->release(m.turn_send()); // (the relay's allocation given back: the next run may have one)
     }
+    // (the goodbye's datagram again, spaced: a moment's full line drops all sent at once; ~0.3 s here, whoever calls
+    // leave() may close the session right after. Each round also lets out what a test's latency holds.)
+    for (int round = 0; round < 5; ++round) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        std::lock_guard guard(m.lock);
+        if (!m.socket.is_open()) break;
+        const auto now = Clock::now();
+        for (uint8_t s = 0; s < kMaxSeats; ++s)
+            if (s != m.my_seat && m.peers[s].present && !m.peers[s].dropped && m.my_watch == kNoSeat)
+                m.send_peer(m.peers[s], header(kGoodbye, m.session, m.me()));
+        m.send_held(now);
+    }
+    std::lock_guard guard(m.lock);
+    if (m.turn) m.turn->release(m.turn_send()); // (the relay's allocation given back, after the goodbyes: the next run may have one)
 }
 
 void Session::vanish() {

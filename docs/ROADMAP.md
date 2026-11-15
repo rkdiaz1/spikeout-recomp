@@ -83,6 +83,8 @@ Spikeout is one player per cabinet; multiplayer means linked boards.
 - [x] Record and replay: `spikeout --record FILE`, `gamerun --replay FILE` (inputs every frame, RAM hashes to check)
 - [ ] Save/load in under a millisecond (a state is 29 MB, mostly Real3D memory: keep what changed, compress)
 - [ ] Linked boards (`LinkRing`) in a state; a recording that starts from a state
+- [x] F10 after a restart: the newest save in the saves folder (0.1.0-preview5.1, issue 27)
+- [ ] **Release 6:** F10 opens a list of saves to choose from, newest first (a page of the Esc menu; keyboard or pad). Each row: a small picture of the moment (F9 saves one beside the state), the stage (read from the game's memory when saving), time played, the date. Saves from another version marked and confirmed, damaged ones greyed out; the version and checksum checks as now; loading keeps the game left (F9 within 5 s goes back); delete asks first; not in network play. The state header gains the stage and time played (raise `kStateFormat`; older saves still load, shown with "—")
 
 ## 7. Online play
 
@@ -91,6 +93,13 @@ See [netplay.md](netplay.md).
 - [ ] Mode A: one board per PC, cabinet link over the network (LAN first)
 - [ ] Mode B: rollback, every PC simulates all linked boards; 2–4 players plus spectators
 - [ ] Lobby / matchmaking; Steam networking as an optional backend
+- [ ] **One board a PC, open problems** (found 2026-11-14; rare: 9 of 1,251 network problem reports were on one board; details in [netplay.md](netplay.md), "Joining a long game"):
+  - A player joining an empty seat in play never gets the game: nobody runs an empty cabinet whole, so the host asks the joiner itself for it. Cure: the host (the authority) runs empty cabinets whole and answers for them.
+  - A player leaving on a very slow upload (under ~0.5 MB/s): its final state (~5.4 MB) isn't through in the 10 s it waits, so the others never have its cabinet whole and a later joiner of that seat can't get in. Cure: the others fall back on its last backup (every 120 frames) and run it on with its inputs, as for a player gone without a goodbye; exact, at worst a short hitch (to measure).
+  - An empty seat keeps one board from ever handing back to side runs.
+  - A one-board joiner's hand-back to side runs while catching up can go out of step (made packets differ from the real ones); waits for the decompile.
+  - Once, an all-one-board room stood at the frame a one-board joiner's cabinet began; not found yet.
+- [ ] **Release 6:** the room's difficulty, shown before joining and while playing: in the lobby's room details and join list, and in the network status's room line (`HOST NAME · ROOM CODE · HARD`), as a coloured pill (suggested: the easiest green, normal white/grey, harder orange, the hardest red; the colours picked from a preview). Linked play uses the master cabinet's setting, so only the host's is needed. Its EEPROM word: see `tools::ArcadeSettings` (tests/test_devices.cpp, "arcade settings"); the level names as the game's test menu says them. The lobby's new room field optional, so older builds still list and join
 
 ## 8. Release
 

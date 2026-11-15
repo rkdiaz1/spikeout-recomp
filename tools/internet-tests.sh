@@ -54,9 +54,17 @@ sync() {
         files=$( (git diff --name-only "$base" -- src tools games tests third_party assets CMakeLists.txt cmake; git ls-files --others --exclude-standard -- src tools games tests third_party assets) | sort -u)
         # (new folders made first: gh codespace cp makes none)
         cs "$c" "cd /workspaces/spikeout-recomp && mkdir -p $(for f in $files; do dirname "$f"; done | sort -u | tr '\n' ' ')" >/dev/null
-        for f in $files; do [ -f "$f" ] && timeout 120 gh codespace cp -c "$c" "$f" "remote:/workspaces/spikeout-recomp/$f" >/dev/null 2>&1; done
+        # (all of them in one archive, one copy and one unpacking: a gh codespace cp a file was one SSH connection
+        # each, ~15 minutes for 52 files on two Codespaces, 2026-11-14)
+        local archive="/tmp/spikeout-sync-$$.tar.gz"
+        tar czf "$archive" $(for f in $files; do [ -f "$f" ] && echo "$f"; done)
+        timeout 300 gh codespace cp -c "$c" "$archive" "remote:/tmp/spikeout-sync.tar.gz" >/dev/null 2>&1
+        cs "$c" "cd /workspaces/spikeout-recomp && tar xzf /tmp/spikeout-sync.tar.gz && rm -f /tmp/spikeout-sync.tar.gz" >/dev/null
+        rm -f "$archive"
         local built
-        built=$(cs "$c" "cd /workspaces/spikeout-recomp && sed -i 's/\r\$//' $(echo $files) 2>/dev/null; cmake --build build-codespace --target gamerun 2>&1 | grep -E 'error|Linking CXX executable|no work' | tail -1")
+        # (a build of its own time limit: cs's 3 minutes cut a rebuild of many changed files short, and on Windows the
+        # ssh left behind kept the run waiting for good, 2026-11-14)
+        built=$(timeout 900 gh codespace ssh -c "$c" -- "cd /workspaces/spikeout-recomp && sed -i 's/\r\$//' $(echo $files) 2>/dev/null; cmake --build build-codespace --target gamerun 2>&1 | grep -E 'error|Linking CXX executable|no work' | tail -1" 2>/dev/null)
         say "$c: $(echo $files | wc -w) files, $built"
         case "$built" in *error*|"") echo "STOPPED: $c's build failed or said nothing"; exit 2 ;; esac
     done
