@@ -158,9 +158,15 @@ inline uint64_t code_id() {
     }();
     return id;
 }
+// Header version 3 (release 6, the Saves page): also where in the game it was saved, the stage and area as the room
+// listing reads them (the window's stage_of / area_of; 0 not known): a list of saves says where each is without loading
+// it. Version 2's still read (shown with "—"); an older build refuses a version 3 file ("a newer version").
 struct StateFile {
     std::optional<uint64_t> format, code; // (none: made before the header, or its first version's)
     uint64_t frame = 0;
+    uint8_t stage = 0, area = 0; // (version 3: where in the game; 0 not known)
+    bool placed = false;         // (version 3: stage and area said; stage 0 then: not in play)
+    uint8_t difficulty = 0;      // (version 3: the cabinet's arcade difficulty + 1; 0 not known)
     std::vector<uint8_t> state;
     bool matches() const { return format == kStateFormat && code == code_id(); } // (loads as it is)
 };
@@ -177,12 +183,14 @@ inline uint64_t state_checksum(std::span<const uint8_t> state) {
     for (; i < state.size(); ++i) a = (a ^ state[i]) * 0x100000001B3ull, b += a;
     return a ^ (b * 0xC2B2AE3D27D4EB4Full) ^ state.size();
 }
-inline std::vector<uint8_t> state_file_bytes(uint64_t frame, const std::vector<uint8_t>& state) {
+inline std::vector<uint8_t> state_file_bytes(uint64_t frame, const std::vector<uint8_t>& state, uint8_t stage = 0, uint8_t area = 0,
+                                             uint8_t difficulty = 0) { // (difficulty: the cabinet's + 1, 0 not known)
     std::vector<uint8_t> out(kStateMagic, kStateMagic + 8);
     auto u64 = [&](uint64_t v) {
         for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
     };
-    u64(2), u64(kStateFormat), u64(code_id()), u64(frame), u64(state_checksum(state));
+    u64(3), u64(kStateFormat), u64(code_id()), u64(frame), u64(state_checksum(state));
+    u64(stage | uint64_t{area} << 8 | uint64_t{difficulty} << 16), u64(0); // (version 3: where in the game, its difficulty; a word kept)
     out.insert(out.end(), state.begin(), state.end());
     return out;
 }
@@ -204,7 +212,8 @@ inline std::string tile_text_row(std::span<const uint8_t> tile, const std::strin
     return {};
 }
 
-inline StateFile read_state_file(std::vector<uint8_t> bytes) {
+// (`whole` false: the header alone, as the Saves page lists them: no checksum, no state; `bytes` then only its first 64)
+inline StateFile read_state_file(std::vector<uint8_t> bytes, bool whole = true) {
     StateFile f;
     if (bytes.size() < 32 || !std::equal(kStateMagic, kStateMagic + 8, bytes.begin())) {
         f.state = std::move(bytes);
@@ -219,13 +228,16 @@ inline StateFile read_state_file(std::vector<uint8_t> bytes) {
     std::size_t at = 0;
     if (version == 1) { // (the first: its build, then its frame: neither format nor code known)
         f.frame = u64(24), at = 32;
-    } else if (version == 2 && bytes.size() >= 48) {
-        f.format = u64(16), f.code = u64(24), f.frame = u64(32), at = 48;
-        if (state_checksum(std::span<const uint8_t>(bytes).subspan(at)) != u64(40))
+    } else if ((version == 2 && bytes.size() >= 48) || (version == 3 && bytes.size() >= 64)) {
+        f.format = u64(16), f.code = u64(24), f.frame = u64(32), at = version == 3 ? 64 : 48;
+        if (version == 3) f.stage = static_cast<uint8_t>(u64(48)), f.area = static_cast<uint8_t>(u64(48) >> 8), f.placed = true,
+                           f.difficulty = static_cast<uint8_t>(u64(48) >> 16);
+        if (whole && state_checksum(std::span<const uint8_t>(bytes).subspan(at)) != u64(40))
             throw std::runtime_error("the save state is damaged (its checksum differs)");
     } else {
         throw std::runtime_error("a save state of a newer version");
     }
+    if (!whole) return f;
     f.state.assign(bytes.begin() + static_cast<std::ptrdiff_t>(at), bytes.end());
     return f;
 }

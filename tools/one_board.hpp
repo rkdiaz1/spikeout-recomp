@@ -17,6 +17,7 @@
 
 #include "game_setup.hpp"
 #include "input_table.hpp"
+#include "net/event_log.hpp" // (its lines in the network timeline too)
 #include "remote_cabinet.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +41,25 @@
 #include <vector>
 
 namespace tools::one_board {
+
+// A line of one board's in the log, and in the network timeline (net/event_log.hpp) as a note: its hand-overs, shadows
+// and hand-backs, kept with a problem report even when a long game has pushed them out of the log's last lines.
+#if defined(__MINGW32__) && !defined(__clang__)
+__attribute__((format(gnu_printf, 1, 2))) // (MinGW's GCC: checked as the GNU printf the rest of the code uses, %zu and all)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 1, 2)))
+#endif
+inline void say(const char* format, ...) {
+    char text[600];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    std::fputs(text, stdout);
+    std::string note = text;
+    while (!note.empty() && (note.back() == '\n' || note.back() == '\r')) note.pop_back();
+    net::events::add(net::events::Kind::note, 0xFF, 0xFF, 0, 0, "one board: " + note);
+}
 
 // Thrown from a shadow's hook where it finished `count`: the module wants it back there (Game::handed_back).
 struct HandedBack {
@@ -228,7 +249,7 @@ public:
                     return std::pair<uint64_t, uint64_t>{a, b};
                 }();
                 if (frame >= log_range.first && frame <= log_range.second)
-                    std::printf("held: seat %zu frame %llu (board at %llu): %s %08x, the table %llu-%llu\n", seat,
+                    say("held: seat %zu frame %llu (board at %llu): %s %08x, the table %llu-%llu\n", seat,
                                 (unsigned long long)frame, (unsigned long long)here->timing.frames(), in ? "in" : "NONE",
                                 in ? remote::held_word(in->bank0, in->controls, in->controls2) : 0u,
                                 (unsigned long long)table->first(seat), (unsigned long long)table->next(seat));
@@ -305,9 +326,9 @@ public:
         {
             std::lock_guard guard(m.cabinets_lock);
             m.cabinets->end_frame(m.timing.frames() - 1);
-            static const bool say = std::getenv("ONEBOARD_STATE_BYTES") != nullptr; // (tests: the module's own state, every 300 frames)
-            if (say && m.timing.frames() % 300 == 0)
-                std::printf("board %zu frame %llu: the module's state %zu KB\n", m.index, (unsigned long long)m.timing.frames(),
+            static const bool say_bytes = std::getenv("ONEBOARD_STATE_BYTES") != nullptr; // (tests: the module's own state, every 300 frames)
+            if (say_bytes && m.timing.frames() % 300 == 0)
+                say("board %zu frame %llu: the module's state %zu KB\n", m.index, (unsigned long long)m.timing.frames(),
                             m.cabinets->state_bytes() / 1024);
         }
         if (m.game) m.game->live(m.timing.frames());
@@ -338,13 +359,13 @@ public:
             std::scoped_lock guard(m.cabinets_lock, other.cabinets_lock);
             const auto seed = m.done_seed.find(count);
             if (seed == m.done_seed.end()) { // (not kept (a going back since): a shadow still, handed back later; it threw)
-                std::printf("board %zu: no seed of count %u to hand back with: a shadow still\n", m.index, count);
+                say("board %zu: no seed of count %u to hand back with: a shadow still\n", m.index, count);
                 m.shadowing = true;
                 return true;
             }
             other.cabinets->hand_back(m.index, seed->second, m.bus.ram(), m.last_link_frame ? m.last_link_frame : m.timing.frames() - 1);
         }
-        std::printf("board %zu: its shadow handed back to board %zu's side runs after count %u (frame %llu)\n", m.index, other.index,
+        say("board %zu: its shadow handed back to board %zu's side runs after count %u (frame %llu)\n", m.index, other.index,
                     count, (unsigned long long)m.timing.frames());
         if (rolling()) { // (rollback: no part of its own now, in the staying board's; guesses again after the next frame,
             // nothing gone back to before it: its save the first in the new way)
@@ -448,7 +469,7 @@ public:
         // from its backup once its player is gone, as one gone without a parting (seat_gone). Its announcement comes a
         // little ahead (kAskAhead: 0.5 s in real time), but gamerun runs faster, and a slow network may take longer)
         if (!whole_here(seat) && m.timing.frames() + 2 > frame) {
-            std::printf("board %zu: board %zu's player leaving after frame %llu, told at frame %llu: too late; its board from its "
+            say("board %zu: board %zu's player leaving after frame %llu, told at frame %llu: too late; its board from its "
                         "backup once it has gone\n",
                         m.index, seat, (unsigned long long)frame, (unsigned long long)m.timing.frames());
             return;
@@ -456,7 +477,7 @@ public:
         departed_.insert(seat);
         if (whole_here(seat)) return; // (whole here already: on as it is)
         remote_frames_[seat] = frame;
-        std::printf("board %zu: board %zu's player leaving after frame %llu: a shadow of it from its state then, whole from there on\n",
+        say("board %zu: board %zu's player leaving after frame %llu: a shadow of it from its state then, whole from there on\n",
                     m.index, seat, (unsigned long long)frame);
     }
     // A player taking a seat whose player went (a game joined in progress): its board is that player's machine's now,
@@ -464,7 +485,7 @@ public:
     void seat_taken(std::size_t seat) {
         std::lock_guard guard(lock_);
         if (departed_.erase(seat) + lost_.erase(seat))
-            std::printf("board %zu: board %zu taken by a new player: its machine's from here, handed back when calm\n", settings_.stays,
+            say("board %zu: board %zu taken by a new player: its machine's from here, handed back when calm\n", settings_.stays,
                         seat);
     }
     // (called at the staying board's frame end)
@@ -475,14 +496,14 @@ public:
         if (departed_.count(seat) || lost_.count(seat) || !m.cabinets || !goes(seat)) return;
         if (whole_here(seat)) { // (whole here as it went: on as it is, never handed back)
             departed_.insert(seat);
-            std::printf("board %zu: board %zu's player gone, its board whole here: on from here\n", m.index, seat);
+            say("board %zu: board %zu's player gone, its board whole here: on from here\n", m.index, seat);
             return;
         }
         const uint64_t now = m.timing.frames();
         const std::optional<uint64_t> from = settings_.backup_frame ? settings_.backup_frame(seat) : std::nullopt;
         if (!from || !settings_.replay || *from >= now) {
             lost_.insert(seat);
-            std::printf("board %zu: board %zu's player gone, no backup of its board: had nowhere whole\n", m.index, seat);
+            say("board %zu: board %zu's player gone, no backup of its board: had nowhere whole\n", m.index, seat);
             return;
         }
         // (run from its backup on its own, a frame of it once this game has run that frame, to a frame ahead: as
@@ -495,7 +516,7 @@ public:
         uint64_t until = idle_from + kGoneHandOver;
         if (until < std::max(now + 120, 2 * now - *from)) {
             const uint64_t late = now + std::max<uint64_t>(120, now - *from);
-            std::printf("board %zu: board %zu's player gone at frame %llu, noticed at %llu: whole from %llu, not %llu (this machine's own)\n",
+            say("board %zu: board %zu's player gone at frame %llu, noticed at %llu: whole from %llu, not %llu (this machine's own)\n",
                         m.index, seat, (unsigned long long)idle_from, (unsigned long long)now, (unsigned long long)late,
                         (unsigned long long)until);
             until = late;
@@ -509,7 +530,7 @@ public:
         departed_.insert(seat);
         remote_frames_[seat] = until;
         replays_[seat] = Replaying{};
-        std::printf("board %zu: board %zu's player gone: its board run on here from its backup at frame %llu, whole from frame %llu\n",
+        say("board %zu: board %zu's player gone: its board run on here from its backup at frame %llu, whole from frame %llu\n",
                     m.index, seat, (unsigned long long)*from, (unsigned long long)until);
         replay_threads_.emplace_back([this, seat, until] {
             std::optional<RemoteBoard> board = settings_.replay(seat, until, [this](uint64_t f) { return wait_live(f); });
@@ -589,7 +610,7 @@ public:
                 m.shadow_base = m.ram_at.rbegin()->second;
                 for (uint32_t a = 0; a < m.shadow_base.size(); ++a)
                     if (m.shadow_base[a] != theirs->second[a]) m.shadow_own.push_back(a);
-                std::printf("board %zu: %zu bytes its own (against board %zu's, after count %u)\n", m.index, m.shadow_own.size(),
+                say("board %zu: %zu bytes its own (against board %zu's, after count %u)\n", m.index, m.shadow_own.size(),
                             other.index, theirs->first);
             }
         m.keep_ram = other.keep_ram = false;
@@ -638,10 +659,10 @@ public:
                                     if (at == want) late_[seat] = Late{want, true};
                             }
                             settings_.run_again_from(want + 1);
-                            std::printf("board %zu: its shadow's state for frame %llu came at frame %llu: every board back to it\n",
+                            say("board %zu: its shadow's state for frame %llu came at frame %llu: every board back to it\n",
                                         m.index, (unsigned long long)want, (unsigned long long)f);
                         } else if (last) {
-                            std::printf("board %zu: no state of it came from its machine for frame %llu\n", m.index,
+                            say("board %zu: no state of it came from its machine for frame %llu\n", m.index,
                                         (unsigned long long)want);
                             std::lock_guard guard(lock_);
                             late_.erase(m.index), remote_frames_.erase(m.index); // (asked again by the rules, if still wanted)
@@ -659,7 +680,7 @@ public:
                 if (want != ~0ull && f == want && rolling() &&
                     !(settings_.wait_settled ? settings_.wait_settled(want) : settings_.settled(want))) {
                     const uint64_t again = want + kAskAhead;
-                    std::printf("board %zu: its shadow's frame %llu guessed wrong: asked again for frame %llu\n", m.index,
+                    say("board %zu: its shadow's frame %llu guessed wrong: asked again for frame %llu\n", m.index,
                                 (unsigned long long)want, (unsigned long long)again);
                     {
                         std::lock_guard guard(lock_);
@@ -684,7 +705,7 @@ public:
                     } else {
                         if (!late_.count(m.index)) {
                             late_[m.index] = Late{want, false};
-                            std::printf("board %zu: its shadow's state for frame %llu not come yet: on side runs meanwhile\n", m.index,
+                            say("board %zu: its shadow's state for frame %llu not come yet: on side runs meanwhile\n", m.index,
                                         (unsigned long long)want);
                         }
                         want = ~0ull; // (not loaded at this frame now)
@@ -718,7 +739,7 @@ public:
             {
                 std::scoped_lock guard(lock_, other.cabinets_lock);
                 if (shadow_frame_ != ~0ull && f > shadow_frame_ + 1) {
-                    std::printf("board %zu: the staying board's state came too late (taken at frame %llu, here at %llu)\n", m.index,
+                    say("board %zu: the staying board's state came too late (taken at frame %llu, here at %llu)\n", m.index,
                                 (unsigned long long)shadow_frame_, (unsigned long long)f);
                     return false;
                 }
@@ -756,7 +777,7 @@ public:
                 if (other.cabinets->shadow_state(m.index, shadow_count_, own)) break;
                 // (none for that count: that cabinet a count off this board's just then, after a frame it missed or held
                 // back: asked again the next frame)
-                std::printf("board %zu: no shadow state for count %u, again\n", m.index, shadow_count_);
+                say("board %zu: no shadow state for count %u, again\n", m.index, shadow_count_);
                 shadow_frame_ = ~0ull, other.shadow_taken = false;
             }
             if (begin != ~0ull) // (and the frame's turns after where it was to start)
@@ -829,7 +850,7 @@ public:
             else m.bus.write32(f.addr, f.value);
         }
         m.bus.write8(kRole, role);
-        std::printf("board %zu: its shadow from board %zu's state after count %u (frame %llu), at frame %llu\n", m.index, other.index,
+        say("board %zu: its shadow from board %zu's state after count %u (frame %llu), at frame %llu\n", m.index, other.index,
                     shadow_count_, (unsigned long long)shadow_frame_, (unsigned long long)m.timing.frames());
         {
             std::lock_guard guard(lock_);
@@ -867,7 +888,7 @@ private:
         std::sscanf(spec, "%llu:%llu", &from, &to);
         const uint64_t f = m.timing.frames();
         if (f < from || f > to) return;
-        std::printf("trace board %zu frame %llu line %llu: %s, count %u\n", m.index, (unsigned long long)f,
+        say("trace board %zu frame %llu line %llu: %s, count %u\n", m.index, (unsigned long long)f,
                     (unsigned long long)((m.c.cycles() - m.timing.frame_start(f)) / m.timing.line_cycles()),
                     pc == remote::kRecordWrite ? "link (its record)" : pc == remote::kLinkSkipped ? "count done" : "dispatcher",
                     m.bus.read32(remote::kLogicCounter));
@@ -933,7 +954,7 @@ private:
             }
             if (trouble && m.shadow_taken && !waiting) {
                 m.shadow_from = frame, m.shadow_taken = false;
-                std::printf("board %zu: a shadow of board %zu wanted at frame %llu (least time %u/64 s, mode %u, mask %08x%s)\n", m.index,
+                say("board %zu: a shadow of board %zu wanted at frame %llu (least time %u/64 s, mode %u, mask %08x%s)\n", m.index,
                             gone, (unsigned long long)frame, least, m.bus.read8(0x10400A), mask, joining ? ", its buttons" : "");
             }
             if (trouble && !m.shadow_from) m.shadow_from = frame;
@@ -948,7 +969,7 @@ private:
             other.held = false; // (asked: kept from here, until the hand-back)
             cab.ask_hand_back(gone);
             m.calm_frames = 0;
-            std::printf("board %zu: board %zu handed back to side runs from frame %llu\n", m.index, gone, (unsigned long long)frame);
+            say("board %zu: board %zu handed back to side runs from frame %llu\n", m.index, gone, (unsigned long long)frame);
         }
     }
 
@@ -995,7 +1016,7 @@ private:
                     remote_frames_[gone] = frame + kAskAhead;
                     settings_.ask_board(gone, frame + kAskAhead);
                     if (late_loads()) settings_.pin(frame + kAskAhead); // (kept as it is, should its state come late)
-                    std::printf("board %zu: a shadow of board %zu wanted at frame %llu (least time %u/64 s, mode %u, mask %08x%s): its "
+                    say("board %zu: a shadow of board %zu wanted at frame %llu (least time %u/64 s, mode %u, mask %08x%s): its "
                                 "machine's state asked for frame %llu\n",
                                 m.index, gone, (unsigned long long)frame, least, m.bus.read8(0x10400A), mask, joining ? ", its buttons" : "",
                                 (unsigned long long)(frame + kAskAhead));
@@ -1021,7 +1042,7 @@ private:
                 other.held = false; // (asked: its seeds kept from here, until the hand-back)
                 cab.ask_hand_back(gone);
                 calm_frames = 0;
-                std::printf("board %zu: board %zu handed back to side runs from frame %llu\n", m.index, gone, (unsigned long long)frame);
+                say("board %zu: board %zu handed back to side runs from frame %llu\n", m.index, gone, (unsigned long long)frame);
             }
         }
         m.keeping = any_keeping;
@@ -1046,7 +1067,7 @@ private:
                 std::lock_guard guard(g.lock_);
                 g.state_ = std::move(s.data()), g.master_ram_ = std::move(ram), g.master_cpu_ = cpu;
                 g.master_ready_ = true;
-                std::printf("board %zu: the master's shadow from its side run of count %u (frame %llu)\n", m.index,
+                say("board %zu: the master's shadow from its side run of count %u (frame %llu)\n", m.index,
                             m.bus.read32(remote::kLogicCounter), (unsigned long long)m.timing.frames());
             }
         }
@@ -1061,9 +1082,9 @@ private:
             m.shadow_taken = true;
             const uint32_t count = m.bus.read32(remote::kLogicCounter);
             const uint64_t frame = m.timing.frames();
-            std::printf("board %zu: state for the shadow asked at frame %llu, count %u\n", m.index, (unsigned long long)frame, count);
+            say("board %zu: state for the shadow asked at frame %llu, count %u\n", m.index, (unsigned long long)frame, count);
             c.request_snapshot([&g, &m, count, frame](uint32_t at) {
-                std::printf("board %zu: state for the shadow taken at frame %llu (asked at %llu), pc %08x%s\n", m.index,
+                say("board %zu: state for the shadow taken at frame %llu (asked at %llu), pc %08x%s\n", m.index,
                             (unsigned long long)m.timing.frames(), (unsigned long long)frame, at,
                             m.cabinets->inside() ? ", in a side run" : "");
                 m3::State s;
@@ -1134,7 +1155,7 @@ private:
         }
         if (!replayed) state = settings_.wait_board(m.index, frame);
         if (!state) {
-            std::printf("board %zu: no state of it %s for frame %llu\n", m.index, replayed ? "from its backup" : "came from its machine",
+            say("board %zu: no state of it %s for frame %llu\n", m.index, replayed ? "from its backup" : "came from its machine",
                         (unsigned long long)frame);
             return false;
         }
@@ -1171,7 +1192,7 @@ private:
         if (settings_.rewind_link) settings_.rewind_link(m.index, *state);
         shadow_inputs(m);
         m.shadowing = true;
-        std::printf("board %zu: its shadow from its machine's state at frame %llu (waited %.0f ms; board %zu at frame %llu)\n", m.index,
+        say("board %zu: its shadow from its machine's state at frame %llu (waited %.0f ms; board %zu at frame %llu)\n", m.index,
                     (unsigned long long)frame, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
                     other.index, (unsigned long long)other.timing.frames());
         return true;
@@ -1218,7 +1239,7 @@ private:
         }
         m.bus.write8(kRole, role);
         m.shadowing = true;
-        std::printf("board %zu: the master's shadow from frame %llu, cycle %llu\n", m.index, (unsigned long long)m.timing.frames(),
+        say("board %zu: the master's shadow from frame %llu, cycle %llu\n", m.index, (unsigned long long)m.timing.frames(),
                     (unsigned long long)(m.c.cycles() - m.timing.frame_start(m.timing.frames())));
         return true;
     }

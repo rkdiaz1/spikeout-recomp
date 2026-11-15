@@ -229,7 +229,13 @@ bool UdpSocket::send_to(const Address& to, std::span<const uint8_t> data) {
     const sockaddr_in a = to_sockaddr(to);
     const auto sent = ::sendto(sock(fd_), reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()), 0,
                                reinterpret_cast<const sockaddr*>(&a), sizeof a);
-    return sent >= 0 && static_cast<std::size_t>(sent) == data.size();
+    if (sent >= 0 && static_cast<std::size_t>(sent) == data.size()) return true;
+#ifdef _WIN32
+    last_send_error_ = sent < 0 ? WSAGetLastError() : 0;
+#else
+    last_send_error_ = sent < 0 ? errno : 0;
+#endif
+    return false;
 }
 
 std::optional<UdpSocket::Datagram> UdpSocket::receive() {

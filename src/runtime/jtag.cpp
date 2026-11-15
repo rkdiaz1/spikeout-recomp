@@ -4,6 +4,9 @@
 #include "runtime/jtag.hpp"
 #include "runtime/state.hpp"
 
+#include <iterator>
+#include <stdexcept>
+
 namespace m3 {
 
 namespace {
@@ -188,6 +191,12 @@ void Jtag::state(m3::State& s) {
         s.io(d.length), s.io(d.instruction);
     }
     s.io(state_), s.io(tdo_), s.io(last_tck_), s.io(modewords_), s.io(mem_config_);
+    // (the state's row in kNext; a register's length a shift of 64 bits can take)
+    if (s.loading()) {
+        bool bad = static_cast<std::size_t>(state_) >= std::size(kNext);
+        for (const Device& d : chain_) bad = bad || d.length < 1 || d.length > 64;
+        if (bad) throw std::runtime_error("save state: the JTAG chain's state out of range");
+    }
 }
 
 } // namespace m3

@@ -36,24 +36,20 @@ four-player co-op over the internet, one player a PC, as four linked cabinets pl
 
 ## Latest update
 
-**0.1.0-preview5** ([all the details](https://github.com/tastyrepublic/spikeout-recomp/releases/tag/v0.1.0-preview5))
+**0.1.0-preview6** ([all the details](https://github.com/tastyrepublic/spikeout-recomp/releases/tag/v0.1.0-preview6))
 
-- **Thank you for the reports:** in its first day, preview4's automatic reports brought in about 170 network games
-  from players in Hong Kong, Taiwan, Japan, Canada, Australia and the UK, and showed us problems we couldn't see on
-  our own machines.
-- **The game list shows where each game is:** its stage and area, like "Stage 2 · Warehouse", kept up to date while
-  the list is open.
-- **Watching:** switching between players is smoother (the picture could stand still for seconds), and a game that
-  never answers now gives up after 45 seconds with a reason.
-- **Screenshots (F12)** now look like the game on your screen: your render scale, picture shape, CRT colours and
-  filter.
-- **Esc > Game > Game folder** shows where your settings, save states, screenshots and logs are, and opens it.
-- **XInput sticks** always show Xbox button names.
-- **Reports that find more:** any crash or freeze, also at the start; what a freeze was waiting for; when each
-  player's buttons arrived over the network; how smooth each game was; and the layout of a stick you set up yourself.
-  The game asks again once, as the question now covers more.
-- **Next: the next update focuses on network play first:** a room freezing when a late player takes their cabinet,
-  then a slow PC slowing everyone (see [Roadmap](#roadmap)).
+- **Saves to choose from (F10):** a list of your saves, newest first, each with a picture of the moment, where it was
+  ("Stage 3 · Shipyard · Normal"), the date and how long into the game. Delete one from the list; damaged ones are
+  greyed out. Saving no longer freezes the picture for a moment.
+- **The room's difficulty** in the join list and on the room line while you play.
+- **Reports that can be played again:** when the game shows "Communication error", a report is saved at once with
+  every cabinet's state and the whole game's recording, so we can run it again here exactly. That error is the most
+  reported problem after joining, and these reports are how we'll find it: please keep **Send reports** on.
+- **Steadier with a far player:** one player's unsteady connection no longer slows what's sent to everyone, and their
+  backups no longer pile up for minutes.
+- **Safer loading:** a damaged save, or a bad game state from another computer, is refused instead of crashing or
+  freezing the game (with thanks to cerroverb, pull request 26).
+- **Next:** finding and fixing the "Communication error" (see [Roadmap](#roadmap)).
 
 ## About
 
@@ -149,7 +145,7 @@ Change them in the menu (<kbd>Esc</kbd>), under Controls.
 | <kbd>Z</kbd> <kbd>X</kbd> <kbd>C</kbd> <kbd>V</kbd> | Beat, charge, jump, shift |
 | <kbd>5</kbd> / <kbd>1</kbd> | Coin / start |
 | <kbd>Esc</kbd> | The menu (a pad: Guide, the touchpad, or Back + Start) |
-| <kbd>F9</kbd> / <kbd>F10</kbd> | Save state / load the last, also one saved before the game was restarted (press twice; <kbd>F9</kbd> within 5 seconds undoes it) |
+| <kbd>F9</kbd> / <kbd>F10</kbd> | Save state / the list of saves to load one (<kbd>F9</kbd> within 5 seconds of a load goes back) |
 | <kbd>F12</kbd> | A screenshot (in the folder the game was started from) |
 | <kbd>Tab</kbd> (held) | As fast as it goes |
 | <kbd>F2</kbd> / <kbd>F1</kbd> | The arcade's test and service buttons |
@@ -176,7 +172,8 @@ diagonals are as easy to hold as up, down, left and right. The d-pad and the key
 - **The cabinet's sound**: the front and rear speakers apart, on a four-channel output or two outputs.
 - **The arcade's settings**, as an operator sets them: difficulty, region, free play, the demo's sound, and its test
   menu.
-- **Save states**, checked before they load and kept across updates.
+- **Save states**: F10 lists your saves with a picture of each moment and where it was (stage, area, difficulty),
+  when and how long into the game; checked before they load, and kept across updates.
 
 <p align="center">
   <img src="docs/images/fight-16x9.jpg" alt="A fight in a hall, 16:9" width="49%">
@@ -195,6 +192,10 @@ diagonals are as easy to hold as up, down, left and right. The d-pad and the key
   <img src="docs/images/crt-4x3.jpg" alt="The arcade's 4:3 with CRT colours and the CRT filter" width="60%">
   <br><sub>The arcade's 4:3, with a Sega arcade monitor's colours and the CRT filter</sub>
 </p>
+<p align="center">
+  <img src="docs/images/saves.jpg" alt="The saves list (F10): each save with a picture of the moment, its stage, area and difficulty, the date and the time played" width="80%">
+  <br><sub>F10: your saves, newest first, each with a picture of the moment and where it was in the game</sub>
+</p>
 
 ## Online play
 
@@ -211,10 +212,10 @@ and only the players' inputs travel, so the game is the same on every screen.
 > network play's bugs.
 
 <p align="center">
-  <img src="docs/images/network-play.jpg" alt="A three-player network game: the seat list with each player's connection and board mode" width="800">
-  <br><sub>Three players, one PC each, about 80 ms apart: the seat list on the right shows each player's connection and
-  how their PC runs the game (ALL BOARDS or 1 BOARD, RB: rollback), and for the others how often their presses were
-  guessed wrong here (RB 0, RB 4)</sub>
+  <img src="docs/images/network-play.jpg" alt="A three-player network game: the room line with the game's difficulty, and the seat list with each player's connection and board mode" width="800">
+  <br><sub>Three players, one PC each, about 80 ms apart: the room line shows its host and the game's difficulty
+  (NORMAL); the seat list shows each player's connection and how their PC runs the game (ALL BOARDS or 1 BOARD, RB:
+  rollback), and for the others how often their presses were guessed wrong here (RB 0, RB 2)</sub>
 </p>
 
 - **Host a game** (Esc > Network play): on the internet lobby, or only on your own network. You get a six-character room

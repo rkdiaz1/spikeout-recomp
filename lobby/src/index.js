@@ -12,7 +12,8 @@
 //                                                  progress with a cabinet free, then full ones (to watch))
 //   host   {name, seats, public, session, port, candidates[, takeover: code]}
 //                                        -> hosted {code}
-//   update {taken, started[, watchers, stage, area]}  (the host's game; stage and area: what its game is playing)
+//   update {taken, started[, watchers, stage, area, difficulty]}  (the host's game; stage and area: what its game is playing;
+//                                        difficulty: its arcade level + 1, 1 easiest - 5 hardest, release 6)
 //   unhost {}
 //   join   {code, port, candidates[, watch]}
 //                                        -> joining {code, name, seats, session, candidates, country} (watch: a
@@ -314,6 +315,7 @@ export class Lobby extends DurableObject {
 					started: h.game.started,
 					stage: h.game.stage || 0,
 					area: h.game.area || 0,
+					difficulty: h.game.difficulty || 0,
 					session: h.game.session,
 					country: h.country || "",
 					ms: estimate(a, h),
@@ -361,6 +363,8 @@ export class Lobby extends DurableObject {
 				// (the game's stage and area, as the host's game has them: shown beside the room in the list; 0.1.0-preview5)
 				if (m.stage !== undefined) a.game.stage = Math.min(15, Math.max(0, Number(m.stage) | 0));
 				if (m.area !== undefined) a.game.area = Math.min(255, Math.max(0, Number(m.area) | 0));
+				// (the room's difficulty, the master cabinet's level + 1, shown as a coloured pill; optional: older builds send none)
+				if (m.difficulty !== undefined) a.game.difficulty = Math.min(5, Math.max(0, Number(m.difficulty) | 0));
 				ws.serializeAttachment(a);
 				return;
 
@@ -383,7 +387,7 @@ export class Lobby extends DurableObject {
 				const port = Number(m.port) | 0;
 				const mine = candidates(m.candidates, seen && port ? `${seen}:${port}` : "");
 				host.ws.send(JSON.stringify({ t: "joiner", name: a.name, candidates: mine, country: a.country, watch: Boolean(m.watch) }));
-				return send({ t: "joining", code, name: g.name, seats: g.seats, session: g.session, candidates: g.candidates, country: host.a.country });
+				return send({ t: "joining", code, name: g.name, seats: g.seats, session: g.session, candidates: g.candidates, country: host.a.country, difficulty: g.difficulty || 0 });
 			}
 
 			case "turn": {

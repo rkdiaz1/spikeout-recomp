@@ -7,7 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <random>
+#include <set>
 
 namespace net {
 
@@ -148,6 +150,9 @@ struct Reliable {
     };
     std::deque<Fragment> out;
     uint32_t next_seq = 0;
+    // (the end of the last backup queued here: Session::backup_through; issue 30, a far player's backups piled up)
+    uint32_t backup_end = 0;
+    bool through(uint32_t end) const { return out.empty() || static_cast<int32_t>(out.front().seq - end) >= 0; }
     // Receiving
     uint32_t rx_next = 0;
     std::map<uint32_t, std::pair<uint8_t, std::vector<uint8_t>>> early;
@@ -369,6 +374,7 @@ struct Session::Impl {
     std::array<Bulk, kMaxWatchers> bulk;
     bool watch_one_board = false; // (a spectator: it runs one board, Session::set_watch_one_board)
     uint8_t stage = 0, area = 0; // (the game's stage and area for the list: Session::set_stage, GameInfo::stage)
+    uint8_t difficulty = 0;      // (the room's difficulty + 1: Session::set_difficulty)
     Clock::time_point watch_punched{};
     std::size_t watchers_told = 0;    // (the count the players were last told)
     Clock::time_point watchers_sent{};
@@ -400,7 +406,15 @@ struct Session::Impl {
     uint64_t send_hold = 0; // (tests: our inputs sent this many frames' time late, Session::hold_inputs)
     std::vector<Clock::time_point> set_at; // (then: when each of our frames was set, from our stream's first)
     uint64_t send_failures = 0, datagrams_in = 0; // (told with a peer not answering)
+    std::map<int, uint64_t> send_errors;          // (the failed sends' system error codes, counted)
     bool late = false, want_state = false;
+    // (one board a PC: the boards' states we expect, by seat and frame: asked for (want_board), or a player's parting
+    // frame; any other kBoard is refused: roadmap, safe loading)
+    std::set<std::pair<uint8_t, uint64_t>> boards_expected;
+    void expect_board(uint8_t seat, uint64_t frame) {
+        boards_expected.insert({seat, frame});
+        while (boards_expected.size() > 256) boards_expected.erase(boards_expected.begin()); // (asked and never come)
+    }
     uint32_t state_size = 0; // (a joiner: the coming kState's size, from kStateSize: its progress)
     Clock::time_point watch_since{}, watch_told{}; // (a spectator: let in then; the wait for the game last logged then)
     std::optional<StartInfo> late_start;
@@ -589,7 +603,20 @@ struct Session::Impl {
         static const bool relay_only = std::getenv("SPIKEOUT_TEST_RELAY_ONLY") != nullptr;
         const bool through_relay = to.relayed || (relay_only && !stun::is_stun(data) && turn && turn->relayed());
         if (through_relay && turn) turn->send_to(Address{to.ip, to.port}, data, turn_send());
-        else if (!socket.send_to(to, data)) ++send_failures;
+        else if (!socket.send_to(to, data)) {
+            ++send_failures;
+            // (each error code said the first time, with the kind of address (no address itself), and counted: issue
+            // 23's "57 sends failed" said nothing of why)
+            const int code = socket.last_send_error();
+            if (send_errors[code]++ == 0)
+                log("a send failed: system error " + std::to_string(code) + " (to " +
+                    (private_address(to.ip) ? "an address on this network" : "an internet address") + ")");
+        }
+    }
+    std::string send_errors_text() const { // ("error N xM, ...": the failed sends' codes)
+        std::string out;
+        for (const auto& [code, n] : send_errors) out += (out.empty() ? "" : ", ") + std::to_string(code) + " x" + std::to_string(n);
+        return out;
     }
     TurnClient::Send turn_send() {
         return [this](const Address& a, std::span<const uint8_t> d) { socket.send_to(a, d); };
@@ -609,6 +636,8 @@ struct Session::Impl {
         static const bool debug = std::getenv("SPIKEOUT_NET_DEBUG") != nullptr;
         if (debug && message.size() > 8000)
             std::fprintf(stderr, "reliable to seat %u: message %u, %zu bytes\n", seat + 1, message.empty() ? 0u : message[0], message.size());
+        // (each in the timeline too, as those come: this machine's own side of the session's exchanges)
+        if (!message.empty()) events::add(events::Kind::sent, seat, 0xFF, message[0], message.size(), events::hex(message.data(), message.size()));
         peers[seat].rel.queue(message);
     }
     void send_all(const std::vector<uint8_t>& message, uint8_t except = kNoSeat) {
@@ -676,15 +705,22 @@ struct Session::Impl {
         if (now - c.changed < std::chrono::seconds(1)) return;
         // (and halved, as the spectators' rate is, when a player's round trip rises: the uplink filling delays the
         // players' inputs before anything is lost, and they come first)
-        bool rising = false;
+        // Only this player's own round trip, or several players' at once: one far player's jumping (150-500 ms, issue
+        // 30) halved every seat's pace, all at the floor for minutes; this machine's own uplink filling shows in
+        // everyone's.
+        bool own_rising = false;
+        int others_rising = 0;
         for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s) {
             Peer& o = peers[s];
             // (the peer sent to counts too, once it plays: its own inputs wait behind what fills the line to it; a joiner
             // still taking in the state isn't playing yet)
             if (s == my_seat || !o.present || o.dropped || o.rtt < 0 || (&o == &p && state_left(p) > 0)) continue;
             o.rtt_floor = o.rtt_floor < 0 ? o.rtt : std::min(o.rtt_floor, o.rtt);
-            if (o.rtt > o.rtt_floor + 40) rising = true;
+            if (o.rtt <= o.rtt_floor + 40) continue;
+            if (&o == &p) own_rising = true;
+            else ++others_rising;
         }
+        const bool rising = own_rising || others_rising >= 2;
         if (p.resent > std::max(4u, p.sent / 20) || (rising && p.sent > 0)) c.rate = std::max(kPaceMin, c.rate / 2);
         else if (p.sent >= 16) c.rate = std::min(kPaceMax, c.rate * 1.25); // (only a busy second shows the line takes more)
         c.changed = now, p.resent = 0, p.sent = 0;
@@ -1403,6 +1439,9 @@ struct Session::Impl {
     }
 
     void on_message(uint8_t from, const std::vector<uint8_t>& m) {
+        // (each in the timeline, its type, size and first bytes: a problem report's session exchanges, gamerun's
+        // --net-arrivals; a state's megabytes only its size)
+        if (!m.empty()) events::add(events::Kind::msg, from, 0xFF, m[0], m.size(), events::hex(m.data(), m.size()));
         Reader r(m.data(), m.size());
         switch (r.u8()) {
         case kWelcome:
@@ -1502,6 +1541,13 @@ struct Session::Impl {
             std::vector<uint8_t> state = r.bytes();
             if (from != authority() && from != host_seat) break;
             if (!r.ok()) break;
+            // (only as asked: joining a game in progress, or out of step and asking (out_of_step); any other a peer
+            // pushed would replace every board here: roadmap, safe loading)
+            const bool joining_now = late && !started && late_start;
+            if (!joining_now && !(started && want_state)) {
+                log("a state from seat " + std::to_string(from + 1) + " not asked for: ignored");
+                break;
+            }
             want_state = false;
             state_at = frame;
             my_hashes.clear(), their_hashes.clear();
@@ -1559,13 +1605,19 @@ struct Session::Impl {
         }
         case kParting: { // (it leaves after this frame, its board's state at its end to come: a shadow of it from it)
             const uint64_t frame = r.u64();
+            if (r.ok() && from < seats) expect_board(from, frame);
             if (r.ok() && from < seats && cb.parting) cb.parting(from, frame);
             break;
         }
         case kBoard: { // (its own board's state, as we asked)
             const uint64_t frame = r.u64();
             std::vector<uint8_t> state = r.bytes();
-            if (r.ok() && from < seats && cb.board) cb.board(from, frame, std::move(state));
+            if (!r.ok() || from >= seats) break;
+            if (!boards_expected.erase({from, frame})) {
+                log("a board's state from seat " + std::to_string(from + 1) + " at frame " + std::to_string(frame) + " not asked for: ignored");
+                break;
+            }
+            if (cb.board) cb.board(from, frame, std::move(state));
             break;
         }
         case kBackup: { // (its own board's backup: the pages changed since its last, or whole)
@@ -1897,7 +1949,7 @@ struct Session::Impl {
                 log(who + " isn't answering (heard " + ms(p.heard) +
                     " ms ago; our inputs to it " + ms(p.inputs_sent) + " ms ago, " + std::to_string(p.rel.out.size()) +
                     " reliable pieces waiting; " + std::to_string(datagrams_in) + " datagrams in, " + std::to_string(send_failures) +
-                    " sends failed, in all)");
+                    " sends failed, in all" + (send_errors.empty() ? "" : ": system errors " + send_errors_text()) + ")");
             }
         }
         if (authority() != my_seat) return;
@@ -2078,6 +2130,7 @@ struct Session::Impl {
         w.u64(build), w.str(game_name), w.u8(seats), w.u8(taken), w.u8(started ? 1 : 0), w.u16(socket.port());
         w.u8(static_cast<uint8_t>(watcher_count()));
         w.u8(stage), w.u8(area); // (the game's stage and area, Session::set_stage: shown in the list)
+        w.u8(difficulty);        // (the room's difficulty + 1, Session::set_difficulty: release 6; older builds stop before it)
         for (const Address& a : beacon_targets) send(a, w);
     }
 
@@ -2116,6 +2169,7 @@ std::vector<GameInfo> Discovery::poll() {
         g.watchers = r.left() ? r.u8() : 0;
         g.stage = r.left() ? r.u8() : 0;
         g.area = r.left() ? r.u8() : 0;
+        g.difficulty = r.left() ? r.u8() : 0;
         g.host = {d->from.ip, port};
         // The same game heard on several networks (this machine's loopback
         // and its LAN): keep one address, preferring loopback.
@@ -2341,6 +2395,7 @@ void Session::want_board(uint8_t seat, uint64_t frame) {
     if (seat >= kMaxSeats || seat == m.my_seat || !m.peers[seat].present) return;
     Writer w;
     w.u8(kWantBoard), w.u64(frame);
+    m.expect_board(seat, frame);
     m.send_reliable(seat, w.out);
 }
 
@@ -2376,12 +2431,25 @@ void Session::send_backup(uint8_t seat, uint64_t frame, std::vector<uint8_t> bac
     w.u8(kBackup), w.u64(frame), w.bytes(backup);
     if (seat >= kWatcherBase && seat < kWatcherBase + kMaxWatchers) { // (a spectator on one board: its channel, capped)
         const uint8_t id = static_cast<uint8_t>(seat - kWatcherBase);
-        if (m.is_host && m.watchers[id].present) m.watchers[id].rel.queue(w.out);
-        else if (!m.is_host && m.bulk[id].present) m.bulk[id].rel.queue(w.out);
+        Reliable* rel = m.is_host && m.watchers[id].present ? &m.watchers[id].rel : !m.is_host && m.bulk[id].present ? &m.bulk[id].rel : nullptr;
+        if (rel) rel->queue(w.out), rel->backup_end = rel->next_seq;
         return;
     }
     if (seat >= kMaxSeats || seat == m.my_seat || !m.peers[seat].present || m.peers[seat].dropped) return;
     m.send_reliable(seat, w.out);
+    m.peers[seat].rel.backup_end = m.peers[seat].rel.next_seq;
+}
+
+bool Session::backup_through(uint8_t seat) const {
+    const Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    if (seat >= kWatcherBase && seat < kWatcherBase + kMaxWatchers) {
+        const uint8_t id = static_cast<uint8_t>(seat - kWatcherBase);
+        const Reliable* rel = m.is_host && m.watchers[id].present ? &m.watchers[id].rel : !m.is_host && m.bulk[id].present ? &m.bulk[id].rel : nullptr;
+        return !rel || rel->through(rel->backup_end);
+    }
+    if (seat >= kMaxSeats || !m.peers[seat].present) return true;
+    return m.peers[seat].rel.through(m.peers[seat].rel.backup_end);
 }
 
 void Session::send_node(uint64_t seq, std::vector<uint8_t> node) {
@@ -2404,6 +2472,11 @@ bool Session::seated() const {
 void Session::set_stage(uint8_t stage, uint8_t area) {
     std::lock_guard guard(impl_->lock);
     impl_->stage = stage, impl_->area = area;
+}
+
+void Session::set_difficulty(uint8_t difficulty) {
+    std::lock_guard guard(impl_->lock);
+    impl_->difficulty = difficulty;
 }
 
 bool Session::greeted() const {
@@ -2660,6 +2733,8 @@ Session::SeatView Session::Impl::view(uint8_t s) const {
             v.link = p.address.relayed               ? SeatView::Link::relay
                      : private_address(p.address.ip) ? SeatView::Link::lan
                                                      : SeatView::Link::direct;
+        // (direct to our own public address: two PCs behind one router, met through the lobby: the router's loop-back)
+        v.same_public = v.link == SeatView::Link::direct && public_address && public_address->ip == p.address.ip;
         if (v.state == State::joining) {
             if (const std::size_t left = state_left(p); left > 0) { // (the state on its way: the pieces it has acknowledged)
                 const uint32_t all = p.state_end - p.state_first;

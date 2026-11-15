@@ -208,6 +208,7 @@ struct Shared {
     // one saved, or --load-state's).
     std::atomic<bool> save_request{false};
     std::string load_path, last_state; // (under `lock`)
+    std::string just_saved; // (under `lock`: F9's file just written, for its picture beside it; taken by the window)
     // (the owner's safeguards, 2026-11-04: each state's file says its format and the game code it was made by
     // (tools::state_file_bytes); the next save to `save_to` instead (the undo's, before a load); saves made so far; a short
     // notice at the bottom of the window (STATE SAVED, CAN'T LOAD: why), under `lock`)
@@ -224,6 +225,9 @@ struct Shared {
         if (text != notice || std::chrono::steady_clock::now() >= notice_until) std::printf("notice: %s\n", text.c_str()); // (what the player saw, for reports)
         notice = text, notice_until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     }
+    // F9's file written off the game thread (its header, checksum and 28 MB to the disk held a frame up: a hitch at each
+    // save); one at a time, joined before the next and at exit (declared after what it uses: destroyed first)
+    std::jthread save_writer;
     bool net_save_key = false; // --net-save-key: F9 in network play saves every cabinet (spikeout-net-<frame>.state), for gamerun
     bool real_netboard = true;
     bool old_link = false; // --net-old-link: the link before the ring model (docs/fidelity.md)
@@ -288,7 +292,10 @@ struct Shared {
     // A network game recorded (tools/net_record.hpp): wanted as it starts (every board's state saved once, as F9 does),
     // then each frame's inputs as they settle, written by the shown board's thread
     std::atomic<bool> net_record_wanted{false};
+    // The game's own "Communication error" seen in this network game (issues 22, 24, 30): its bundle saved once a game
+    std::atomic<bool> comm_error_noted{false};
     tools::net_record::Writer net_rec;
+    tools::net_record::HashTable net_hashes; // (the machines' settled RAM hashes, into it: net_record.hpp version 2)
     std::mutex recordings_lock;
     std::vector<std::string> game_recordings; // (this network game's NAME.inputs files: sent when it ends, if allowed)
     std::vector<uint8_t> net_state;
@@ -329,6 +336,10 @@ struct Shared {
     // (a network game's smoothness, as its player saw it, for its numbers (tools/problem_report.hpp part 2): the shown
     // board's frames paced, the stutters among them (a gap over 1.5 frames), the longest gap; from net_begin)
     std::atomic<uint8_t> room_stage{0}, room_area{0}; // (the shown board's stage and area, for the room's listing: stage_of)
+    // (the room's arcade difficulty + 1, 0 not known: board 0's EEPROM, the master cabinet's, whose setting linked play
+    // uses; a host waiting to start: its own cabinet's)
+    std::atomic<uint8_t> room_difficulty{0};
+    std::atomic<uint64_t> room_id{0}; // (the network game's session id: reports from one room matched; 0 none)
     // (a network game's areas and the game's raw stage ids gone through, for its numbers: which areas players reach, to name
     // the ones the bot never went to (area_name); bits by area_of's number - 1, and by the id at 0x10402C; from net_begin)
     std::atomic<uint64_t> areas_seen[2] = {0, 0};
@@ -876,6 +887,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                                    : std::function<void(m3::State&)>();
     bool loaded = false;    // from a save state: the run resumes there
     tools::net_frame::Hashes hashes; // (the RAM hashes for the others; rollback: once their frames are settled)
+    hashes.settled = [&shared](uint64_t f, std::size_t i, uint64_t h) { shared.net_hashes.put(f, i, h); }; // (and the recording's)
     tools::net_frame::CatchUp catch_up; // (run on from a state: catching up with the others)
     std::string load_error; // a state that doesn't fit stops the board, saying why
     if (index == 0 && !networked) {
@@ -1022,6 +1034,16 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         // as far as the window, and every input of the other's then takes it back that far.
         if (shared.rollback && shared.netplay) {
             const auto lead = shared.netplay->lead(shown);
+            // (the timeline, once a second: the lead it goes by, and what it did since: a slow player slowing everyone)
+            if (timing.frames() % 57 == 0) {
+                static uint64_t slowed_was = 0, sooner_was = 0, free_was = 0;
+                const uint64_t slowed = shared.sync_slowed, sooner = shared.sync_sooner, unpaced = shared.sync_free;
+                net::events::add(net::events::Kind::sync, 0xFF, 0xFF, static_cast<uint64_t>(std::max<int64_t>(0, lead.ahead)),
+                                 static_cast<uint64_t>(std::max<int64_t>(0, lead.behind)),
+                                 "slowed " + std::to_string(slowed - slowed_was) + " sooner " + std::to_string(sooner - sooner_was) +
+                                     " unpaced " + std::to_string(unpaced - free_was));
+                slowed_was = slowed, sooner_was = sooner, free_was = unpaced;
+            }
             if (std::getenv("SPIKEOUT_NET_DEBUG") && timing.frames() % 30 == 0) // (SPIKEOUT_NET_DEBUG: the lead it goes by)
                 std::printf("spikeout: frame %llu: ahead %lld, behind %lld\n", static_cast<unsigned long long>(timing.frames()),
                             static_cast<long long>(lead.ahead), static_cast<long long>(lead.behind));
@@ -1154,6 +1176,11 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             shared.room_stage = stage_of(bus), shared.room_area = area_of(bus);
             if (const uint8_t a = shared.room_area.load(); a > 0 && a <= 128) shared.areas_seen[(a - 1) / 64] |= 1ull << ((a - 1) % 64);
             if (bus.read8(0x10400A) == 7 && bus.read8(0x10402C) < 32) shared.stage_ids_seen |= 1u << bus.read8(0x10402C);
+        }
+        if (networked && index == 0 && timing.frames() % 60 == 0) { // (the room's difficulty: the master cabinet's setting)
+            const tools::ArcadeSettings arcade{bus.eeprom().words()};
+            const int d = arcade.valid() ? arcade.difficulty() : -1;
+            shared.room_difficulty = static_cast<uint8_t>(d >= 0 && d < 5 ? d + 1 : 0);
         }
         const uint64_t board_every = timing_debug ? 300 : networked ? 3600 : 0;
         if (board_every && timing.frames() % board_every == 0 && !(shared.rollback && shared.rollback->quiet(index, timing.frames()))) {
@@ -1365,6 +1392,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                                     static_cast<unsigned long long>(frame + 2), base.c_str());
                         std::lock_guard guard(shared.recordings_lock);
                         shared.game_recordings.push_back(base + ".inputs");
+                        net::events::record_to(base + ".events"); // (the whole game's network timeline beside it)
                     }
                     tools::net_record::prune(shared.saves_dir);
                 }
@@ -1382,7 +1410,52 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                         shared.net_rec.close();
                         break;
                     }
-                    shared.net_rec.frame(in);
+                    shared.net_rec.frame(in, &shared.net_hashes);
+                }
+            }
+            // The game's own "Communication error" (issues 22, 24 and 30: every board showing it at once, every machine in
+            // step, so the emulated cabinets disagreeing; never made here yet): looked for every 30 frames on the shown
+            // board's screen (a 16 KB read), and once a game a problem bundle saved with every board's state of that
+            // moment beside the recording from the game's start (its replay run to here should show it; if not, the
+            // state tells where it parted). Costs nothing more till it shows; nothing sent, nothing in the build id.
+            // (tests: SPIKEOUT_TEST_PROBLEM_AT=FRAME:KIND, a problem of that kind noted at that frame of a network game: its
+            // bundle, the join state in it, its save again kAfter later)
+            if (static const char* at = std::getenv("SPIKEOUT_TEST_PROBLEM_AT"); at && *at && index == shown && shared.problems) {
+                static const unsigned long long at_frame = std::strtoull(at, nullptr, 10);
+                static const std::string kind = std::strchr(at, ':') ? std::strchr(at, ':') + 1 : "stall";
+                if (frame == at_frame) shared.problems->note(kind, "a test's (SPIKEOUT_TEST_PROBLEM_AT)", frame);
+            }
+            // (tests: SPIKEOUT_TEST_COMM_TEXT=STRING watched for instead: a text any game shows)
+            static const std::string comm_text = [] {
+                const char* t = std::getenv("SPIKEOUT_TEST_COMM_TEXT");
+                return std::string(t && *t ? t : "Communication error");
+            }();
+            if (index == shown && frame % 30 == 0 && !shared.comm_error_noted && shared.problems &&
+                !tools::tile_text_row(bus.tile_ram(), comm_text).empty()) {
+                shared.comm_error_noted = true;
+                const std::string row = tools::tile_text_row(bus.tile_ram(), comm_text);
+                std::string what = "the game's Communication error on the screen at frame " + std::to_string(frame) + ": ";
+                for (std::size_t i = 0, n = 0; i < row.size(); ++i) // (its row, spaces run together)
+                    if (row[i] != ' ' || (n && what.back() != ' ')) what += row[i], ++n;
+                std::printf("spikeout: %s\n", what.c_str());
+                net::events::add(net::events::Kind::note, 0xFF, 0xFF, frame, 0, "communication error on the screen at frame " + std::to_string(frame));
+                if (shared.linked.capture_frame == 0 && !(alone && !one_board->all_whole())) {
+                    // (every board's state, as F9 saves it, two frames on; packed off the game thread, then the bundle)
+                    shared.linked.to_file = true;
+                    shared.linked.path = "comm-error.state";
+                    shared.linked.write_elsewhere = [problems = shared.problems, what, frame](std::string path, std::vector<uint8_t> bytes) {
+                        std::thread([problems, what, frame, path = std::move(path), bytes = std::move(bytes)] {
+                            const std::vector<uint8_t> packed = net::compress(bytes);
+                            tools::problems::Note n{"comm-error", what, frame, {}, {}, {}};
+                            n.files.push_back({path, std::string(packed.begin(), packed.end())});
+                            problems->note(std::move(n));
+                        }).detach();
+                    };
+                    shared.linked.capture_frame = frame + 2;
+                } else {
+                    shared.problems->note("comm-error", what + " (no boards' state: " +
+                                                            (shared.linked.capture_frame ? "a save under way)" : "not every board whole here)"),
+                                          frame);
                 }
             }
             if (shared.netplay->resync_pending()) throw Stop{}; // (out of step: again from the host's state)
@@ -1529,26 +1602,46 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                     std::lock_guard<std::mutex> guard(shared.lock);
                     if (!shared.save_to.empty()) path = std::exchange(shared.save_to, {}), undo = true;
                 }
+                auto failed = [&shared, path, undo](const std::string& why) {
+                    std::printf("spikeout: no save state %s: %s\n", path.c_str(), why.c_str());
+                    if (!undo) shared.say(why.rfind("can't write", 0) == 0 ? "CAN'T SAVE: THE SAVES FOLDER CAN'T BE WRITTEN" : "CAN'T SAVE: " + why);
+                    ++shared.saves_done;
+                };
                 try {
-                    m3::State s;
+                    // (the board taken here, at its frame's end; the file made and written on a thread of its own)
+                    const auto taking = std::chrono::steady_clock::now();
+                    m3::State s(tools::kBoardStateBytes); // (its room at once: grown, it was copied over and over)
                     tools::board_state(s, c, timing, sound_state);
-                    errno = 0;
-                    if (!tools::write_file(path, tools::state_file_bytes(timing.frames(), s.data())))
-                        throw std::runtime_error(std::string("can't write it") + (errno ? std::string(" (") + std::strerror(errno) + ")" : ""));
-                    if (!undo) {
-                        {
-                            std::lock_guard<std::mutex> guard(shared.lock);
-                            shared.last_state = path;
+                    // (where in the game, for the Saves page: header version 3)
+                    const tools::ArcadeSettings arcade{bus.eeprom().words()}; // (and the cabinet's difficulty, as the lobby shows it)
+                    const int level = arcade.valid() ? arcade.difficulty() : -1;
+                    const uint64_t frame = timing.frames();
+                    const auto stage = static_cast<uint8_t>(stage_of(bus)), area = static_cast<uint8_t>(area_of(bus));
+                    const auto difficulty = static_cast<uint8_t>(level >= 0 && level < 5 ? level + 1 : 0);
+                    const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - taking).count();
+                    if (shared.save_writer.joinable()) shared.save_writer.join(); // (the last one first: F9 pressed fast)
+                    shared.save_writer = std::jthread([&shared, path, undo, frame, stage, area, difficulty, took, failed,
+                                                       data = std::move(s.data())] {
+                        const auto writing = std::chrono::steady_clock::now();
+                        errno = 0;
+                        if (!tools::write_file(path, tools::state_file_bytes(frame, data, stage, area, difficulty))) {
+                            failed(std::string("can't write it") + (errno ? std::string(" (") + std::strerror(errno) + ")" : ""));
+                            return;
                         }
-                        shared.say("STATE SAVED (FRAME " + std::to_string(timing.frames()) + ")");
-                    }
-                    std::printf("spikeout: saved %s\n", path.c_str());
+                        if (!undo) {
+                            {
+                                std::lock_guard<std::mutex> guard(shared.lock);
+                                shared.last_state = path, shared.just_saved = path; // (its picture written beside it: the Saves page)
+                            }
+                            shared.say("STATE SAVED (FRAME " + std::to_string(frame) + ")");
+                        }
+                        std::printf("spikeout: saved %s (taken in %.1f ms in the frame, written in %.0f ms off it)\n", path.c_str(), took,
+                                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - writing).count());
+                        ++shared.saves_done;
+                    });
                 } catch (const std::exception& e) {
-                    std::printf("spikeout: no save state %s: %s\n", path.c_str(), e.what());
-                    if (!undo) shared.say(std::string(e.what()).rfind("can't write", 0) == 0 ? "CAN'T SAVE: THE SAVES FOLDER CAN'T BE WRITTEN"
-                                                                                           : "CAN'T SAVE: " + std::string(e.what()));
+                    failed(e.what());
                 }
-                ++shared.saves_done;
             });
         if (recording.is_open()) {
             const auto frame = static_cast<uint32_t>(timing.frames());
@@ -1979,8 +2072,8 @@ struct NetGame {
     bool host = false, internet = false, running = false;
     bool spectator = false; // (watching it: Session::watch)
     std::size_t listed_taken = 1; // (the host, on the internet: the players the lobby last heard of)
-    int listed_stage = 0, listed_area = 0;   // (and the game's stage and area it last heard of)
-    uint8_t beacon_stage = 0, beacon_area = 0; // (the session's, for its beacons)
+    int listed_stage = 0, listed_area = 0, listed_difficulty = 0;  // (and the game's stage and area it last heard of)
+    uint8_t beacon_stage = 0, beacon_area = 0, beacon_difficulty = 0; // (the session's, for its beacons)
     std::atomic<bool> ready{false}, failed{false};
     std::chrono::steady_clock::time_point asked_at{}, told_at{}; // (joining or watching: since then no answer; last said then)
     mutable std::mutex lock;
@@ -2155,9 +2248,12 @@ int main(int argc, char** argv) {
         if (!s) return std::string("(the game not set up yet)\n");
         // (and what the boards waited for, if a wait went on a second or more lately: which player a room stood still for)
         const std::string waited = tools::InputTable::last_long_wait();
+        // (the room: its session's id, random, the same on every PC in it: reports from one room matched up)
+        const uint64_t room = s->room_id.load();
         return "input delay " + std::to_string(s->input_delay.load()) +
                (s->one_board_frame.load() != ~0ull ? ", one board here" : ", every board here") + ", the shown board at frame " +
-               std::to_string(s->shown_frame.load()) + "\n" + (waited.empty() ? "" : waited + "\n");
+               std::to_string(s->shown_frame.load()) + (room ? ", room " + tools::hex64(room) : std::string()) + "\n" +
+               (waited.empty() ? "" : waited + "\n");
     });
     tools::problems::Watchdog watchdog;
     watchdog.start(problems, [&report_shared] {
@@ -2819,6 +2915,11 @@ int main(int argc, char** argv) {
     bool running = true;
     std::size_t reported = 0;
     std::string pending_shot; // (F12: the picture asked of the presenter, to write once it comes)
+    // (F9: the save's small picture, asked of the presenter; kept until the save's file is written)
+    bool thumb_wanted = false;
+    std::vector<uint32_t> thumb_pixels;
+    int thumb_w = 0, thumb_h = 0;
+    uint64_t thumb_saves_before = 0;
     auto fps_start = std::chrono::steady_clock::now();
     bool first_picture = false, solo_armed = false, reports_asked = false; // (the start over; the watchdog on for a game alone)
     (void)reports_asked; // (the menu's: not in a build without the GPU)
@@ -2936,6 +3037,109 @@ int main(int argc, char** argv) {
         }
         return {};
     };
+    // A save loaded (checked already): the game as it is kept first (F9 goes back to it 5 s), then the reset into it.
+    // F10's second press, and the Saves page (once the menu has closed: the game paused under it can't save).
+    auto load_save = [&](const std::string& path, const std::string& which) {
+        const uint64_t before = shared.saves_done;
+        {
+            std::lock_guard<std::mutex> guard(shared.lock);
+            shared.save_to = undo_state;
+        }
+        shared.save_request = true;
+        for (int k = 0; k < 200 && shared.saves_done == before; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const bool kept = shared.saves_done != before;
+        reset_game([&] { shared.load_path = path; });
+        {
+            std::lock_guard<std::mutex> guard(shared.lock);
+            shared.last_state = path; // (F10 pressed twice: this one again)
+        }
+        undo_until = kept ? std::chrono::steady_clock::now() + std::chrono::seconds(5) : std::chrono::steady_clock::time_point{};
+        shared.say(kept ? "LOADED " + which + "  \xC2\xB7  F9 GOES BACK" : "LOADED " + which, 5);
+        std::printf("spikeout: loading %s%s%s%s\n", path.c_str(), kept ? " (the game before it in " : "", kept ? undo_state.c_str() : "",
+                    kept ? ")" : "");
+    };
+    std::string pending_load, pending_load_which; // (the Saves page's choice: loaded once the menu has closed)
+    // The Saves page's rows (release 6, docs/ROADMAP.md): F9's saves in the saves folder (spikeout-<frame>.state, not the
+    // undo's nor a network game's), newest first, each header read once (kept by its time and size).
+    struct SaveInfo {
+        std::filesystem::file_time_type when{};
+        uintmax_t size = 0;
+        bool damaged = false, other = false;
+        uint64_t frame = 0;
+        bool frame_known = false, placed = false; // (a header with its frame; a version 3 one, where in the game)
+        uint8_t stage = 0, area = 0, difficulty = 0; // (difficulty + 1; 0 not known)
+    };
+    std::map<std::string, SaveInfo> save_infos;
+    // (the saves folder's F9 saves, newest first, at most `most`: path, time, size)
+    struct SaveFile {
+        std::string path;
+        std::filesystem::file_time_type when{};
+        uintmax_t size = 0;
+    };
+    auto save_files = [&shared](std::size_t most) {
+        namespace fs = std::filesystem;
+        std::vector<SaveFile> out;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(tools::utf8_path(shared.saves_dir), ec)) {
+            const std::u8string u = e.path().filename().u8string();
+            const std::string name(u.begin(), u.end());
+            if (name.rfind("spikeout-", 0) != 0 || e.path().extension() != ".state" || name == "spikeout-undo.state" ||
+                name.rfind("spikeout-net-", 0) == 0)
+                continue;
+            out.push_back({shared.saves_dir + name, e.last_write_time(ec), e.file_size(ec)});
+        }
+        std::sort(out.begin(), out.end(), [](const SaveFile& a, const SaveFile& b) { return a.when > b.when; });
+        if (out.size() > most) out.resize(most);
+        return out;
+    };
+    // Saves found damaged when one was chosen (the whole file is checked then, check_state): kept in the saves folder's
+    // damaged.txt (its size and name a line), so the page greys them out from then on. The page reads only each save's
+    // header (it read every save whole, up to 30 of 28 MB, before it showed); F9's own are written whole and checked
+    // as they're chosen like any other.
+    auto damaged_saves = [&shared] {
+        std::set<std::string> out;
+        std::ifstream in(tools::utf8_path(shared.saves_dir + "damaged.txt"));
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty()) out.insert(line);
+        return out;
+    };
+    auto damaged_key = [](const std::string& path, uintmax_t size) {
+        return std::to_string(size) + " " + path.substr(path.find_last_of("/\\") + 1);
+    };
+    auto mark_damaged = [&shared, damaged_saves, damaged_key](const std::string& path) {
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(tools::utf8_path(path), ec);
+        if (ec || damaged_saves().count(damaged_key(path, size))) return;
+        std::ofstream(tools::utf8_path(shared.saves_dir + "damaged.txt"), std::ios::app) << damaged_key(path, size) << "\n";
+    };
+    auto list_saves = [&] {
+        std::vector<std::pair<std::string, SaveInfo>> out;
+        const std::set<std::string> bad = damaged_saves();
+        for (const SaveFile& file : save_files(30)) {
+            SaveInfo i;
+            i.when = file.when, i.size = file.size;
+            auto& kept = save_infos[file.path];
+            if (kept.when != i.when || kept.size != i.size) {
+                try { // (its header only: where, when, which version)
+                    std::vector<uint8_t> head(64);
+                    std::ifstream in(tools::utf8_path(file.path), std::ios::binary);
+                    in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+                    head.resize(static_cast<std::size_t>(in.gcount()));
+                    const tools::StateFile f = tools::read_state_file(std::move(head), false);
+                    i.other = !f.matches(), i.frame = f.frame, i.stage = f.stage, i.area = f.area;
+                    i.frame_known = f.format.has_value(), i.placed = f.placed, i.difficulty = f.difficulty;
+                    i.damaged = i.size < 64;
+                } catch (const std::exception&) {
+                    i.damaged = true; // (a newer version's, or no header to read)
+                }
+                kept = i;
+            }
+            SaveInfo row = kept;
+            if (bad.count(damaged_key(file.path, file.size))) row.damaged = true;
+            out.push_back({file.path, row});
+        }
+        return out;
+    };
     int net_seats = 2;      // a game offered: its players
     bool net_listed = true; // on the internet: in the lobby's list, or by its code only
     int net_where = 0;      // a game offered: 0 this network, 1 the internet (listed), 2 the internet (private)
@@ -2982,6 +3186,11 @@ int main(int argc, char** argv) {
         auto words = tools::eeprom_words(eeprom);
         const tools::ArcadeSettings own{words};
         own_country = eeprom.size() == 128 && own.valid() ? own.country() : 0;
+        // (a host's room before its game starts: its own cabinet's difficulty, board 0's once it runs)
+        if (netgame->host && !netgame->running)
+            shared.room_difficulty = static_cast<uint8_t>(eeprom.size() == 128 && own.valid() && own.difficulty() >= 0 && own.difficulty() < 5
+                                                              ? own.difficulty() + 1
+                                                              : 0);
         netgame->session().set_cabinet(std::move(eeprom), std::move(backup));
     };
     // After a network game: this player's board (its settings, its country
@@ -3109,6 +3318,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(delay), one_way);
         std::vector<uint8_t> state; // (a game joined in progress: every board as the host had them)
         if (start.state_frame) {
+            tools::problems::keep_join_state(*start.state_frame, start.state); // (as it came, packed: for a problem's bundle)
             if (auto unpacked = net::decompress(start.state)) state = std::move(*unpacked);
             else std::printf("spikeout: the host's state doesn't unpack\n");
         } else if (!test_state_file.empty() && netgame->host) { // (tests: SPIKEOUT_TEST_NET_STATE, above, as gamerun's)
@@ -3141,8 +3351,12 @@ int main(int argc, char** argv) {
             shared.watched = shared.local;
             shared.net_start = start;
             shared.input_delay = delay;
+            net::events::add(net::events::Kind::delay, 0xFF, 0xFF, delay, start.state_frame ? *start.state_frame : 0); // (the timeline)
             shared.net_state = std::move(state);
             shared.net_rec.close(), shared.net_record_wanted = true; // (this game recorded: tools/net_record.hpp)
+            shared.comm_error_noted = false;
+            shared.net_hashes.clear();
+            if (!start.state_frame) tools::problems::keep_join_state(0, {}); // (a game from its start: the last game's forgotten)
             shared.catching_up = start.state_frame.has_value();
             shared.catch_up_behind = 0, shared.catch_up_start = 0;
             shared.rollback_from = start.state_frame ? ~0ull : 0; // (joined in progress: none until caught up)
@@ -3153,9 +3367,11 @@ int main(int argc, char** argv) {
         netgame->running = true;
         // (problems in this game: a bundle each, tools/problem_report.hpp; the hang watchdog on while it runs)
         netgame->play->on_problem([&problems](const std::string& kind, const std::string& what, uint64_t frame) { problems.note(kind, what, frame); });
+        netgame->play->on_state_packed = [](uint64_t frame, const std::vector<uint8_t>& packed) { tools::problems::keep_join_state(frame, packed); };
         watchdog.arm(true);
         net_game_began = std::chrono::steady_clock::now(), net_game_first_frame = shared.shown_frame.load();
         shared.net_frames = 0, shared.net_stutters = 0, shared.net_worst_ms = 0;
+        shared.room_id = netgame->session().session_id();
         shared.areas_seen[0] = 0, shared.areas_seen[1] = 0, shared.stage_ids_seen = 0;
         net_sync_from[0] = shared.sync_slowed, net_sync_from[1] = shared.sync_sooner, net_sync_from[2] = shared.sync_free;
         if (shared.spectating)
@@ -3203,6 +3419,7 @@ int main(int argc, char** argv) {
         using tools::problems::json_text;
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - net_game_began).count();
         std::string j = "{\"version\":" + json_text(net::kVersion) + ",\"os\":" + json_text(tools::report::os_name()) +
+                        ",\"room\":" + json_text(tools::hex64(shared.room_id.load())) + // (the same on each PC of the room)
                         ",\"cpu\":" + json_text(tools::report::cpu_name()) +
                         ",\"threads\":" + std::to_string(std::thread::hardware_concurrency()) +
                         ",\"seats\":" + std::to_string(shared.boards) + ",\"spectator\":" + (shared.spectating ? "true" : "false") +
@@ -3244,6 +3461,7 @@ int main(int argc, char** argv) {
         if (netgame->running && settings.send_reports >= 1 && (!test_run || report_test)) tools::problems::keep_stats(report_folder, game_stats());
         parting();
         netgame->session().leave();
+        net::events::record_to(""); // (the game's timeline file finished: NAME.events beside its recording)
         if (netgame->running)
             reset_game([&] {
                 if (!shared.spectating) keep_seat(); // (this player's board, as this computer's cabinet: while still in the game)
@@ -3257,6 +3475,7 @@ int main(int argc, char** argv) {
                 if (!test_run) load_nvram(data_folder, shared, boards);
                 shared.net_rec.close(), shared.net_record_wanted = false; // (the recording ends with the game)
             });
+        problems.game_over(); // (a problem's bundle waiting to be saved again: now, the recording complete)
         netgame.reset();
         if (set_up_display) set_up_display();
         { // (its recordings closed now: their inputs to send, if the player said yes; the list emptied for the next game)
@@ -4042,6 +4261,96 @@ int main(int argc, char** argv) {
         p.items.push_back(back_item());
         return p;
     };
+    // The Saves page (F10, or Game > Saves): F9's saves, newest first, each with its picture, where in the game, when and
+    // how long the game had run; Enter loads one (another version's asked first; a damaged one can't), Delete removes one
+    // (asked first). Not in network play.
+    auto confirm_page = [&](const std::string& title, const std::string& question, const std::string& yes, std::function<void()> act) {
+        ui::MenuPage p{title, "", {}};
+        p.items.push_back({question, "", {}, {}, {}, true});
+        p.items.push_back({yes, "", {}, {}, std::move(act)});
+        p.items.push_back({"Cancel", "", {}, {}, [&] { menu.pop(); }});
+        return p;
+    };
+    std::function<ui::MenuPage()> saves_page = [&] {
+        ui::MenuPage p{"Saves", "F9 saves the game as it is. Enter: load (F9 within 5 seconds goes back). Delete: remove.", {}};
+        if (netgame) {
+            p.items.push_back({"Saves are for single-player games", "Not in network play.", {}, {}, {}, true});
+            return p;
+        }
+        const auto saves = list_saves();
+        if (saves.empty()) p.items.push_back({"No saves yet: F9 saves the game as it is", "", {}, {}, {}, true});
+        for (const auto& [path, info] : saves) {
+            // ("—": a save from before release 6, where unknown; outside play: the title, the demo, a player choosing)
+            std::string label = info.stage ? playing_text(info.stage, info.area) : info.placed ? "Not in play (title or demo)" : "\xE2\x80\x94";
+            if (info.difficulty >= 1 && info.difficulty <= 5) // (as the join list says a room's)
+                label += std::string("  \xC2\xB7  ") + tools::ArcadeSettings::kDifficultyNames[info.difficulty - 1];
+            // (when: the file's time, as this computer's clock says; how long: the game's frames from its start, as run)
+            std::string when;
+            {
+                const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(info.when);
+                const std::time_t t = std::chrono::system_clock::to_time_t(sys);
+                char text[64] = {};
+                if (const std::tm* tm = std::localtime(&t)) std::strftime(text, sizeof text, "%d %b %Y %H:%M", tm);
+                when = text;
+            }
+            const uint64_t secs = static_cast<uint64_t>(static_cast<double>(info.frame) / 57.52);
+            char played[32];
+            std::snprintf(played, sizeof played, "%llu:%02llu:%02llu", static_cast<unsigned long long>(secs / 3600),
+                          static_cast<unsigned long long>(secs / 60 % 60), static_cast<unsigned long long>(secs % 60));
+            const std::string what = info.damaged ? "DAMAGED" : info.other ? "OTHER VERSION" : "";
+            const std::string which = "THE STATE FROM FRAME " + std::to_string(info.frame);
+            ui::MenuItem it{label,
+                            info.damaged ? "This save is damaged: it can't be loaded. Delete (pad: Y) removes it."
+                            : info.other ? "Made by another version of the game: it may not load as it was. Enter asks first; "
+                                           "Delete (pad: Y) removes it."
+                                         : "Enter loads it (the game as it is now is kept a few seconds: F9 goes back). Delete "
+                                           "(pad: Y) removes it, after asking.",
+                            what.empty() ? std::function<std::string()>() : [what] { return what; }, {},
+                            [&, path, info, which] {
+                                if (info.damaged) return;
+                                auto go = [&, path, which] {
+                                    std::optional<uint64_t> frame;
+                                    bool other = false;
+                                    if (const std::string why = check_state(path, frame, other); !why.empty()) {
+                                        shared.say("CAN'T LOAD: " + why, 5);
+                                        mark_damaged(path); // (greyed out from now on)
+                                        menu.replace(saves_page());
+                                        return;
+                                    }
+                                    pending_load = path, pending_load_which = which;
+                                    menu.close();
+                                };
+                                if (info.other)
+                                    menu.push(confirm_page("Another version's save",
+                                                           "This save is from another version of the game: it may not load as it was.",
+                                                           "Load it anyway", go));
+                                else
+                                    go();
+                            },
+                            false,
+                            [&, path] {
+                                menu.push(confirm_page("Delete the save", "Delete this save? It can't be brought back.", "Delete", [&, path] {
+                                    namespace fs = std::filesystem;
+                                    std::error_code ec;
+                                    fs::remove(tools::utf8_path(path), ec);
+                                    fs::remove(tools::utf8_path(path.substr(0, path.size() - 6) + ".png"), ec);
+                                    save_infos.erase(path);
+                                    {
+                                        std::lock_guard<std::mutex> guard(shared.lock);
+                                        if (shared.last_state == path) shared.last_state.clear();
+                                    }
+                                    std::printf("spikeout: deleted the save %s\n", path.c_str());
+                                    menu.pop();
+                                    menu.replace(saves_page());
+                                }));
+                            }};
+            it.tall = true, it.dim = info.damaged, it.detail = when + (info.frame_known ? "  \xC2\xB7  played " + std::string(played) : "");
+            if (std::error_code ec; std::filesystem::exists(tools::utf8_path(path.substr(0, path.size() - 6) + ".png"), ec))
+                it.image = path.substr(0, path.size() - 6) + ".png";
+            p.items.push_back(std::move(it));
+        }
+        return p;
+    };
     auto game_page = [&] {
         ui::MenuPage p{"Game", "", {}};
         p.items.push_back({"Reset game", "Restarts the game, as switching the arcade off and on.", {}, {}, [&] {
@@ -4098,6 +4407,9 @@ int main(int argc, char** argv) {
                                }
                                if (!SDL_OpenURL(url.c_str())) std::printf("spikeout: can't open %s: %s\n", url.c_str(), SDL_GetError());
                            }});
+        if (boards == 1) // (one cabinet's saves: F10 opens the same page)
+            p.items.push_back({"Saves", "Your save states (F9 saves one, F10 opens this list): load or delete one.", {}, {},
+                               [&] { menu.push(saves_page()); }});
         if (net::report::available()) // (the same as Network play's: the question covers every problem since 2026-11-12)
             p.items.push_back({"Send reports", kSendReportsText, [&] { return on_off(settings.send_reports >= 1); },
                                [&](int) {
@@ -4230,12 +4542,15 @@ int main(int argc, char** argv) {
         look_nearby();
         nearby_games = discovery->poll();
         const char* const kInProgress = "Join this game in progress: an empty cabinet is yours once you've caught up.";
-        auto label = [](const std::string& name, int taken, int seats, const std::string& where, bool playing, int stage = 0, int area = 0) {
-            return name + "  (" + std::to_string(taken) + "/" + std::to_string(seats) + ", " + where +
+        // (difficulty: the room's + 1, 0 not known: an older build's room)
+        auto label = [](const std::string& name, int taken, int seats, const std::string& where, bool playing, int stage = 0, int area = 0,
+                        int difficulty = 0) {
+            const std::string level = difficulty >= 1 && difficulty <= 5 ? std::string(", ") + tools::ArcadeSettings::kDifficultyNames[difficulty - 1] : "";
+            return name + "  (" + std::to_string(taken) + "/" + std::to_string(seats) + ", " + where + level +
                    (playing ? ", " + playing_text(stage, area) + ")" : ")");
         };
         for (const net::GameInfo& g : nearby_games) {
-            const std::string text = label(g.name, g.taken, g.seats, "nearby", g.started, g.stage, g.area);
+            const std::string text = label(g.name, g.taken, g.seats, "nearby", g.started, g.stage, g.area, g.difficulty);
             if (g.build != build) {
                 p.items.push_back({text, "Another version of the game, or another ROM set: players need the same ones to play together.", [] { return std::string(); }, {}, {}, true});
             } else {
@@ -4281,7 +4596,7 @@ int main(int argc, char** argv) {
                 const int taken = static_cast<int>(g["taken"].as_number()), seats = static_cast<int>(g["seats"].as_number());
                 const int watchers = static_cast<int>(g["watchers"].as_number(0));
                 ui::MenuItem it{label(name, taken, seats, "internet", playing, static_cast<int>(g["stage"].as_number(0)),
-                                      static_cast<int>(g["area"].as_number(0))),
+                                      static_cast<int>(g["area"].as_number(0)), static_cast<int>(g["difficulty"].as_number(0))),
                                 std::string(taken >= seats ? "Full: watch it." : playing ? kInProgress : "Join or watch this game (through the internet).") +
                                     " The speed (~) is an estimate, from how far away its host is; the real one shows in the game.",
                                 {}, {}, [&, code, name, taken, seats, watchers] {
@@ -4521,6 +4836,27 @@ int main(int argc, char** argv) {
                 pending_shot.clear();
             }
         }
+        // (F9's small picture (the Saves page): asked of the presenter as the save was, kept until the save's file is
+        // written, then beside it as NAME.png; a save that failed: none)
+        if (thumb_wanted && pending_shot.empty() && presenter) {
+            int pw = 0, ph = 0;
+            if (presenter->take_capture(thumb_pixels, pw, ph)) thumb_wanted = false, thumb_w = pw, thumb_h = ph;
+        }
+        if (!thumb_pixels.empty() && shared.saves_done != thumb_saves_before) {
+            std::string saved;
+            {
+                std::lock_guard<std::mutex> guard(shared.lock);
+                saved = std::exchange(shared.just_saved, {});
+            }
+            if (!saved.empty() && saved.size() > 6) {
+                const std::string png = saved.substr(0, saved.size() - 6) + ".png"; // (NAME.state: NAME.png)
+                std::thread([png, pixels = std::move(thumb_pixels), w = thumb_w, h = thumb_h] {
+                    if (!tools::write_png(png, pixels, static_cast<uint32_t>(w), static_cast<uint32_t>(h)))
+                        std::printf("spikeout: the save's picture can't be written: %s\n", png.c_str());
+                }).detach();
+            }
+            thumb_pixels.clear();
+        }
 #endif
         // Each frame shown as soon as it is finished (and, with the game
         // paused or stopped, the menu and events 50 times a second: longer
@@ -4720,6 +5056,18 @@ int main(int argc, char** argv) {
                     shared.say("BACK TO THE GAME BEFORE THE LOAD");
                     std::printf("spikeout: back to the game before the load (%s)\n", undo_state.c_str());
                 } else if (boards == 1) {
+#ifdef SPIKEOUT_GPU
+                    // (its small picture for the Saves page, the picture's shape, 160 wide: as the save is made; not while
+                    // an F12 screenshot is on its way, the presenter drawing one at a time)
+                    if (on_gpu && presenter && pending_shot.empty() && !thumb_wanted) {
+                        const int sides = shared.gpu_3d && real3d_gpu ? real3d_gpu->extend() : 0;
+                        const int pw = shared.gpu_3d ? kWidth + 2 * sides : width, ph = shared.gpu_3d ? kHeight : height;
+                        presenter->request_capture(160, std::max(1, 160 * ph / std::max(1, pw)));
+                        thumb_wanted = true, thumb_pixels.clear(), thumb_saves_before = shared.saves_done;
+                        std::lock_guard<std::mutex> guard(shared.lock);
+                        shared.just_saved.clear();
+                    }
+#endif
                     shared.save_request = true;
                     std::printf("spikeout: saving at the end of the frame\n");
                 } else {
@@ -4727,6 +5075,15 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
             }
+#ifdef SPIKEOUT_GPU
+            // (F10 with the menu: the Saves page, newest first, release 6; without it (no GPU menu): the last save,
+            // pressed twice, below)
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay &&
+                menu_ready) {
+                if (!menu.is_open()) menu.open(saves_page());
+                continue;
+            }
+#endif
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay) {
                 std::string last;
                 {
@@ -4748,19 +5105,7 @@ int main(int argc, char** argv) {
                     shared.say(other ? "THIS SAVE IS FROM ANOTHER VERSION: PRESS F10 AGAIN TO TRY IT" : "PRESS F10 AGAIN TO LOAD " + which);
                 } else { // (the second: the game as it is kept first, then the load)
                     load_armed_until = {};
-                    const uint64_t before = shared.saves_done;
-                    {
-                        std::lock_guard<std::mutex> guard(shared.lock);
-                        shared.save_to = undo_state;
-                    }
-                    shared.save_request = true;
-                    for (int k = 0; k < 200 && shared.saves_done == before; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    const bool kept = shared.saves_done != before;
-                    reset_game([&] { shared.load_path = last; });
-                    undo_until = kept ? std::chrono::steady_clock::now() + std::chrono::seconds(5) : std::chrono::steady_clock::time_point{};
-                    shared.say(kept ? "LOADED " + which + "  \xC2\xB7  F9 GOES BACK" : "LOADED " + which, 5);
-                    std::printf("spikeout: loading %s%s%s%s\n", last.c_str(), kept ? " (the game before it in " : "", kept ? undo_state.c_str() : "",
-                                kept ? ")" : "");
+                    load_save(last, which);
                 }
             }
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode >= SDL_SCANCODE_F5 && e.key.scancode <= SDL_SCANCODE_F8) {
@@ -4889,6 +5234,10 @@ int main(int argc, char** argv) {
             }
             menu_was_open = menu_open;
         }
+        // (a save chosen on the Saves page: loaded now the menu has closed and the game runs again)
+        if (!pending_load.empty() && !menu_open && !shared.paused) {
+            load_save(std::exchange(pending_load, {}), pending_load_which);
+        }
 #endif
         const auto now = std::chrono::steady_clock::now();
         read_inputs(shared, focus, settings, player_pads(), now < test_until, now < service_until);
@@ -5013,6 +5362,28 @@ int main(int argc, char** argv) {
         // The host left the game in progress and this machine hosts the room
         // now (host migration): on the internet, the room listed again under
         // its code (the lobby still knows it), so the others can join it.
+        // A network game running slow (the owner, 2026-11-13: a room that crawls saves nothing, yet that's what the slow-PC
+        // work needs): each minute, the frames shown; under 90% of the arcade's pace, a "slow" problem bundle (its
+        // timeline: time sync's decisions, each player's lateness), at most one a minute and ten a run (the saver's).
+        {
+            static auto slow_from = now;
+            static uint64_t slow_frames_from = 0;
+            if (!(netgame && netgame->running) || shared.catching_up) {
+                slow_from = now, slow_frames_from = shared.net_frames.load();
+            } else if (now - slow_from >= std::chrono::seconds(60)) {
+                const double secs = std::chrono::duration<double>(now - slow_from).count();
+                const uint64_t frames = shared.net_frames.load() - slow_frames_from;
+                const double rate = static_cast<double>(frames) / secs;
+                if (rate < 0.9 * recomp::FrameTiming::kRefreshHz) {
+                    char what[160];
+                    std::snprintf(what, sizeof what, "the game ran slow: %.1f frames a second over the last minute (the arcade's %.2f)",
+                                  rate, recomp::FrameTiming::kRefreshHz);
+                    std::printf("problem: %s\n", what);
+                    problems.note("slow", what, shared.shown_frame.load());
+                }
+                slow_from = now, slow_frames_from = shared.net_frames.load();
+            }
+        }
         // The input delay in play (Auto): each second, tools::DelayTuner::step (gamerun's the same), a frame at a time
         // (a raised delay leaves a frame held, a lowered one drops one: the session's stream takes either).
         static auto delay_checked = now;
@@ -5023,6 +5394,7 @@ int main(int argc, char** argv) {
             const uint64_t have = shared.input_delay, want = delay_tuner.step(one_way, shared.rollback != nullptr, late, have);
             if (want != have) {
                 shared.input_delay = want;
+                net::events::add(net::events::Kind::delay, 0xFF, 0xFF, want, shared.shown_frame.load()); // (the timeline)
                 std::printf("spikeout: input delay %llu (the furthest player %d ms away one way, %llu of %llu catch-ups late)\n",
                             static_cast<unsigned long long>(want), one_way, static_cast<unsigned long long>(late),
                             static_cast<unsigned long long>(catches));
@@ -5061,19 +5433,26 @@ int main(int argc, char** argv) {
                 for (const std::string& name : netgame->session().players()) taken += name.empty() ? 0 : 1;
                 // (and the game's stage and area, the owner's "which stage the game is in": stage_of, area_of)
                 const int stage = netgame->running ? shared.room_stage.load() : 0, area = netgame->running ? shared.room_area.load() : 0;
-                if (taken != netgame->listed_taken || stage != netgame->listed_stage || area != netgame->listed_area) { // the lobby's list up to date
+                const int difficulty = shared.room_difficulty.load(); // (the room's, + 1: a coloured pill in the lists)
+                if (taken != netgame->listed_taken || stage != netgame->listed_stage || area != netgame->listed_area ||
+                    difficulty != netgame->listed_difficulty) { // the lobby's list up to date
                     netgame->listed_taken = taken, netgame->listed_stage = stage, netgame->listed_area = area;
+                    netgame->listed_difficulty = difficulty;
                     net::Json m = net::Json::object();
                     m.set("t", "update"), m.set("taken", static_cast<int>(taken)), m.set("started", netgame->running);
-                    m.set("stage", stage), m.set("area", area);
+                    m.set("stage", stage), m.set("area", area), m.set("difficulty", difficulty);
                     netgame->lobby.send(m);
                 }
             }
-            if (netgame->host) { // (the game's stage and area in this network's beacons too)
+            if (netgame->host) { // (the game's stage and area in this network's beacons too, and the room's difficulty)
                 const uint8_t stage = netgame->running ? shared.room_stage.load() : 0, area = netgame->running ? shared.room_area.load() : 0;
                 if (stage != netgame->beacon_stage || area != netgame->beacon_area) {
                     netgame->beacon_stage = stage, netgame->beacon_area = area, netgame->session().set_stage(stage, area);
                     std::printf("net: the room's listing: %s (area %d)\n", playing_text(stage, area).c_str(), area - 1);
+                }
+                if (const uint8_t d = shared.room_difficulty.load(); d != netgame->beacon_difficulty) {
+                    netgame->beacon_difficulty = d, netgame->session().set_difficulty(d);
+                    std::printf("net: the room's difficulty: %s\n", d ? tools::ArcadeSettings::kDifficultyNames[d - 1] : "not known");
                 }
             }
             if (!netgame->running)
@@ -5111,8 +5490,8 @@ int main(int argc, char** argv) {
             for (std::size_t s = 0; s < seats.size(); ++s) {
                 const auto& v = seats[s];
                 if (v.link == Link::none || v.link == link_told[s]) continue;
-                std::printf("net: %s (seat %zu): %s, %d ms there and back\n", v.name.empty() ? "a player" : v.name.c_str(), s + 1,
-                            kind(v.link), v.round_trip);
+                std::printf("net: %s (seat %zu): %s%s, %d ms there and back\n", v.name.empty() ? "a player" : v.name.c_str(), s + 1,
+                            kind(v.link), v.same_public ? " (our own public address: this home's router between us)" : "", v.round_trip);
                 link_told[s] = v.link;
             }
             if (now - summary_at >= std::chrono::seconds(60)) {
@@ -5277,6 +5656,8 @@ int main(int argc, char** argv) {
                 }
                 // (spectators: an eye and how many after the header, in the room and in the game: the owner's choice)
                 net_pills.watchers = static_cast<int>(netgame->session().watching());
+                // (the room's difficulty, a coloured pill after the room line: playing, or a host waiting to start)
+                if (netgame->running || netgame->host) net_pills.difficulty = static_cast<int>(shared.room_difficulty.load()) - 1;
                 // (a spectator: whom it watches and how to change it, at the bottom for 5 s once its game shows and
                 // after each change: the owner's choice)
                 static bool banner_started = false;

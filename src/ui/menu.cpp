@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <chrono>
 #include <map>
 #include <set>
@@ -44,6 +45,16 @@ int first_selectable(const MenuPage& p) {
 
 Rml::Span<const Rml::byte> bytes(const Asset& a) { return {a.data, a.size}; }
 
+// A file read from a UTF-8 path (a save's picture in the data folder, which has the user's name in it, in any
+// language: Windows' fopen takes its code page).
+std::FILE* open_utf8(const std::string& path) {
+#ifdef _WIN32
+    return _wfopen(std::filesystem::path(std::u8string(path.begin(), path.end())).wstring().c_str(), L"rb");
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
+
 // RmlUi's files: the flags' picture (flags.rcss's "src: flags.png") from the program itself, anything else
 // from the disk as RmlUi's own would.
 struct AssetFiles : Rml::FileInterface {
@@ -56,7 +67,7 @@ struct AssetFiles : Rml::FileInterface {
         auto* f = new struct Open;
         if (path.size() >= 9 && path.compare(path.size() - 9, 9, "flags.png") == 0) f->asset = &assets::flags_png;
         else if (path.size() >= 13 && path.compare(path.size() - 13, 13, "platforms.png") == 0) f->asset = &assets::platforms_png;
-        else if (!(f->file = std::fopen(path.c_str(), "rb"))) return delete f, 0;
+        else if (!(f->file = open_utf8(path))) return delete f, 0;
         return reinterpret_cast<Rml::FileHandle>(f);
     }
     void Close(Rml::FileHandle h) override {
@@ -232,6 +243,12 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         ".flag { width: 20dp; height: 15dp; margin: 0 6dp 3dp 0; border: 1dp #000000; } " // (as tall as the 20dp text's capitals, on their middle: measured)
         ".noflag { width: 22dp; height: 15dp; margin: 0 6dp 3dp 0; } "
         ".head .eye { width: 22dp; height: 22dp; margin: 0 3dp 0 10dp; image-color: #ffd34a; } " // (the spectators' count)
+        // (the room's difficulty, a pill after the room line: the easiest green, normal grey, the hardest red)
+        ".head .diff { font-size: 15dp; line-height: 18dp; height: 18dp; padding: 0 8dp; margin-left: 8dp; border-radius: 9dp; "
+        "border: 1dp #000000; font-effect: none; } "
+        ".diff.d0 { background-color: #5fd35f; color: #0d2a0d; } .diff.d1 { background-color: #b5e06a; color: #1f2a0d; } "
+        ".diff.d2 { background-color: #c8ccd4; color: #15171c; } .diff.d3 { background-color: #ff9a3c; color: #2a1400; } "
+        ".diff.d4 { background-color: #e05555; color: #ffffff; } "
         // (a spectator's banner: bottom middle, over the game, its keys as key caps)
         "#watchb { display: none; position: absolute; left: 0; width: 100%; bottom: 28dp; text-align: center; } "
         "#watchb { font-size: 22dp; color: #ffffff; font-effect: outline(2dp #000000); } "
@@ -277,6 +294,9 @@ void Menu::show_corner() {
     else impl_->fps->Hide();
 }
 
+// (the arcade's difficulty levels as the game's test menu names them: tools::ArcadeSettings::kDifficultyNames)
+constexpr const char* kDifficultyPills[] = {"EASIEST", "EASY", "NORMAL", "HARD", "HARDEST"};
+
 void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, const NetPills& pills) {
     if (!impl_->fps) return;
     // (the spectators: an eye and their count after the header, in its colour; the input delay: each player's own now,
@@ -287,6 +307,10 @@ void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, c
                                      : "<div class=\"head\"><span>" + escape(header) + "</span>" +
                                            (pills.watchers > 0 ? "<img class=\"eye\" sprite=\"eye\"/><span>" + std::to_string(pills.watchers) + "</span>"
                                                                : std::string()) +
+                                           (pills.difficulty >= 0 && pills.difficulty < 5
+                                                ? "<span class=\"diff d" + std::to_string(pills.difficulty) + "\">" +
+                                                      std::string(kDifficultyPills[pills.difficulty]) + "</span>"
+                                                : std::string()) +
                                            "</div>";
     // (a platform's icon, then a flag, between the seat and the name; the icon in the row's colour, as its text; each
     // row right-aligned, its parts as wide as they are)
@@ -493,10 +517,24 @@ void Menu::build() {
     std::string rml;
     for (size_t i = 0; i < p.items.size(); i++) {
         const MenuItem& it = p.items[i];
-        rml += "<div class=\"row" + std::string(it.info ? " info" : "") + (static_cast<int>(i) == selected_ ? " selected" : "") +
-               "\" id=\"r" + std::to_string(i) + "\"><span class=\"label\">" +
+        // (a save's row: its picture from the disk, as RmlUi joins a path: a drive's path whole; elsewhere one more '/',
+        // as it takes one off an absolute path)
+        std::string picture;
+        if (it.tall) {
+            std::string src = it.image;
+            for (char& ch : src)
+                if (ch == '\\') ch = '/';
+#ifndef _WIN32
+            if (!src.empty() && src[0] == '/') src = "/" + src;
+#endif
+            picture = src.empty() ? "<div class=\"thumb none\"></div>" : "<img class=\"thumb\" src=\"" + escape(src) + "\"/>";
+        }
+        rml += "<div class=\"row" + std::string(it.info ? " info" : "") + (it.tall ? " tall" : "") + (it.dim ? " dim" : "") +
+               (static_cast<int>(i) == selected_ ? " selected" : "") + "\" id=\"r" + std::to_string(i) + "\">" + picture +
+               "<span class=\"label\">" +
                (impl_->flags.count(it.country) ? "<img class=\"flag\" sprite=\"flag-" + it.country + "\"/>" : std::string()) +
-               escape(it.label) +
+               (it.tall ? "<span class=\"line\">" + escape(it.label) + "</span><span class=\"detail\">" + escape(it.detail) + "</span>"
+                        : escape(it.label)) +
                (it.watchers > 0 ? "<img class=\"eye\" sprite=\"eye\"/>" + std::to_string(it.watchers) : std::string()) + "</span>";
         if (it.estimate_ms >= 0) { // (the same bars as the seat list's, by the same bands)
             const int ms = it.estimate_ms, bars = ms < 40 ? 4 : ms < 80 ? 3 : ms < 140 ? 2 : 1;

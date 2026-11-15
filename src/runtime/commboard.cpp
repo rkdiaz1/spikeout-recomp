@@ -254,8 +254,9 @@ void CommBoard::deliver_receive() {
     if (send_done_ == kForwarding) { // a slave's frame, with what came in where it lands: on to the next
         const std::size_t out = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
         std::vector<uint8_t> frame(bank(false) + send_offset_, bank(false) + send_offset_ + out);
-        const std::size_t at = recv_offset_ - send_offset_;
-        std::memcpy(frame.data() + at, packet.data(), std::min(size, out - at));
+        // (where it lands, inside the frame: a loaded state's offsets aren't the firmware's, safe loading)
+        const std::size_t at = recv_offset_ >= send_offset_ ? std::size_t{recv_offset_} - send_offset_ : out;
+        if (at < out) std::memcpy(frame.data() + at, packet.data(), std::min(size, out - at));
         send_done_ = cpu_cycles() + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(at));
         transmit(frame.data(), out);
     }

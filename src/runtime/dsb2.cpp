@@ -324,6 +324,22 @@ void Dsb2::check_loaded() const {
     if (dec.reserv < 0 || dec.reserv > static_cast<int>(sizeof dec.reserv_buf) || dec.free_format_bytes < 0 ||
         dec.free_format_bytes > kMaxFreeFormatBytes)
         throw std::runtime_error("save state: the music decoder's frame state out of range");
+    // (where its 68000 is run to: the samples made, against its own clock; and its timer's next tick. A count far from
+    // the clock had render() run the CPU billions of cycles, the game stood: the fuzz test's finding. A second's
+    // cycles either way allowed: a real state's are a sample apart, and the timer a tick ahead at most)
+    const auto clock = static_cast<uint64_t>(cpu_->getClock());
+    constexpr uint64_t kSlack = kCpuHz;
+    if (samples_ > (uint64_t{1} << 40) || clock > (uint64_t{1} << 50))
+        throw std::runtime_error("save state: the music board's clock out of range");
+    const uint64_t target = samples_ * kCpuHz / kOutputRate;
+    if (target + kSlack < clock || target > clock + kSlack || next_timer_ + kSlack < clock || next_timer_ > clock + kSlack)
+        throw std::runtime_error("save state: the music board's clock and its samples disagree");
+    // (the two output samples blended between: sound samples, 16 bits after the volume; and the blend's place in
+    // 16.16, under one: UBSan's finding, prev_ - next_ overflowed)
+    for (const int32_t v : {prev_[0], prev_[1], next_[0], next_[1]})
+        if (v < -65536 || v > 65536) throw std::runtime_error("save state: the music board's output out of range");
+    if (frac_ >= 0x10000 || stereo_ > Stereo::MonoRight) // (stereo_: next_sample's switch, none of its cases: no output made)
+        throw std::runtime_error("save state: the music board's output out of range");
 }
 
 } // namespace m3

@@ -46,6 +46,8 @@ constexpr uint64_t kHashEvery = 120;
 
 struct Hashes {
     std::map<uint64_t, uint64_t> pending; // (rollback: frame -> hash, waiting to be settled)
+    // (each settled hash also here: the game's recording keeps them, tools/net_record.hpp version 2)
+    std::function<void(uint64_t frame, std::size_t index, uint64_t hash)> settled;
 
     // At the end of `frame`: its hash taken (`hashed`: this board's RAM is the real one here: not a shadow's, which is
     // exact only in what it sends), then those now settled sent.
@@ -54,14 +56,20 @@ struct Hashes {
         if (hashed && frame % kHashEvery == 0) {
             const uint64_t h = Recording::ram_hash(ram);
             if (rollback) pending[frame] = h;
-            else net.hash(frame, index, h);
+            else send(net, index, frame, h);
             ram_dump(index, frame, ram.data(), ram.size());
         }
         while (!pending.empty() && pending.begin()->first <= frame && inputs.all_set(pending.begin()->first, boards) &&
                inputs.wrong_from() > pending.begin()->first) {
-            net.hash(pending.begin()->first, index, pending.begin()->second);
+            send(net, index, pending.begin()->first, pending.begin()->second);
             pending.erase(pending.begin());
         }
+    }
+
+private:
+    void send(NetPlay& net, std::size_t index, uint64_t frame, uint64_t h) {
+        net.hash(frame, index, h);
+        if (settled) settled(frame, index, h);
     }
 };
 
@@ -111,9 +119,21 @@ inline BackupSent backup_now(NetPlay& net, backup::Maker& backups, std::set<uint
         if (s == index) continue;
         else if (net.session().joining(s)) bases.erase(s); // (whole once seated)
         else to.push_back(s);
+    std::vector<uint8_t> owed; // (held back before: all the changes since the last it was sent, each its own)
     for (const uint8_t s : to) {
-        (backups.changes_possible() && bases.count(s) ? to_changes : to_whole).push_back(s);
-        bases.insert(s);
+        if (!backups.changes_possible() || !bases.count(s)) {
+            backups.forget(s), to_whole.push_back(s), bases.insert(s);
+            continue;
+        }
+        // (its last still on its way: none this time, the pages kept for its next; issue 30, a far player's line
+        // at its slowest took a backup in more than the 2 s between them, and the rest to it waited behind them)
+        if (!net.backup_through(s)) backups.hold(s);
+        else (backups.owes(s) ? owed : to_changes).push_back(s);
+    }
+    for (const uint8_t s : owed) {
+        std::vector<uint8_t> raw = backups.changes_for(s);
+        sent.changes = std::max(sent.changes, raw.size());
+        net.send_backup(at, std::move(raw), {s});
     }
     if (!to_changes.empty()) {
         std::vector<uint8_t> raw = backups.changes();
@@ -537,7 +557,7 @@ inline uint64_t set_up_one_board(one_board::Game& game, const OneBoardSetUp& u) 
         auto packed = net->wait_board(static_cast<uint8_t>(seat), frame, std::chrono::seconds(30));
         if (!packed) return std::nullopt;
         const auto t1 = std::chrono::steady_clock::now();
-        auto board = one_board::unpack_remote(*packed, [](std::span<const uint8_t> d) { return ::net::decompress(d); });
+        auto board = one_board::unpack_remote(*packed, [](std::span<const uint8_t> d) { return ::net::decompress(d, ::net::kMaxBoardState); });
         const bool backup = board && board->state.empty();
         if (backup) { // ("my backup of that frame": from the copy kept here)
             auto copy = net->backup_at(static_cast<uint8_t>(seat), frame);

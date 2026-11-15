@@ -5,14 +5,18 @@
 // order its state() walks them); a check of the state's size or of a known field first keeps that place honest.
 #include "test.hpp"
 
+#include "runtime/crypt315_5881.hpp"
 #include "runtime/dsb2.hpp"
 #include "runtime/eeprom.hpp"
+#include "runtime/jtag.hpp"
 #include "runtime/real3d.hpp"
 #include "runtime/real3d_scene.hpp"
 #include "runtime/scsp.hpp"
 #include "runtime/state.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -227,4 +231,138 @@ TEST_CASE("real3d scene: siblings drawn last first, a looping chain and a viewpo
     viewport(cull, 0x800100, 0x83FFF0); // the next viewport's words past high culling RAM's end: not read
     Real3dSceneBuilder().build(r, scene);
     CHECK_EQ(scene.viewports.size(), 1u);
+}
+
+TEST_CASE("state load: the decryption chip's buffer places and bit numbers") {
+    Crypt315_5881 crypt;
+    const std::vector<uint8_t> bytes = saved(crypt);
+    // From the end: done_compression_ 1, block_numlines_, block_pos_, block_size_ 4 each, buffer2a_ 2, buffer2_ 2,
+    // buffer_bit2_, buffer_bit_, line_buffer_size_, line_buffer_pos_, buffer_pos_ 4 each.
+    constexpr std::size_t kBit2 = 21, kBit = 25, kLineSize = 29, kLinePos = 33, kPos = 37;
+    CHECK_EQ(field<int>(bytes, kBit2), 15);
+    CHECK(loads_with(crypt, bytes, kPos, int{2}));
+    CHECK(!loads_with(crypt, bytes, kPos, int{3}));
+    CHECK(!loads_with(crypt, bytes, kPos, int{-2}));
+    CHECK(loads_with(crypt, bytes, kLineSize, int{512}));
+    CHECK(!loads_with(crypt, bytes, kLineSize, int{513}));
+    CHECK(!loads_with(crypt, bytes, kLinePos, int{-1}));
+    CHECK(!loads_with(crypt, bytes, kBit, int{8}));
+    CHECK(!loads_with(crypt, bytes, kBit2, int{16}));
+    CHECK(round_trips(crypt, bytes));
+}
+
+TEST_CASE("state load: the JTAG chain's state and register lengths") {
+    Jtag jtag;
+    const std::vector<uint8_t> bytes = saved(jtag);
+    // From the end: mem_config_ 12, modewords_ 20, last_tck_, tdo_, state_ 1 each; then the last device's
+    // instruction 1 and length 4.
+    constexpr std::size_t kState = 35, kLength = 40;
+    CHECK_EQ(field<uint8_t>(bytes, kState), uint8_t{0});
+    CHECK(loads_with(jtag, bytes, kState, uint8_t{15}));
+    CHECK(!loads_with(jtag, bytes, kState, uint8_t{16}));
+    CHECK(loads_with(jtag, bytes, kLength, uint32_t{64}));
+    CHECK(!loads_with(jtag, bytes, kLength, uint32_t{65}));
+    CHECK(!loads_with(jtag, bytes, kLength, uint32_t{0}));
+    CHECK(round_trips(jtag, bytes));
+}
+
+// Fuzzing (roadmap, safe loading): each device's state with random bytes changed, loaded, and run a little if it
+// loads; nothing may read or write outside memory (run under AddressSanitizer and UBSan to see it: Linux,
+// -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"). A fixed seed: the same cases each run; SPIKEOUT_FUZZ=N runs N
+// rounds a device (default 300).
+namespace {
+
+struct Rng {
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    uint64_t next() {
+        s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+        return s;
+    }
+    std::size_t below(std::size_t n) { return static_cast<std::size_t>(next() % n); }
+};
+
+std::size_t fuzz_rounds() {
+    const char* env = std::getenv("SPIKEOUT_FUZZ");
+    return env ? static_cast<std::size_t>(std::strtoull(env, nullptr, 10)) : 300;
+}
+
+// `bytes` with a few bytes changed: most in the last 4 KB (the small fields, after the big buffers), some anywhere.
+std::vector<uint8_t> mutated(const std::vector<uint8_t>& bytes, Rng& rng) {
+    std::vector<uint8_t> b = bytes;
+    const std::size_t n = 1 + rng.below(4);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t tail = std::min<std::size_t>(b.size(), 4096);
+        const std::size_t at = rng.below(4) ? b.size() - 1 - rng.below(tail) : rng.below(b.size());
+        switch (rng.below(3)) {
+        case 0: b[at] = static_cast<uint8_t>(rng.next()); break;
+        case 1: b[at] ^= static_cast<uint8_t>(1u << rng.below(8)); break;
+        default: b[at] = rng.below(2) ? 0xFF : 0x80; break;
+        }
+    }
+    return b;
+}
+
+// Each round: a mutated state into `device`; `run` if it loads. Then the good state loads again (a refused one
+// leaves the device usable). Returns how many loaded (some must, or the mutations never reach the checks' fields).
+template <class Device, class Run> std::size_t fuzz(Device& device, const std::vector<uint8_t>& bytes, Run run, uint64_t seed) {
+    Rng rng{seed};
+    std::size_t loaded = 0;
+    for (std::size_t round = 0, rounds = fuzz_rounds(); round < rounds; ++round) {
+        static const bool trace = std::getenv("SPIKEOUT_FUZZ_TRACE") != nullptr; // (each round as it starts: one that hangs found)
+        std::vector<uint8_t> m = mutated(bytes, rng);
+        if (trace) {
+            std::printf("round %zu:", round);
+            for (std::size_t i = 0; i < m.size(); ++i)
+                if (m[i] != bytes[i]) std::printf(" %zu from the end: %02x->%02x", bytes.size() - i, bytes[i], m[i]);
+            std::printf("\n"), std::fflush(stdout);
+        }
+        if (loads(device, std::move(m))) ++loaded, run(device);
+        if (!loads(device, bytes)) return 0;
+    }
+    return loaded;
+}
+
+} // namespace
+
+TEST_CASE("state load fuzz: SCSP") {
+    std::vector<uint8_t> ram(Scsp::kRamSize, 0);
+    Scsp scsp(ram, true);
+    for (uint32_t slot = 0; slot < 4; ++slot) { // (a few playing, LFOs on: their tables in the state)
+        const uint32_t at = slot * 0x20;
+        scsp.write16(at + 0x12, static_cast<uint16_t>(0x00E1 + slot));
+        scsp.write16(at + 0x08, 0x001F);
+        scsp.write16(at + 0x00, 0x1800);
+    }
+    const std::vector<uint8_t> bytes = saved(scsp);
+    CHECK(fuzz(scsp, bytes, [](Scsp& s) {
+        int32_t l = 0, r = 0;
+        for (int i = 0; i < 64; ++i) s.sample(l, r), s.tick_timers();
+    }, 1) > 0);
+}
+
+TEST_CASE("state load fuzz: the music board") {
+    std::vector<uint8_t> program(0x20000, 0), mpeg(0x1000, 0);
+    Dsb2 dsb(program, mpeg);
+    const std::vector<uint8_t> bytes = saved(dsb);
+    CHECK(fuzz(dsb, bytes, [](Dsb2& d) {
+        int16_t out[64 * 2];
+        d.render(out, 64);
+    }, 2) > 0);
+}
+
+TEST_CASE("state load fuzz: EEPROM, JTAG and the decryption chip") {
+    Eeprom93C46 eeprom;
+    CHECK(fuzz(eeprom, saved(eeprom), [](Eeprom93C46& e) {
+        for (uint64_t t = 0; t < 64; ++t) e.write_pins(true, (t & 1) != 0, (t & 2) != 0, t * 100);
+    }, 3) > 0);
+    Jtag jtag;
+    CHECK(fuzz(jtag, saved(jtag), [](Jtag& j) {
+        for (int t = 0; t < 256; ++t) j.write((t & 1) != 0, (t & 6) == 2, (t & 8) != 0, false);
+    }, 4) > 0);
+    Crypt315_5881 crypt;
+    crypt.set_key(0x12345678);
+    crypt.set_reader([](uint32_t a) { return static_cast<uint16_t>(a * 0x9E37u); });
+    CHECK(fuzz(crypt, saved(crypt), [](Crypt315_5881& c) {
+        for (int i = 0; i < 2048; ++i) c.decrypt();
+    }, 5) > 0);
 }

@@ -53,6 +53,8 @@ public:
     const std::string& error() const { return error_; }
 
     bool send_to(const Address& to, std::span<const uint8_t> data);
+    // (the system's error code of the last send that failed: WSAGetLastError on Windows, errno elsewhere; 0 cut short)
+    int last_send_error() const { return last_send_error_; }
     struct Datagram {
         Address from;
         std::vector<uint8_t> data;
@@ -66,6 +68,7 @@ private:
     uint16_t port_ = 0;
     std::string error_;
     std::vector<uint8_t> buffer_;
+    int last_send_error_ = 0;
 };
 
 } // namespace net

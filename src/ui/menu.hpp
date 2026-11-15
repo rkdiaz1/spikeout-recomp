@@ -37,6 +37,13 @@ struct MenuItem {
     std::string country;                // a flag before the label (two letters; "" none): a listed game's host
     int estimate_ms = -1;               // signal bars and "~N ms" on the right: a listed game's estimated speed (-1 none)
     int watchers = 0;                   // an eye and this count after the label: a listed game's spectators (0: none)
+    // A save's row (the Saves page): taller, a small picture before the label (a PNG's path, UTF-8; "" a dark box),
+    // a second line under it; `dim` greyed (a damaged save: still selectable, to delete). `tall` without a picture's
+    // file still draws the box.
+    bool tall = false;
+    std::string image;
+    std::string detail;
+    bool dim = false;
 };
 
 // A seat of a network game, in the list under the frame rate.
@@ -60,6 +67,7 @@ struct NetPills {
     int delay = -1;
     bool auto_delay = false;
     int watchers = 0; // (spectators: an eye and their count after the header line; 0 none)
+    int difficulty = -1; // (the room's: the arcade's level, 0 easiest - 4 hardest, a coloured pill after the header; -1 none)
 };
 
 // A page for typing a short code (a game's): a box of its letters and an

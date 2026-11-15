@@ -27,6 +27,8 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,10 +93,37 @@ public:
         base_ = frame_;
         snaps_.save(frame, walk);
         frame_ = frame, taken_ = taken, sent_ = sent;
-        if (snaps_.started()) base_ = 0; // (nothing to change from: whole for every machine)
+        if (snaps_.started()) base_ = 0, owed_.clear(); // (nothing to change from: whole for every machine)
+        else
+            for (auto& [seat, o] : owed_) snaps_.pages([&](std::size_t r, std::size_t p) { o.pages[r].insert(p); });
     }
     uint64_t frame() const { return frame_; }
     bool changes_possible() const { return base_ != 0; }
+    // A machine whose last backup is still on its way (issue 30: a slow line's backups queued faster than they went,
+    // thousands of pieces, everything else to it behind them for minutes): this one isn't sent to it; the pages
+    // changed since the last it was sent are kept for it, and its next (changes_for) has them all, from that one.
+    void hold(uint8_t seat) {
+        if (owed_.count(seat) || !changes_possible()) return;
+        Owed& o = owed_[seat];
+        o.base = base_;
+        snaps_.pages([&](std::size_t r, std::size_t p) { o.pages[r].insert(p); });
+    }
+    bool owes(uint8_t seat) const { return owed_.count(seat) != 0; }
+    void forget(uint8_t seat) { owed_.erase(seat); } // (it's sent the whole next)
+    std::vector<uint8_t> changes_for(uint8_t seat) {
+        const auto it = owed_.find(seat);
+        if (it == owed_.end()) return changes();
+        detail::Out o;
+        header(o, detail::kChanges, it->second.base);
+        uint32_t n = 0;
+        for (const auto& [r, pages] : it->second.pages) n += static_cast<uint32_t>(pages.size());
+        o.u32(n);
+        for (const auto& [r, pages] : it->second.pages)
+            for (const std::size_t page : pages) page_out(o, r, page);
+        small(o);
+        owed_.erase(it);
+        return std::move(o.b);
+    }
     // (not packed yet: net::compress, best off the game's thread)
     std::vector<uint8_t> whole() const {
         detail::Out o;
@@ -116,19 +145,26 @@ public:
         uint32_t n = 0;
         snaps_.pages([&](std::size_t, std::size_t) { ++n; });
         o.u32(n);
-        snaps_.pages([&](std::size_t region, std::size_t page) {
-            const std::vector<uint8_t>& r = snaps_.region(region);
-            const std::size_t at = page * m3::Snapshots::kPageBytes;
-            o.u32(static_cast<uint32_t>(region)), o.u32(static_cast<uint32_t>(page));
-            o.bytes(r.data() + at, std::min(m3::Snapshots::kPageBytes, r.size() - at));
-        });
+        snaps_.pages([&](std::size_t region, std::size_t page) { page_out(o, region, page); });
         small(o);
         return std::move(o.b);
     }
 
 private:
-    void header(detail::Out& o, uint8_t kind) const {
-        o.u8(kind), o.u64(frame_), o.u64(base_), o.u64(taken_), o.u64(sent_);
+    struct Owed {
+        uint64_t base = 0;                                  // (the last backup it was sent)
+        std::map<std::size_t, std::set<std::size_t>> pages; // (by region: changed since)
+    };
+    std::map<uint8_t, Owed> owed_;
+    void page_out(detail::Out& o, std::size_t region, std::size_t page) const {
+        const std::vector<uint8_t>& r = snaps_.region(region);
+        const std::size_t at = page * m3::Snapshots::kPageBytes;
+        o.u32(static_cast<uint32_t>(region)), o.u32(static_cast<uint32_t>(page));
+        o.bytes(r.data() + at, std::min(m3::Snapshots::kPageBytes, r.size() - at));
+    }
+    void header(detail::Out& o, uint8_t kind) const { header(o, kind, base_); }
+    void header(detail::Out& o, uint8_t kind, uint64_t base) const {
+        o.u8(kind), o.u64(frame_), o.u64(base), o.u64(taken_), o.u64(sent_);
         o.u32(static_cast<uint32_t>(snaps_.regions()));
     }
     void small(detail::Out& o) const {
@@ -150,7 +186,7 @@ struct Copy {
     // A backup received (packed). False: changes from a backup this isn't (the whole wanted, Session::want_backup),
     // or not one.
     bool apply(std::span<const uint8_t> packed) {
-        const auto unpacked = net::decompress(packed);
+        const auto unpacked = net::decompress(packed, net::kMaxBoardState);
         if (!unpacked) return false;
         detail::In in{*unpacked};
         const uint8_t kind = in.u8();

@@ -778,8 +778,11 @@ inline std::filesystem::path make_report(const std::string& folder, const std::s
         }
         fs::path state = newest;
         state.replace_extension(".state");
+        fs::path timeline = newest;
+        timeline.replace_extension(".events"); // (the whole game's network timeline)
         if (!newest.empty() && fs::exists(state, ec))
-            for (const fs::path& p : {newest, state}) {
+            for (const fs::path& p : {newest, state, timeline}) {
+                if (!fs::exists(p, ec)) continue;
                 const std::string bytes = detail::read_all(p);
                 const std::vector<uint8_t> locked = lock::seal(std::vector<uint8_t>(bytes.begin(), bytes.end()), *owner);
                 if (!locked.empty()) files.push_back({p.filename().string() + ".locked", std::string(locked.begin(), locked.end())});

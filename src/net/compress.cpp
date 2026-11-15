@@ -22,9 +22,9 @@ std::vector<uint8_t> compress(std::span<const uint8_t> data, int level) {
     return out;
 }
 
-std::optional<std::vector<uint8_t>> decompress(std::span<const uint8_t> data) {
+std::optional<std::vector<uint8_t>> decompress(std::span<const uint8_t> data, std::size_t max_bytes) {
     const unsigned long long size = ZSTD_getFrameContentSize(data.data(), data.size());
-    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN || size > (1ull << 31)) return std::nullopt;
+    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN || size > max_bytes) return std::nullopt;
     std::vector<uint8_t> out(static_cast<std::size_t>(size));
     const std::size_t n = ZSTD_decompress(out.data(), out.size(), data.data(), data.size());
     if (ZSTD_isError(n) || n != out.size()) return std::nullopt;

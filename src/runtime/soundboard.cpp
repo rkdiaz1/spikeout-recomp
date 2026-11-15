@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <stdexcept>
 
 namespace m3 {
 
@@ -185,6 +186,14 @@ void SoundBoard::state(State& s) {
     scsp1_.state(s), scsp2_.state(s);
     cpu_->cpu_state(s);
     s.io(ctrl_), s.io(samples_), s.io(midi_bytes), s.io(irqs_taken);
+    // (its 68000 is run to the samples made, a sample at a time: a count far from its clock had it run billions of
+    // cycles at the next sample, the game stood, as the music board's did: the fuzz test's finding)
+    if (s.loading()) {
+        const auto clock = static_cast<uint64_t>(cpu_->getClock());
+        const uint64_t target = samples_ * kCyclesPerSample;
+        if (samples_ > (uint64_t{1} << 40) || target + kCpuHz < clock || target > clock + kCpuHz)
+            throw std::runtime_error("save state: the sound board's clock and its samples disagree");
+    }
     bool music = dsb_ != nullptr;
     s.io(music);
     if (music != (dsb_ != nullptr)) throw std::runtime_error("save state: saved with the music board, or without it");

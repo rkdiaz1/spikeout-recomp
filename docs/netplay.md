@@ -3933,6 +3933,17 @@ game's rollback, frames wrong and run again against "held last"). Not in the gam
 person playing on this PC yet (the five net-game recordings in the data folder are coins and starts; the owner's game
 of 08:59 was rotated out): the owner to record a few minutes of a fight.
 
+**Measured on players' recordings (2026-11-15):** 1,009 recordings the reports brought (2,894 seats with a player
+pressing, 177.5 million board frames). The learned run lengths guess wrong MORE often than "held last" at every
+distance: +6.8% at 2 frames late (~35 ms), +10.4% at 6, +12.7% at 9, +18.0% at 17 (~300 ms). Held last is wrong once
+for each change of the inputs (7.8% of a pressing player's frames), each costing the frames late run again. Where the
+changes are (per button, presses and how long they were held): beat 22% of all changes (its presses 22% 1-3 frames,
+69% 4-8, 8% 9-30), the stick's four directions 51% (mostly held 9 frames or more), charge 13%, shift 9%, jump 4%. A
+tap's release is the only change a rule could see coming, and beat's spread over 1-8 frames leaves its exact frame a
+guess: a wrong one costs a going back as held last's does, and a release guessed too soon on a long hold one more.
+Kept: held last (tools/input_guess.hpp stays out of the game). What helps more: fewer frames late (time sync, input
+delay) and cheaper goings back.
+
 ## Plan
 
 1. Single board, single player (milestones 1–4).
@@ -4168,3 +4179,52 @@ cabinet), GAMERUN_ROLLBACK_AT_SEAT=1 rollback only from the cabinet's frame (mea
   sync, one board for weak PCs, the host moving a player to watching) are for it.
 - Every-board join desyncs in the reports: 8 of 13 desync events within ~3 s of a seat taken (bundles 1016,
   764/1271, 584/1259, 539, 1465, 904, 1281/1352, 736/1241); a cause apart from this one.
+
+## Reports that can be played again; issue 30 (2026-11-15, release 6)
+
+**Issue 30** (0.1.0-preview5.1, a room of four, its player TONG with automatic reports off; the others sent none): the
+log's last 90 seconds. At about frame 33,730 every board's game logic stopped together (+128, then +0 from 33,900) and
+the game showed its "Communication error": every machine in step, the emulated cabinets disagreeing, as in issues 22
+and 24. No join, leave, resync or host change in what the log kept (its start cut off by GitHub's size limit). Seen
+on the way, not shown to be its cause: board backups (kBackup, ~120 KB each ~2 s, one 1.2 MB) queued to every seat on
+the reliable channel faster than its pace, which every seat's had fallen to its floor (31 KB/s): a far player's round
+trip jumping (150-500 ms) halves everyone's pace (Impl::pace's `rising`). The far player's queue stood at 4,000-5,400
+pieces, its front 32,000 pieces behind the others'; anything reliable to it (a take, a parting, a joiner's state) waits
+behind that, minutes. Fixed in release 6 (both machines' sides the same; nothing new sent, so a release 5 machine
+still takes them):
+- **One backup on its way to a seat at most.** While a seat's last backup isn't acknowledged (Session::backup_through:
+  the end of the last backup queued on that channel, `Reliable::backup_end`; NetPlay::backup_through adds those still
+  being packed), backup_now holds the next back from it (backup::Maker::hold) and keeps the pages changed since the
+  last it was sent; its next (Maker::changes_for) has them all, its `base` that last one, which the receiver's
+  Copy::apply already checks. A slow line gets fewer backups, each a little bigger, never a pile; spectators on one
+  board the same.
+- **Each player's pace its own.** Impl::pace halves a player's channel when its own round trip rises, or when two or
+  more players' do at once (this machine's uplink filling shows in everyone's); one far player's jumping no longer
+  halves the near players'. Two players: as before.
+
+**What a report now holds** (the owner's list from issue 22's findings, all in tools/problem_report.hpp and the
+window; nothing sent between machines, nothing in the build id):
+- **The game's Communication error** saves a bundle ("comm-error") the moment it shows: every 30 frames the shown
+  board's tile layers are read for it (tools::tile_text_row, a 16 KB read), and once a game every board's state of
+  that moment (`comm-error.state`, packed, as F9's network save) goes in with the recording from the game's start.
+  Tests: SPIKEOUT_TEST_COMM_TEXT=STRING watches for another text ("MASTER SITE" at the link screen: the bundle saved,
+  its state loaded by gamerun and run on).
+- **The whole game's network timeline** (`NAME.events` beside `NAME.inputs`): net::events::record_to writes the ring's
+  events to a file on a thread of its own each second (the join's exchanges first); closed when the game is left,
+  pruned with its recording, in every bundle and Report a problem's zip (locked).
+- **Saved again after a problem**: a hang, stall, desync or Communication error's bundle is saved a second time 60 s
+  later ("<kind>-after", Saver::kAfter), or as the game is left or the program ends, with the recording and timeline
+  since.
+- **The newest join's state** (`join-state-<frame>.state`): the host's packed "every board's state" as it sends a
+  joiner (NetPlay::on_state_packed: no extra work), a joiner's as it came; ~10 MB of memory. Proved: a two-window game
+  joined at frame 1063, its bundle's join state replayed with the recording (gamerun --load-state join-state-1063.state
+  --net-replay NAME.inputs): 22 of 22 RAM checks the same on each board.
+- **Recordings that check themselves** (net_record.hpp version 2): each board's RAM hash at every 120th frame as the
+  machines' own check takes it once settled (net_frame::Hashes::settled), written a check late; gamerun --net-replay
+  says the first frame a board parts from the game ("net replay: board B parts from the recorded game at frame F").
+  Version 1 recordings still read.
+- **Why sends failed**: each system error code the first time (WSAGetLastError / errno, with the kind of address, no
+  address), counted in the "isn't answering" line; a direct link to this machine's own public address marked (two
+  PCs behind one router, issue 23's question).
+- **Test switch**: SPIKEOUT_TEST_PROBLEM_AT=FRAME:KIND notes a problem at that frame (the join state and the save
+  again tested with it).

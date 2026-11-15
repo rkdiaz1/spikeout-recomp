@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -62,6 +63,27 @@ struct Note {
     std::vector<uint8_t> dump;           // (a hang on Windows: a minidump)
     std::vector<std::pair<std::string, std::string>> files; // (more, already read: a crash's report)
 };
+
+// The newest "every board's state" of a join in this game (the host's, packed as it sends it a joiner; a joiner's, as it
+// came), kept in memory (~10 MB) for the bundles: a replay starts there (gamerun --load-state with the recording's
+// inputs), seconds before a problem instead of at the game's frame 3. Empty frame/bytes: forgotten (the game left).
+namespace detail {
+struct KeptState {
+    std::mutex lock;
+    uint64_t frame = 0;
+    std::string packed;
+};
+inline KeptState& kept_state() {
+    static KeptState* k = new KeptState; // (never destroyed: written from network threads)
+    return *k;
+}
+} // namespace detail
+inline void keep_join_state(uint64_t frame, std::span<const uint8_t> packed) {
+    detail::KeptState& k = detail::kept_state();
+    std::string bytes(packed.begin(), packed.end());
+    std::lock_guard guard(k.lock);
+    k.frame = frame, k.packed = std::move(bytes);
+}
 
 class Saver {
 public:
@@ -97,6 +119,16 @@ public:
         wake_.notify_all();
     }
     void note(const std::string& kind, const std::string& detail, uint64_t frame = 0) { note(Note{kind, detail, frame, {}, {}, {}}); }
+    // The game left (or the program ending): the bundles waiting to be saved again after a problem (kAfter) saved now,
+    // the recording then complete.
+    void game_over() {
+        {
+            std::lock_guard guard(lock_);
+            for (auto& [due, n] : later_) queue_.push_back(std::move(n));
+            later_.clear();
+        }
+        wake_.notify_all();
+    }
     // How many of each kind were noticed this run (the stats line, part 2).
     std::map<std::string, int> counts_by_kind() const {
         std::lock_guard guard(lock_);
@@ -104,16 +136,40 @@ public:
     }
 
 private:
+    // A room standing still, out of step or showing the game's error: the bundle saved again kAfter later (or when the
+    // game is left first), "<kind>-after", with the recording and timeline since, to see how the room went on (issue
+    // 22's: every PC's bundle ended mid-freeze).
+    static constexpr int kAfter = 60;
+    static bool saved_again(const std::string& kind) {
+        return kind == "hang" || kind == "hang-alone" || kind == "stall" || kind == "desync" || kind == "comm-error";
+    }
     void run() {
         for (;;) {
             Note n;
             {
                 std::unique_lock guard(lock_);
-                wake_.wait(guard, [&] { return stop_ || !queue_.empty(); });
+                for (;;) {
+                    if (stop_) // (the program ending: what waits saved now)
+                        for (auto& [due, l] : later_) queue_.push_back(std::move(l));
+                    if (stop_) later_.clear();
+                    const auto now = std::chrono::steady_clock::now();
+                    for (auto it = later_.begin(); it != later_.end();)
+                        if (it->first <= now) queue_.push_back(std::move(it->second)), it = later_.erase(it);
+                        else ++it;
+                    if (stop_ || !queue_.empty()) break;
+                    if (later_.empty()) wake_.wait(guard);
+                    else wake_.wait_until(guard, std::min_element(later_.begin(), later_.end(), [](const auto& a, const auto& b) { return a.first < b.first; })->first);
+                }
                 if (queue_.empty()) return;
                 n = std::move(queue_.front());
                 queue_.pop_front();
                 ++seen_[n.kind];
+                if (saved_again(n.kind) &&
+                    std::none_of(later_.begin(), later_.end(), [&](const auto& l) { return l.second.kind == n.kind + "-after"; }))
+                    later_.push_back({std::chrono::steady_clock::now() + std::chrono::seconds(kAfter),
+                                      Note{n.kind + "-after", "the " + n.kind + " at frame " + std::to_string(n.frame) +
+                                                                  ": the game's recording and timeline since (" + n.detail + ")",
+                                           n.frame, {}, {}, {}}});
             }
             save(n);
         }
@@ -144,10 +200,17 @@ private:
                 newest = f.path();
         }
         if (!newest.empty()) {
-            fs::path state = newest;
+            fs::path state = newest, timeline = newest;
             state.replace_extension(".state");
-            for (const fs::path& p : {newest, state})
+            timeline.replace_extension(".events"); // (the whole game's network timeline, beside the last minutes' net-events.txt)
+            std::fflush(nullptr);
+            for (const fs::path& p : {newest, state, timeline})
                 if (fs::exists(p, ec)) files.push_back({p.filename().string(), report::detail::read_all(p)});
+        }
+        { // (the newest join's state: a replay from there)
+            detail::KeptState& k = detail::kept_state();
+            std::lock_guard guard(k.lock);
+            if (!k.packed.empty()) files.push_back({"join-state-" + std::to_string(k.frame) + ".state", k.packed});
         }
         // (zipped, then locked whole: the recording's state holds pieces of the ROM, the dump this computer's memory)
         const std::string base = "problem-" + report::detail::stamp() + "-" + n.kind;
@@ -183,6 +246,7 @@ private:
     mutable std::mutex lock_;
     std::condition_variable wake_;
     std::deque<Note> queue_;
+    std::vector<std::pair<std::chrono::steady_clock::time_point, Note>> later_; // (saved again: kAfter)
     std::map<std::string, std::chrono::steady_clock::time_point> last_;
     std::map<std::string, int> seen_;
     int saved_ = 0;

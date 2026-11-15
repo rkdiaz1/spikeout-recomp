@@ -273,6 +273,8 @@ public:
     // backups' thread: the game goes on meanwhile (packed on the game thread, the host's game held 0.2-0.6 s at each
     // join; the session keeps every frame's inputs, so the state may go out a little after its frame).
     // (`make`: the state, made there too: LinkedState::assemble's 80 MB copy)
+    // (each such state as packed, on that thread: the window keeps the newest for its problem bundles; set before play)
+    std::function<void(uint64_t frame, const std::vector<uint8_t>& packed)> on_state_packed;
     void send_state_later(uint64_t frame, std::function<std::vector<uint8_t>()> make) {
         {
             std::lock_guard guard(backup_lock_);
@@ -288,10 +290,21 @@ public:
     void send_backup(uint64_t frame, std::vector<uint8_t> raw, std::vector<uint8_t> seats) {
         {
             std::lock_guard guard(backup_lock_);
+            for (const uint8_t s : seats) ++backups_packing_[s];
             backups_out_.push_back({frame, std::move(raw), std::move(seats), {}, false, {}});
         }
         start_backup_sender();
         backup_queued_.notify_all();
+    }
+    // Every backup to seat `seat` through (none being packed, the session's last acknowledged): backup_now holds the
+    // next back from a seat still taking the last (issue 30).
+    bool backup_through(uint8_t seat) {
+        {
+            std::lock_guard guard(backup_lock_);
+            const auto it = backups_packing_.find(seat);
+            if (it != backups_packing_.end() && it->second > 0) return false;
+        }
+        return session_->backup_through(seat);
     }
     void start_backup_sender() {
         {
@@ -316,6 +329,7 @@ public:
                                         static_cast<unsigned long long>(b.frame), b.raw.size() / 1024, packed.size() / 1024,
                                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
                             std::fflush(stdout);
+                            if (on_state_packed) on_state_packed(b.frame, packed); // (kept for a problem's bundle)
                             session_->send_state(b.frame, std::move(packed));
                             continue;
                         }
@@ -325,6 +339,8 @@ public:
                         }
                         const std::vector<uint8_t> packed = net::compress(b.raw);
                         for (const uint8_t seat : b.seats) session_->send_backup(seat, b.frame, packed);
+                        std::lock_guard guard2(backup_lock_);
+                        for (const uint8_t seat : b.seats) --backups_packing_[seat];
                     }
                 });
         }
@@ -522,6 +538,7 @@ private:
     std::mutex backup_lock_;
     std::condition_variable_any backup_queued_;
     std::deque<BackupOut> backups_out_;
+    std::map<uint8_t, int> backups_packing_; // (by seat: backups queued here, not handed to the session yet)
     std::jthread backup_sender_;
 };
 

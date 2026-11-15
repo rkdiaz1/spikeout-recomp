@@ -210,6 +210,8 @@
 #include "netplay.hpp"
 #include "net/compress.hpp"
 #include "input_log.hpp"
+#include "net/event_log.hpp" // (the network timeline: input delay changes, as the window's)
+#include "net_arrivals.hpp" // (--net-arrivals: a reported game's timing)
 #include "net_record.hpp"
 #include "report_lock.hpp"
 #include "recording.hpp"
@@ -820,6 +822,9 @@ struct Pace { // --pace: how well it kept to the arcade's speed (the end says)
 tools::SpeedReport g_speed; // (--pace: the window's measure, lines and summary: tools/speed_report.hpp)
 const m3::RomSet* g_roms = nullptr; // (one board a PC: a board whose player went run on from its backup)
 std::unique_ptr<tools::rollback::Linked> g_net_rb; // (--net-rollback: every board going back together)
+// --net-arrivals FILE (with --net-replay): the other seats' buttons put in as they came on the reporting PC
+// (tools/net_arrivals.hpp), rollback guessing them till then
+const tools::net_arrivals::Arrivals* g_arrivals = nullptr;
 // --clone-seat B@FRAME: board 0's state at its first block after FRAME's end (no sound), which
 // board B takes at its own, as its own cabinet (thrown after: run() goes on from it).
 std::vector<uint8_t> g_clone_state;
@@ -2453,6 +2458,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                     const uint64_t have = g_input_delay, want = tuner.step(one_way, g_net_rb != nullptr, late, have);
                     if (want != have) {
                         g_input_delay = want;
+                        net::events::add(net::events::Kind::delay, 0xFF, 0xFF, want, frame); // (the timeline, as the window's)
                         std::printf("net: input delay %llu at frame %llu (auto; the furthest player %d ms away one way, %llu of %llu "
                                     "catch-ups late)\n",
                                     (unsigned long long)want, (unsigned long long)frame, one_way, (unsigned long long)late,
@@ -2481,7 +2487,20 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             m.inputs_started = true;
             // (--rollback-sim: after the hand-over another seat's own come late, put in below, whole there or not: a
             // board held whole here runs on its player's inputs from the network, guessed till they come)
-            if (!(o.rb_sim_latency && static_cast<int>(m.index) != o.one_board_stays && frame + g_input_delay > o.one_board_frame))
+            // (--net-arrivals: only the reporting PC's own seat puts its own in; the others' come as they came there, put
+            // in by that seat's board just below, before any read)
+            if (g_arrivals) {
+                if (static_cast<int>(m.index) == g_arrivals->me) {
+                    const uint64_t d = g_arrivals->delay_at(frame, g_input_delay); // (its delay then, the timeline's, Auto's changes too)
+                    put(frame + d, source);
+                    g_arrivals->put_by(frame + d, o.net_replay->first,
+                                       [&](int seat) { return m.inputs->next(static_cast<std::size_t>(seat)); },
+                                       [&](int seat, uint64_t f) {
+                                           if (const auto rec = o.net_replay->get(static_cast<std::size_t>(seat), f))
+                                               m.inputs->set(static_cast<std::size_t>(seat), f, *rec);
+                                       });
+                }
+            } else if (!(o.rb_sim_latency && static_cast<int>(m.index) != o.one_board_stays && frame + g_input_delay > o.one_board_frame))
                 put(frame + g_input_delay, source);
             // (--rollback-sim: the made seats' buttons, as their machines' would come, `rb_sim_latency` frames late)
             // (on time in the run's last frames: none of them left on a guess still to be put right)
@@ -2540,6 +2559,27 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         if (o.netplay)
             m.hashes.frame_end(*o.netplay, *m.inputs, g_net_rb != nullptr, o.boards, m.index, frame, m.bus.ram(),
                                !(one_board_goes(o, m.index) && frame > g_one_board_frame));
+        // (--net-replay of a recording with RAM hashes (net_record.hpp version 2, release 6): each board's RAM checked
+        // against the game's at the same frame end the machines' own check takes it; the first frame a board parts from
+        // the game said at once, the tally with each board's line every 3600 frames)
+        if (o.net_replay && frame % tools::net_record::kHashEvery == 0 && m.index < 4) {
+            static std::atomic<uint64_t> same[4], differ[4], first_differ[4];
+            if (const uint64_t want = o.net_replay->hash(m.index, frame)) {
+                if (tools::Recording::ram_hash(m.bus.ram()) == want) ++same[m.index];
+                else if (differ[m.index]++ == 0) {
+                    first_differ[m.index] = frame;
+                    std::printf("net replay: board %zu parts from the recorded game at frame %llu (its RAM hash differs; %llu checks the "
+                                "same before)\n",
+                                m.index, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(same[m.index].load()));
+                    std::fflush(stdout);
+                }
+            }
+            if (frame % 3600 == 0)
+                std::printf("net replay: board %zu at %llu: %llu RAM checks as recorded, %llu differed%s\n", m.index,
+                            static_cast<unsigned long long>(frame), static_cast<unsigned long long>(same[m.index].load()),
+                            static_cast<unsigned long long>(differ[m.index].load()),
+                            differ[m.index] ? (" (first at " + std::to_string(first_differ[m.index].load()) + ")").c_str() : "");
+        }
         if (o.music_hash && frame % o.music_hash == 0 && m.sound.board.music()) { // --music-hash: the music board's state, and what it plays
             const m3::Dsb2::NowPlaying p = m.sound.board.music()->now_playing();
             std::printf("board %zu frame %llu: music %016llx, %s %06x-%06x at %06x, volume %02x %02x\n", m.index,
@@ -2611,10 +2651,10 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             // (the window's read, tools/net_frame.hpp; --rollback-force: none guessed; --rollback-sim: past its latency)
             // (one board here: a cabinet handed over to the module, which reads its frames around this one's)
             tools::net_frame::Read read;
-            read.guess = g_net_rb && (o.netplay || o.rb_sim_latency) && frame >= g_rollback_from && g_one_board.may_guess(frame);
-            read.ahead = o.rb_sim_latency ? std::max<uint64_t>(12, o.rb_sim_latency + 4) : o.net_rollback;
+            read.guess = g_net_rb && (o.netplay || o.rb_sim_latency || g_arrivals) && frame >= g_rollback_from && g_one_board.may_guess(frame);
+            read.ahead = o.rb_sim_latency ? std::max<uint64_t>(12, o.rb_sim_latency + 4) : g_arrivals ? 12 : o.net_rollback; // (--net-arrivals: rollback's window, as network play's)
             read.quiet_ahead = tools::rollback::quiet_ahead(o.net_rollback_depth);
-            read.keep = o.rb_frames ? o.rb_depth + 1 : o.rb_force_every || o.rb_sim_latency ? o.rb_force_depth + o.rb_sim_latency + 64 : g_net_rb ? std::max(o.net_rollback, o.net_rollback_depth) + 2 : o.one_board >= 0 ? 64 : 0;
+            read.keep = o.rb_frames ? o.rb_depth + 1 : g_arrivals ? 64 : o.rb_force_every || o.rb_sim_latency ? o.rb_force_depth + o.rb_sim_latency + 64 : g_net_rb ? std::max(o.net_rollback, o.net_rollback_depth) + 2 : o.one_board >= 0 ? 64 : 0;
             const auto got = tools::net_frame::read_inputs(*m.inputs, m.index, frame, read);
             if (o.netplay) { // (network play: the longest a frame waited for inputs, and how often over a frame, at the end)
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count();
@@ -2628,6 +2668,15 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             }
             if (!got) throw recomp::OutOfBudget(m.c.cpu.pc); // (the session ended)
             const tools::InputTable::Inputs in_table = *got;
+            // (tests: NET_INPUT_LOG=B:FROM-TO, board B's inputs as read each time a frame in that range runs)
+            if (static const char* spec = std::getenv("NET_INPUT_LOG"); spec) {
+                unsigned b = 0;
+                unsigned long long lo = 0, hi = 0;
+                if (std::sscanf(spec, "%u:%llu-%llu", &b, &lo, &hi) == 3 && m.index == b && frame >= lo && frame <= hi)
+                    std::printf("input: board %zu frame %llu: %02x %02x %02x %02x (next set %llu)\n", m.index,
+                                static_cast<unsigned long long>(frame), in_table.bank0, in_table.bank1, in_table.controls,
+                                in_table.controls2, static_cast<unsigned long long>(m.inputs->next(m.index)));
+            }
             m.bus.inputs.bank0 = in_table.bank0;
             m.bus.inputs.bank1 = in_table.bank1;
             m.bus.inputs.controls = in_table.controls;
@@ -3750,6 +3799,7 @@ int main(int argc_given, char** argv_given) {
     tools::net_record::Reader net_replay; // (--net-replay)
     tools::net_record::Reader net_history; // (--net-history: tests)
     uint64_t net_history_upto = 0;
+    tools::net_arrivals::Arrivals arrivals; // (--net-arrivals)
     std::string net_replay_state;          // (its .state)
     std::map<tools::LinkedInputLog::Where, tools::LinkedInputLog::Change> linked_inputs; // (--inputs, linked boards')
     bool blocks_given = false;
@@ -3757,6 +3807,13 @@ int main(int argc_given, char** argv_given) {
         const std::string arg = argv[i];
         bool taken = true; // (the options in two chains: one of over 128 branches is too deep for MSVC, C1061)
         if (arg == "--blocks" && i + 1 < argc) o.blocks = std::strtoll(argv[++i], nullptr, 0), blocks_given = true;
+        else if (arg == "--net-arrivals" && i + 1 < argc) { // FILE: net-events.txt, the reporting PC's timing (tools/net_arrivals.hpp)
+            if (const std::string why = arrivals.load(argv[++i]); !why.empty()) {
+                std::fprintf(stderr, "gamerun: %s\n", why.c_str());
+                return 1;
+            }
+            g_arrivals = &arrivals;
+        }
         else if (arg == "--net-replay" && i + 1 < argc) { // FILE.inputs: a network game recorded (tools/net_record.hpp)
             const std::string path = argv[++i];
             if (const std::string why = net_replay.load(path); !why.empty()) {
@@ -4420,6 +4477,7 @@ int main(int argc_given, char** argv_given) {
             for (std::size_t s = 0; s < trips.size(); ++s)
                 if (s != o.local_seat && trips[s] >= 0) one_way = std::max(one_way, trips[s] / 2);
             g_input_delay = tools::DelayTuner::base(one_way, o.net_rollback != 0);
+            net::events::add(net::events::Kind::delay, 0xFF, 0xFF, g_input_delay.load(), 0); // (the timeline, as the window's)
             std::printf("net: input delay %llu (auto; the furthest player %d ms away one way)\n", (unsigned long long)g_input_delay.load(),
                         one_way);
         }
@@ -4826,13 +4884,13 @@ int main(int argc_given, char** argv_given) {
     std::printf("\n\n");
 
     g_net_rb.reset();
-    if (((o.net_rollback && o.netplay) || o.rb_force_every || o.rb_sim_latency) && ring) { // (--net-rollback; --rollback-force, -sim)
+    if (((o.net_rollback && o.netplay) || o.rb_force_every || o.rb_sim_latency || g_arrivals) && ring) { // (--net-rollback; --rollback-force, -sim; --net-arrivals)
         const uint64_t depth = o.netplay ? std::max(o.net_rollback, o.net_rollback_depth)
                              : std::max<uint64_t>({o.rb_force_depth + 4, o.rb_sim_latency + 8, 16});
         const bool sim = o.rb_sim_latency != 0;
         g_net_rb = std::make_unique<tools::rollback::Linked>(o.boards, depth, ring.get(), inputs);
         if (o.rb_force_every) g_net_rb->force(o.rb_force_depth, o.rb_force_every, o.rb_force_from, o.max_frames ? o.max_frames : ~0ull), g_net_rb->keep_every(true);
-        if (sim && !std::getenv("ROLLBACK_SIM_LAZY")) g_net_rb->keep_every(true); // (ROLLBACK_SIM_LAZY=1: lazy snapshots, as every-board network play)
+        if ((sim || g_arrivals) && !std::getenv("ROLLBACK_SIM_LAZY")) g_net_rb->keep_every(true); // (ROLLBACK_SIM_LAZY=1: lazy snapshots, as every-board network play)
         // (one board a PC in network play: every frame kept by its set-up, tools::net_frame::set_up_one_board, the safety net)
         for (auto& m : machines)
             g_net_rb->attach(m->index, [mp = m.get()](m3::State& s) {
@@ -4922,6 +4980,7 @@ int main(int argc_given, char** argv_given) {
         report(*m, o);
     }
     if (ring) std::printf("\nLink: %llu packets delivered around the ring\n", static_cast<unsigned long long>(ring->delivered()));
+    if (g_arrivals && g_net_rb) std::printf("Rollback (--net-arrivals): %s\n", g_net_rb->report().c_str());
     if (o.camera_events && machines.size() > 1) { // each event writer: the same writes at the same game frames on boards 0 and 1?
         const auto& a = machines[0]->camera.event_writers;
         const auto& b = machines[1]->camera.event_writers;

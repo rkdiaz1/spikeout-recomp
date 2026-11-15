@@ -81,6 +81,7 @@ struct GameInfo {
     std::vector<Address> candidates; // (from the lobby) every address it may be reached at
     uint8_t watchers = 0; // spectators (up to kMaxWatchers)
     uint8_t stage = 0, area = 0; // the game's stage and area as the host's game has them (0 not playing; Session::set_stage)
+    uint8_t difficulty = 0; // the room's arcade difficulty + 1 (1 easiest - 5 hardest; 0 not known: an older build's)
 };
 
 // Listens for games on the networks this machine is on.
@@ -220,6 +221,9 @@ public:
     // the last sent it: tools::backup), so that the others can run it on from there if this machine is lost; and
     // asking seat `seat` for its whole next (ours of it is missing what its changes are from).
     void send_backup(uint8_t seat, uint64_t frame, std::vector<uint8_t> backup);
+    // Every backup queued to seat `seat` (a player's, or a spectator's kWatcherBase + n) acknowledged: false while the
+    // last is still on its way (its next is then held back and its changes sent together later: issue 30's pile).
+    bool backup_through(uint8_t seat) const;
     void want_backup(uint8_t seat);
     // One board a PC's check: our own board's part of its link packet `seq` (packed: tools::NodeCheck) to every
     // other player, reliably, so that a machine making our board's packets (side runs) can compare its own with them.
@@ -259,6 +263,9 @@ public:
     // The host: the game's stage, for the lists (the LAN's beacon, GameInfo::stage; the window's lobby update): 0 not
     // playing, 1-3 stages 1-3, 4 the final stage (the window reads it from the game: kStageNames there); `area` the game's area number (its table at 0xA1D24), 0 unknown.
     void set_stage(uint8_t stage, uint8_t area);
+    // The host: the room's arcade difficulty + 1 (the master cabinet's setting, which linked play uses; 0 not known),
+    // in the LAN's beacon (GameInfo::difficulty).
+    void set_difficulty(uint8_t difficulty);
 
     // This machine's player's inputs, set at the end of `frame` (in order;
     // frames skipped hold the last).
@@ -317,6 +324,7 @@ public:
         // spectator's view (the host's seats).
         enum class Link : uint8_t { none, lan, direct, relay };
         Link link = Link::none;
+        bool same_public = false; // (direct, to this machine's own public address: one home's two PCs, through its router)
         // A player joining the game in progress (state joining): receiving the state (as far as this machine, the
         // host, has it acknowledged), then catching up (as its machine says), in percent; none: neither yet.
         enum class Joining : uint8_t { none, receiving, catching_up };

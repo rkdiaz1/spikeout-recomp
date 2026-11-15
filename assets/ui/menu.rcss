@@ -56,8 +56,13 @@ div { display: block; }
 
 #rows {
 	max-height: 448dp;
-	overflow-y: hidden;
+	overflow-y: auto; /* (a page longer than this: a thin bar on the right says there's more, and where; the wheel scrolls) */
 }
+
+#rows scrollbarvertical { width: 6dp; margin-left: 6dp; }
+#rows scrollbarvertical slidertrack { background-color: #2a1a16; border-radius: 3dp; }
+#rows scrollbarvertical sliderbar { background-color: #ff8a2c; border-radius: 3dp; min-height: 24dp; }
+#rows scrollbarvertical sliderarrowdec, #rows scrollbarvertical sliderarrowinc { width: 0dp; height: 0dp; }
 
 .row {
 	display: flex;
@@ -104,6 +109,17 @@ div { display: block; }
 .row .bars.g .on { background-color: #5fd35f; }
 .row .bars.y .on { background-color: #ffd34a; }
 .row .bars.r .on { background-color: #e05555; }
+
+/* A save (the Saves page): taller, its picture (4:3) before two lines: where in the game, then when and how long played. */
+.row.tall { height: 60dp; line-height: 26dp; align-items: center; }
+.row .thumb { flex: 0 0 auto; width: 72dp; height: 54dp; margin-right: 14dp; border: 1dp #000000; }
+.row .thumb.none { background-color: #1a1c22; }
+.row.tall .label { display: block; }
+.row .line { display: block; }
+.row .detail { display: block; font-size: 17dp; line-height: 22dp; color: #b8a8a2; }
+.row.selected .detail { color: #3a1a10; }
+.row.dim { color: #7a6e6a; }
+.row.dim .value, .row.dim .detail { color: #6a605c; }
 
 .row .arrow { color: #c99a8a; }
 .row.selected .arrow { color: #1a0705; }

@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <sstream>
 #include <string>
@@ -51,10 +53,13 @@ void check_eq(const A& a, const B& b, const char* expr_a, const char* expr_b, co
 }
 
 inline int run_all() {
+    const char* only = std::getenv("SPIKEOUT_TEST"); // (only the cases whose name holds this)
     for (const Case& c : registry()) {
+        if (only && !std::strstr(c.name, only)) continue;
         const int before = failures();
         c.fn();
         std::printf("[%s] %s\n", failures() == before ? " ok " : "FAIL", c.name);
+        std::fflush(stdout); // (a long run's progress seen as it goes)
     }
     std::printf("%zu tests, %d failed checks\n", registry().size(), failures());
     return failures() == 0 ? 0 : 1;

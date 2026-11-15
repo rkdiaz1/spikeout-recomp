@@ -77,6 +77,16 @@ public:
     void io(T& v) {
         state_fields(*this, v);
     }
+    // A bool loaded as 0 or 1 whatever its byte (a damaged or made-up state's 128 in a bool is undefined behaviour,
+    // UBSan's finding in the fuzz test): saved as before, one byte.
+    void io(bool& v) {
+        uint8_t b = v ? 1 : 0;
+        bytes(&b, 1);
+        if (loading_) v = b != 0;
+    }
+    template <std::size_t N> void io(std::array<bool, N>& v) {
+        for (bool& e : v) io(e);
+    }
     template <class T> void io(std::vector<T>& v) { sequence(v); }
     template <class T> void io(std::deque<T>& v) { sequence(v); }
     template <class T, std::size_t N>

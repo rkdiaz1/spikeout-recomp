@@ -428,6 +428,7 @@ void SimNetBoard::state(m3::State& s) {
     link_->state(s);
     s.fixed(net_ram_), s.fixed(buffer_), s.io(commbank_), s.io(state_), s.io(running_), s.io(irq2ack_);
     s.io(status0_), s.io(status1_), s.io(machines_), s.io(counter_), s.io(segment_size_);
+    if (s.loading() && state_ > State::Error) throw std::runtime_error("save state: the network board's state out of range");
 }
 
 } // namespace m3

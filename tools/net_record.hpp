@@ -8,6 +8,11 @@
 // NAME.inputs: "SPKNETIN", version (u32, 1), the boards (u32), the first frame (u64: the state's), then for each frame
 // from there, each board's inputs as set at the end of that frame (tools::InputTable: read for the next frame), 4 bytes
 // a board (bank0, bank1, controls, controls2). Little-endian.
+// Version 2 (2026-11-15, release 6: a replay checks itself): after the inputs of each frame F that is a multiple of
+// kHashEvery, each board's main RAM hash (u64, tools::Recording::ram_hash) at the end of frame F - kHashEvery, as the
+// machines' own check took it once that frame was settled (net_frame::Hashes; 0: not known here, a one-board machine's
+// shadow); written a check late so every board's has come. gamerun --net-replay compares its own and names the first
+// frame a board parts from the recording. Version 1 files (no hashes) still read.
 #pragma once
 
 #include "recording.hpp"
@@ -17,6 +22,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,8 +33,35 @@ namespace tools::net_record {
 using Inputs = Recording::Inputs;
 inline constexpr char kMagic[8] = {'S', 'P', 'K', 'N', 'E', 'T', 'I', 'N'};
 inline constexpr std::size_t kKeep = 5; // (recordings kept: the newest)
+inline constexpr uint64_t kHashEvery = 120; // (net_frame::kHashEvery: the machines' check's frames)
 
 inline std::filesystem::path u8path(const std::string& s) { return std::filesystem::path(std::u8string(s.begin(), s.end())); }
+
+// The settled hashes, put by each board's thread (net_frame::Hashes::settled), taken by the writer.
+class HashTable {
+public:
+    void put(uint64_t frame, std::size_t board, uint64_t hash) {
+        std::lock_guard guard(lock_);
+        auto& row = rows_[frame];
+        if (row.size() <= board) row.resize(board + 1);
+        row[board] = hash;
+    }
+    std::vector<uint64_t> take(uint64_t frame) { // (and the older ones dropped)
+        std::lock_guard guard(lock_);
+        std::vector<uint64_t> row;
+        if (const auto it = rows_.find(frame); it != rows_.end()) row = it->second;
+        rows_.erase(rows_.begin(), rows_.upper_bound(frame));
+        return row;
+    }
+    void clear() {
+        std::lock_guard guard(lock_);
+        rows_.clear();
+    }
+
+private:
+    std::mutex lock_;
+    std::map<uint64_t, std::vector<uint64_t>> rows_;
+};
 
 // Written on one thread (the shown board's), frame after frame.
 class Writer {
@@ -37,17 +71,21 @@ public:
         if (!out_) return false;
         path_ = path, boards_ = boards, next_ = first;
         out_.write(kMagic, sizeof kMagic);
-        put32(1), put32(static_cast<uint32_t>(boards)), put64(first);
+        put32(2), put32(static_cast<uint32_t>(boards)), put64(first);
         return static_cast<bool>(out_);
     }
     bool open() const { return out_.is_open(); }
     uint64_t next() const { return next_; } // (the frame to write next)
     const std::string& path() const { return path_; }
-    void frame(const std::vector<Inputs>& in) {
+    void frame(const std::vector<Inputs>& in, HashTable* hashes = nullptr) {
         for (std::size_t b = 0; b < boards_; ++b) {
             const Inputs i = b < in.size() ? in[b] : Inputs{};
             const uint8_t bytes[4] = {i.bank0, i.bank1, i.controls, i.controls2};
             out_.write(reinterpret_cast<const char*>(bytes), 4);
+        }
+        if (next_ % kHashEvery == 0) { // (the check before this one's: every board's in by now)
+            const std::vector<uint64_t> row = hashes && next_ >= kHashEvery ? hashes->take(next_ - kHashEvery) : std::vector<uint64_t>{};
+            for (std::size_t b = 0; b < boards_; ++b) put64(b < row.size() ? row[b] : 0);
         }
         ++next_;
         if (next_ % 60 == 0) out_.flush(); // (a crash loses a second at most)
@@ -74,6 +112,7 @@ struct Reader {
     std::size_t boards = 0;
     uint64_t first = 0;
     std::vector<uint8_t> data; // (frame after frame, 4 bytes a board)
+    std::map<uint64_t, std::vector<uint64_t>> hashes; // (version 2: frame -> each board's RAM hash, 0 not known)
     // "" if loaded, else why not
     std::string load(const std::string& path) {
         std::ifstream in(u8path(path), std::ios::binary);
@@ -82,12 +121,30 @@ struct Reader {
         if (all.size() < 24 || std::memcmp(all.data(), kMagic, 8) != 0) return path + " isn't a network game's recording";
         auto u32 = [&](std::size_t at) { uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= uint32_t{all[at + i]} << (8 * i); return v; };
         auto u64 = [&](std::size_t at) { uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= uint64_t{all[at + i]} << (8 * i); return v; };
-        if (u32(8) != 1) return path + ": a recording of another version";
+        const uint32_t version = u32(8);
+        if (version != 1 && version != 2) return path + ": a recording of another version";
         boards = u32(12), first = u64(16);
         if (boards == 0 || boards > 4) return path + ": " + std::to_string(boards) + " boards?";
-        data.assign(all.begin() + 24, all.end());
-        data.resize(data.size() / (4 * boards) * (4 * boards)); // (a frame cut short at the end: left out)
+        data.clear(), hashes.clear();
+        for (std::size_t at = 24, f = first; at + 4 * boards <= all.size(); ++f) { // (a frame cut short at the end: left out)
+            data.insert(data.end(), all.begin() + static_cast<std::ptrdiff_t>(at), all.begin() + static_cast<std::ptrdiff_t>(at + 4 * boards));
+            at += 4 * boards;
+            if (version == 2 && f % kHashEvery == 0) {
+                if (at + 8 * boards > all.size()) break;
+                if (f >= kHashEvery) {
+                    std::vector<uint64_t> row(boards);
+                    for (std::size_t b = 0; b < boards; ++b) row[b] = u64(at + 8 * b);
+                    if (std::any_of(row.begin(), row.end(), [](uint64_t h) { return h != 0; })) hashes[f - kHashEvery] = row;
+                }
+                at += 8 * boards;
+            }
+        }
         return {};
+    }
+    // Board `board`'s RAM hash at the end of `frame`, as the game had it (0: not recorded)
+    uint64_t hash(std::size_t board, uint64_t frame) const {
+        const auto it = hashes.find(frame);
+        return it != hashes.end() && board < it->second.size() ? it->second[board] : 0;
     }
     uint64_t frames() const { return boards ? data.size() / (4 * boards) : 0; }
     uint64_t end() const { return first + frames(); } // (the first frame not recorded)
@@ -112,6 +169,8 @@ inline void prune(const std::string& folder, std::size_t keep = kKeep) {
         fs::remove(found[i], ec);
         fs::path state = found[i];
         state.replace_extension(".state");
+        fs::remove(state, ec);
+        state.replace_extension(".events"); // (its network timeline: net/event_log.hpp's record_to)
         fs::remove(state, ec);
     }
 }

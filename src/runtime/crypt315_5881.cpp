@@ -44,6 +44,7 @@
 #include "runtime/state.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace m3 {
@@ -672,6 +673,10 @@ void Crypt315_5881::state(State& s) {
     s.io(dec_hist_), s.io(dec_header_), s.io(enc_ready_), s.io(buffer_pos_), s.io(line_buffer_pos_);
     s.io(line_buffer_size_), s.io(buffer_bit_), s.io(buffer_bit2_), s.io(buffer2_), s.io(buffer2a_);
     s.io(block_size_), s.io(block_pos_), s.io(block_numlines_), s.io(done_compression_);
+    // (where the next word is read from: inside the buffers, a bit number a shift can take)
+    if (s.loading() && (buffer_pos_ < 0 || buffer_pos_ > kBufferSize || line_buffer_size_ < 0 || line_buffer_size_ > kLineSize ||
+                        line_buffer_pos_ < 0 || buffer_bit_ < 0 || buffer_bit_ > 7 || buffer_bit2_ < 0 || buffer_bit2_ > 15))
+        throw std::runtime_error("save state: the decryption chip's place out of range");
 }
 
 } // namespace m3

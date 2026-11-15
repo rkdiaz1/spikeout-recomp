@@ -152,7 +152,7 @@ public:
             }
         }
         if (packed[0] == 2) return; // (a sync frame's: its hash alone)
-        const auto unpacked = net::decompress(std::span<const uint8_t>(packed.data() + 21, packed.size() - 21));
+        const auto unpacked = net::decompress(std::span<const uint8_t>(packed.data() + 21, packed.size() - 21), net::kMaxPacket);
         if (!unpacked || unpacked->size() != kNodeBytes) return;
         const std::vector<uint8_t>& raw = *unpacked;
         std::unique_lock guard(lock_);
