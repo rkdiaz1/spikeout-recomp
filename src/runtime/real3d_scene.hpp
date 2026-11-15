@@ -209,6 +209,8 @@ private:
     void walk_viewports(uint32_t addr);
     void walk_pointer(uint32_t ptr, int depth);
     void walk_node(uint32_t addr, int depth);
+    const uint32_t* enter_node(uint32_t addr, int depth);
+    void draw_node(uint32_t addr, const uint32_t* node, int depth);
     void add_model(uint32_t addr);
     void multiply_matrix(uint32_t index);
     void multiply_inverse_matrix(uint32_t index);
@@ -232,6 +234,7 @@ private:
     // right u, v; bottom u, w.
     std::array<float, 8> planes_{};
     uint32_t visits_ = 0; // guards against loops in a broken scene
+    std::vector<uint32_t> sibling_chain_; // walk_node's chains of siblings, nested ones on top
 };
 
 } // namespace m3

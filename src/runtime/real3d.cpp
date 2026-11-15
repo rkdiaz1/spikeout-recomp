@@ -2,6 +2,7 @@
 #include "runtime/state.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace m3 {
 
@@ -29,10 +30,10 @@ uint32_t Real3d::culling(uint32_t addr) const {
     return p ? *p : 0;
 }
 
-const uint32_t* Real3d::culling_ptr(uint32_t addr) const {
+const uint32_t* Real3d::culling_ptr(uint32_t addr, uint32_t words) const {
     addr &= 0xFFFFFF;
-    if (addr >= 0x800000 && addr < 0x800000 + kCullingHighWords) return &culling_hi_[addr - 0x800000];
-    if (addr < kCullingLowWords) return &culling_lo_[addr];
+    if (addr >= 0x800000 && addr - 0x800000 + uint64_t{words} <= kCullingHighWords) return &culling_hi_[addr - 0x800000];
+    if (addr + uint64_t{words} <= kCullingLowWords) return &culling_lo_[addr];
     return nullptr;
 }
 
@@ -126,12 +127,14 @@ void Real3d::apply(bool polygon, WatchedVector<uint32_t>& target) {
     if (!buf.used) return;
     uint32_t begin, end;
     buffer_range(polygon, begin, end);
-    for (uint32_t i = begin; i + 2 <= buf.cursor;) {
+    // (i is 64-bit: a block whose last word is before its first, written by the game into low culling RAM, ends
+    // the walk instead of wrapping i back, which could go round for ever)
+    for (uint64_t i = begin; i + 2 <= buf.cursor;) {
         const uint32_t first = culling_lo_[i], last = culling_lo_[i + 1];
         const uint32_t count = last - first + 1;
         for (uint32_t k = 0; k < count && i + 2 + k < buf.cursor; ++k)
             if (first + k < target.size()) target[first + k] = culling_lo_[i + 2 + k];
-        i += 2 + count;
+        i += 2 + uint64_t{count};
     }
     buf = {};
 }
@@ -247,7 +250,18 @@ void Real3d::state(State& s) {
     for (UpdateBuffer* b : {&high_buffer_, &polygon_buffer_}) s.io(b->cursor), s.io(b->block), s.io(b->used);
     s.io(flipped_), s.io(command_written_), s.io(tilegen_drew_), s.io(block_culling_);
     s.io(config_), s.io(fifo_), s.io(textures_uploaded_);
-    if (s.loading()) std::fill(rows_written_.begin(), rows_written_.end(), uint8_t{1}); // a renderer's copy is stale
+    if (!s.loading()) return;
+    check_loaded_buffers();
+    std::fill(rows_written_.begin(), rows_written_.end(), uint8_t{1}); // a renderer's copy is stale
+}
+
+// A buffer in use ends inside low culling RAM, its current block (first word, last word, data) before its end.
+void Real3d::check_loaded_buffers() const {
+    for (const UpdateBuffer* b : {&high_buffer_, &polygon_buffer_}) {
+        if (!b->used) continue;
+        if (b->cursor > culling_lo_.size() || (b->block != UINT32_MAX && (b->cursor < 3 || b->block > b->cursor - 3)))
+            throw std::runtime_error("save state: a 3D update buffer outside low culling RAM");
+    }
 }
 
 // The 3D frame dump (docs/frame-dump.md), every number little-endian:

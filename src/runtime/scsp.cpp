@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace m3 {
@@ -799,7 +800,9 @@ void Scsp::state(State& s) {
         for (std::size_t k = 0; k < std::size(rows) && !s.loading(); ++k)
             if (p == rows[k]) i = static_cast<int32_t>(k);
         s.io(i);
-        if (s.loading()) p = i >= 0 && static_cast<std::size_t>(i) < std::size(rows) ? rows[i] : nullptr;
+        if (!s.loading()) return;
+        if (i < -1 || i >= static_cast<int32_t>(std::size(rows))) throw std::runtime_error("save state: an SCSP LFO table out of range");
+        p = i >= 0 ? rows[i] : nullptr;
     };
     const Tables& t = tables();
     s.io(regs_);
@@ -818,6 +821,29 @@ void Scsp::state(State& s) {
     if (s.loading()) d.steps_made = false;
     s.io(ring_), s.io(bufptr_), s.io(noise_), s.io(timer_), s.io(mcieb_), s.io(mcipd_);
     s.io(midi_), s.io(midi_w_), s.io(midi_r_);
+    if (s.loading()) check_loaded();
+}
+
+// What indexes a table: a slot's envelope (its volume and rates as the chip leaves them), a playing slot's LFOs
+// switched on, the DSP's last step and the ring buffer's position.
+void Scsp::check_loaded() const {
+    const Tables& t = tables();
+    auto is_rate = [](const std::array<int, 64>& rates, int v) {
+        return v == 0 || std::find(rates.begin(), rates.end(), v) != rates.end();
+    };
+    for (const Slot& slot : slots_) {
+        const Eg& eg = slot.eg;
+        if (eg.volume < 0 || eg.volume > (0x3FF << kEgShift) || !is_rate(t.ar, eg.ar) || !is_rate(t.dr, eg.d1r) ||
+            !is_rate(t.dr, eg.d2r) || !is_rate(t.dr, eg.rr))
+            throw std::runtime_error("save state: an SCSP envelope out of range");
+        const Fields f{slot.data};
+        if (slot.active && ((f.plfos() && (!slot.plfo.table || !slot.plfo.scale)) ||
+                            (f.alfos() && (!slot.alfo.table || !slot.alfo.scale))))
+            throw std::runtime_error("save state: an SCSP LFO switched on without its tables");
+    }
+    if (dsp_.last_step < 0 || dsp_.last_step > static_cast<int>(dsp_.steps.size()))
+        throw std::runtime_error("save state: the SCSP DSP's last step out of range");
+    if (bufptr_ >= ring_.size()) throw std::runtime_error("save state: the SCSP ring buffer's position out of range");
 }
 
 } // namespace m3

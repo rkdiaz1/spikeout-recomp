@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <stdexcept>
 
 namespace m3 {
 
@@ -306,6 +307,23 @@ void Dsb2::state(State& s) {
     s.io(pcm_), s.io(pcm_count_), s.io(pcm_pos_), s.io(pcm_channels_), s.io(stream_layer_), s.io(stream_hz_);
     s.io(prev_), s.io(next_), s.io(frac_), s.io(samples_);
     s.io(tracks_started), s.io(commands), s.io(irqs_taken);
+    if (s.loading()) check_loaded();
+}
+
+// What the decoder and next_sample() index with: the stream's place in the MPEG ROM, the decoded frame's samples
+// in pcm_ (as minimp3 leaves them: up to MINIMP3_MAX_SAMPLES_PER_FRAME, 1 or 2 channels), the decoder's bit
+// reservoir and free-format frame size.
+void Dsb2::check_loaded() const {
+    constexpr int kMaxFreeFormatBytes = 2304; // minimp3.h's MAX_FREE_FORMAT_FRAME_SIZE (internal to it)
+    const mp3dec_t& dec = decoder_->dec;
+    if (play_start_ > play_end_ || play_end_ > mpeg_.size() || pos_ > mpeg_.size())
+        throw std::runtime_error("save state: the music's place outside the MPEG ROM");
+    if (pcm_.size() != MINIMP3_MAX_SAMPLES_PER_FRAME || pcm_channels_ < 1 || pcm_channels_ > 2 || pcm_count_ < 0 ||
+        pcm_pos_ < 0 || pcm_pos_ > pcm_count_ || pcm_count_ * pcm_channels_ > static_cast<int>(pcm_.size()))
+        throw std::runtime_error("save state: the music's decoded samples out of range");
+    if (dec.reserv < 0 || dec.reserv > static_cast<int>(sizeof dec.reserv_buf) || dec.free_format_bytes < 0 ||
+        dec.free_format_bytes > kMaxFreeFormatBytes)
+        throw std::runtime_error("save state: the music decoder's frame state out of range");
 }
 
 } // namespace m3

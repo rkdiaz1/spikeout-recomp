@@ -17,7 +17,17 @@ constexpr uint32_t kMaxVisits = 200000;
 constexpr uint32_t kMaxPolygonsPerModel = 65536;
 constexpr int kScreenHeight = 384, kScreenWidth = 496;
 
+// The words a culling node and a viewport are read from.
+constexpr uint32_t kNodeWords = 10, kViewportWords = 0x26;
+
 float as_float(uint32_t w) { return std::bit_cast<float>(w); }
+
+// A node's sibling to walk, or 0 for none (a colour-table node has none).
+uint32_t next_sibling(const uint32_t* node) {
+    const uint32_t flags = node[0], sibling = node[8] & 0x1FFFFFF;
+    const bool colour_table_node = (flags & 7) == 6, point_ref = flags & 0x10000000;
+    return (!colour_table_node || point_ref) && !(sibling & 0x1000000) ? sibling : 0;
+}
 
 // The Real3D's 16-bit float (radii): a 6-bit exponent (above 31 it is
 // negative: value - 64) over a 10-bit mantissa, no sign (the format
@@ -169,7 +179,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
 
 void Real3dSceneBuilder::walk_viewports(uint32_t addr) {
     for (int n = 0; n < 256 && (addr & 0xFFFFFF) != 0; ++n) {
-        const uint32_t* node = mem_->culling_ptr(addr);
+        const uint32_t* node = mem_->culling_ptr(addr, kViewportWords);
         if (!node) return;
         Real3dScene::Viewport vp;
         vp.priority = static_cast<int>((node[0] >> 3) & 3);
@@ -330,23 +340,40 @@ void Real3dSceneBuilder::walk_pointer(uint32_t ptr, int depth) {
     }
 }
 
+// Siblings first, as Supermodel does: a chain's last node is drawn first. The chain is listed, not walked by
+// recursion, so a long or looping one can't use up the stack (a sibling: no deeper).
 void Real3dSceneBuilder::walk_node(uint32_t addr, int depth) {
-    if (depth > kMaxDepth || ++visits_ > kMaxVisits) return;
-    const uint32_t* node = mem_->culling_ptr(addr);
-    if (!node || addr + 10 > 0x800000 + 0x40000) return;
+    const size_t chain_start = sibling_chain_.size();
+    for (const uint32_t* node = enter_node(addr, depth); node;) {
+        sibling_chain_.push_back(addr);
+        addr = next_sibling(node);
+        node = addr ? enter_node(addr, depth) : nullptr;
+    }
+    while (sibling_chain_.size() > chain_start) {
+        const uint32_t at = sibling_chain_.back();
+        sibling_chain_.pop_back();
+        draw_node(at, mem_->culling_ptr(at, kNodeWords), depth);
+    }
+}
+
+// The node at `addr` if it is drawn from here (counted), else nullptr.
+const uint32_t* Real3dSceneBuilder::enter_node(uint32_t addr, int depth) {
+    if (depth > kMaxDepth || ++visits_ > kMaxVisits) return nullptr;
+    const uint32_t* node = mem_->culling_ptr(addr, kNodeWords);
+    if (!node) return nullptr;
     const uint32_t flags = node[0];
-    if ((flags & 3) == 0) return;              // a viewport, not drawn from here
-    if ((flags & 0x300) == 0x300) { // hidden
+    if ((flags & 3) == 0) return nullptr; // a viewport, not drawn from here
+    if ((flags & 0x300) == 0x300) {       // hidden
         ++scene_->stats.hidden_nodes;
-        return;
+        return nullptr;
     }
     ++scene_->stats.nodes;
-    const uint32_t child = node[7] & 0x7FFFFFF;
-    const uint32_t sibling = node[8] & 0x1FFFFFF;
+    return node;
+}
 
-    // Siblings first, as Supermodel does (a colour-table node has none).
-    const bool colour_table_node = (flags & 7) == 6, point_ref = flags & 0x10000000;
-    if ((!colour_table_node || point_ref) && sibling && !(sibling & 0x1000000)) walk_node(sibling, depth); // (a sibling: no deeper)
+void Real3dSceneBuilder::draw_node(uint32_t addr, const uint32_t* node, int depth) {
+    const uint32_t flags = node[0];
+    const uint32_t child = node[7] & 0x7FFFFFF;
 
     if (flags & 4) // the colour table address, in pieces
         colour_table_ = ((node[3] >> 19) | ((node[7] >> 28) << 13) | ((node[8] >> 25) << 17)) & 0xFFFFF;

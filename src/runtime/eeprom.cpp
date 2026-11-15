@@ -1,6 +1,8 @@
 #include "runtime/eeprom.hpp"
 #include "runtime/state.hpp"
 
+#include <stdexcept>
+
 namespace m3 {
 
 void Eeprom93C46::write_pins(bool cs, bool clk, bool di, uint64_t now) {
@@ -88,6 +90,9 @@ void Eeprom93C46::state(State& s) {
     s.io(words_);
     s.io(cs_), s.io(clk_), s.io(do_), s.io(writable_), s.io(done_), s.io(sending_);
     s.io(in_), s.io(in_bits_), s.io(out_), s.io(out_bits_), s.io(addr_), s.io(busy_until_);
+    // (a command is 25 bits at most, in_ shifted by the count of them; a word goes out in 16)
+    if (s.loading() && (in_bits_ < 0 || in_bits_ > 25 || out_bits_ < 0 || out_bits_ > 15))
+        throw std::runtime_error("save state: an EEPROM bit count out of range");
 }
 
 } // namespace m3

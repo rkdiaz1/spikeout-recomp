@@ -85,6 +85,7 @@ private:
     void play(uint32_t start, uint32_t end, bool loop);
     bool decode();
     void next_sample(int32_t out[2]);
+    void check_loaded() const; // after loading a state: throws if it would read outside a buffer
 
     std::span<const uint8_t> program_, mpeg_;
     WatchedVector<uint8_t> ram_;

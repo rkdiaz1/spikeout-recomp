@@ -70,7 +70,8 @@ public:
     // Words as the Real3D sees them, by word address (0 outside memory).
     uint32_t culling(uint32_t addr) const;
     uint32_t model(uint32_t addr) const; // polygon RAM or VROM
-    const uint32_t* culling_ptr(uint32_t addr) const; // nullptr outside memory
+    // `words` words from `addr`; nullptr unless all of them are in one memory.
+    const uint32_t* culling_ptr(uint32_t addr, uint32_t words = 1) const;
     uint16_t texel(uint32_t x, uint32_t y) const { return texture_[(y & 2047) * kTextureWidth + (x & 2047)]; }
     // All of texture RAM, 2048 x 2048 texels, row by row (for the GPU).
     std::span<const uint16_t> texture_ram() const { return texture_; }
@@ -116,6 +117,7 @@ private:
     void buffer_range(bool polygon, uint32_t& begin, uint32_t& end) const;
     void buffered_write(bool polygon, WatchedVector<uint32_t>& target, uint32_t word, uint32_t value);
     void apply(bool polygon, WatchedVector<uint32_t>& target);
+    void check_loaded_buffers() const;
     void flush_textures();
     void draw_frame(uint32_t mercury_mode);
 

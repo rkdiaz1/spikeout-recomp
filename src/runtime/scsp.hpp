@@ -116,6 +116,7 @@ private:
     uint16_t ram_word(uint32_t word) const;
     void set_ram_word(uint32_t word, uint16_t v);
     void timer_reload(int t);
+    void check_loaded() const; // after loading a state: throws if it would index outside a table
 
     std::span<uint8_t> ram_;
     bool master_;

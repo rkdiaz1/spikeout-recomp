@@ -640,6 +640,7 @@ if(SPIKEOUT_BUILD_TESTS)
         tests/test_devices.cpp
         tests/test_net.cpp
         tests/test_snapshots.cpp
+        tests/test_state_load.cpp
         tests/test_delay.cpp)
     target_link_libraries(spikeout_tests PRIVATE analysis m3runtime m3net spikeout_warnings)
     if(SPIKEOUT_GPU)
