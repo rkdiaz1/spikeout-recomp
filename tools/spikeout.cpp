@@ -2077,21 +2077,22 @@ private:
         SDL_RenderClear(r_);
     }
     // A progress bar as the menu's (the owner's choice, 2026-11-17: glossy): a black outline, a sunken dark track, the
-    // fill a light yellow top half and a darker bottom half, the ends round. Drawn a pixel row at a time (SDL's 2D
-    // renderer has no gradients), each row as long as the round ends allow at its height.
+    // fill a light yellow top half and a darker bottom half, the ends round but the fill's far end flat until it's full
+    // (the owner's choice, as every bar's). Drawn a pixel row at a time (SDL's 2D renderer has no gradients), each row
+    // as long as the round ends allow at its height.
     void glossy_bar(const SDL_FRect& f, float share) {
         struct Rgb {
             float r, g, b;
         };
         auto lerp = [](Rgb a, Rgb b, float t) { return Rgb{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t}; };
         auto hex = [](uint32_t c) { return Rgb{float(c >> 16 & 0xFF), float(c >> 8 & 0xFF), float(c & 0xFF)}; };
-        // one rounded shape (x, y, w, h), its colour by the height within it (0 top, 1 bottom)
-        auto shape = [&](float x, float y, float sw, float sh, auto colour) {
+        // one rounded shape (x, y, w, h), its colour by the height within it (0 top, 1 bottom); `flat`: its right end square
+        auto shape = [&](float x, float y, float sw, float sh, auto colour, bool flat = false) {
             const float r = sh / 2;
             for (int row = 0; row < static_cast<int>(sh); ++row) {
                 const float dy = std::abs(static_cast<float>(row) + 0.5f - r);
                 const float in = r - std::sqrt(std::max(0.0f, r * r - dy * dy)); // (the round ends' inset at this row)
-                const float len = sw - 2 * in;
+                const float len = sw - (flat ? 1 : 2) * in;
                 if (len <= 0) continue;
                 const Rgb c = colour((static_cast<float>(row) + 0.5f) / sh);
                 SDL_SetRenderDrawColor(r_, static_cast<Uint8>(c.r), static_cast<Uint8>(c.g), static_cast<Uint8>(c.b), 255);
@@ -2103,10 +2104,13 @@ private:
         const float b = std::max(1.0f, std::round(f.h / 12));
         shape(f.x + b, f.y + b, f.w - 2 * b, f.h - 2 * b, [&](float t) { return lerp(hex(0x08090c), hex(0x262a33), t); });
         const float fill = (f.w - 2 * b) * std::clamp(share, 0.0f, 1.0f);
-        if (fill >= f.h - 2 * b) // (narrower than its round ends: not drawn yet)
-            shape(f.x + b, f.y + b, fill, f.h - 2 * b, [&](float t) {
-                return t < 0.5f ? lerp(hex(0xfff6c8), hex(0xffe06a), t * 2) : lerp(hex(0xe8a800), hex(0xffcf3a), t * 2 - 1);
-            });
+        if (fill >= (f.h - 2 * b) / 2) // (narrower than its round start: not drawn yet)
+            shape(
+                f.x + b, f.y + b, fill, f.h - 2 * b,
+                [&](float t) {
+                    return t < 0.5f ? lerp(hex(0xfff6c8), hex(0xffe06a), t * 2) : lerp(hex(0xe8a800), hex(0xffcf3a), t * 2 - 1);
+                },
+                share < 1.0f);
     }
     // A centred line at a height (a share of the window's), `scale` times the 8x8 font; its box in render pixels.
     SDL_FRect line(const std::string& text, float y, float scale, SDL_Color c) {
@@ -3907,18 +3911,33 @@ int main(int argc, char** argv) {
     };
     auto sound_page = [&] {
         ui::MenuPage p{"Sound", "", {}};
+        // (each a slider, as players didn't know the effects and the music go past 100%: Left / Right 10% a step, the
+        // mouse to the nearest 5%; the effects' and the music's fill orange past 100%, the arcade's level)
         auto volume = [&](const char* label, const char* help, int& v, int most) {
-            return ui::MenuItem{label, help, [&v] { return std::to_string(v) + "%"; },
-                                [&, most](int d) {
-                                    v = std::clamp(v + 10 * d, 0, most);
-                                    if (sound) sound->set_volumes(effects_volume(settings), music_volume(settings));
-                                    changed();
-                                }};
+            auto apply = [&] {
+                if (sound) sound->set_volumes(effects_volume(settings), music_volume(settings));
+                changed();
+            };
+            ui::MenuItem it{label, help, [&v] { return std::to_string(v) + "%"; }, [&v, most, apply](int d) {
+                                v = std::clamp(v + 10 * d, 0, most);
+                                apply();
+                            }};
+            it.slider_max = most;
+            it.slider_mark = most > 100 ? 100 : -1;
+            it.level = [&v] { return v; };
+            it.set = [&v, most, apply](int level) {
+                v = std::clamp((level + 2) / 5 * 5, 0, most);
+                apply();
+            };
+            return it;
         };
         p.items.push_back(volume("Volume", "Everything: the effects and the music together.", settings.volume, 100));
-        p.items.push_back(
-            volume("Sound effects", "Hits, voices and effects: the sound board's two SCSPs.", settings.sound_volume, 200));
-        p.items.push_back(volume("Music", "The music board's tunes.", settings.music_volume, 200));
+        p.items.push_back(volume("Sound effects",
+                                 "Hits, voices and effects: the sound board's two SCSPs. 100% is the arcade's level (as "
+                                 "Supermodel's); up to 200% for louder voices and hits.",
+                                 settings.sound_volume, 200));
+        p.items.push_back(volume("Music", "The music board's tunes. 100% is the arcade's level; up to 200%.",
+                                 settings.music_volume, 200));
         // The outputs SDL has, by name ("" the default), and how many channels one has.
         auto outputs = [] {
             std::vector<std::string> names{""};

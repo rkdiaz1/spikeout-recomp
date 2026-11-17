@@ -47,6 +47,12 @@ struct MenuItem {
     // A bar on the right, before the value: how far something has come, 0-100 (-1: none). The in-game update's
     // download; the page is made again as it moves.
     int progress = -1;
+    // A slider on the right, before the value (the volumes): `level()` from 0 to slider_max (0: no slider), its fill
+    // orange past slider_mark (100%: the arcade's level; -1 none). Left / Right still `change`; a click or a drag on it
+    // `set`s the level under the pointer.
+    int slider_max = 0, slider_mark = -1;
+    std::function<int()> level;
+    std::function<void(int)> set;
 };
 
 // A seat of a network game, in the list under the frame rate.

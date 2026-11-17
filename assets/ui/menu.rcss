@@ -122,15 +122,31 @@ div { display: block; }
 .row.dim .value, .row.dim .detail { color: #6a605c; }
 
 /* A bar before the value (the in-game update's download), glossy as the game's other progress bars (the owner's
-   choice, 2026-11-17): a sunken track, the fill a light yellow top half and a darker bottom half. Its value in a box of
-   a fixed width, right-aligned, so that the bar stays still as the numbers change. */
+   choice, 2026-11-17): a sunken track, the fill a light yellow top half and a darker bottom half; the fill's far end
+   flat (the owner's choice: every bar's), rounded only once it fills the track (.full). Its value in a box of a fixed
+   width, right-aligned, so that the bar stays still as the numbers change. */
 .row .pbar { display: block; flex: 0 6 auto; width: 240dp; min-width: 60dp; height: 12dp; margin: 9dp 14dp 0 0;
 	decorator: vertical-gradient(#08090c #262a33); border: 1dp #000000; border-radius: 6dp; }
 .row.selected .pbar { decorator: vertical-gradient(#3a0a05 #6a1a10); }
 .row .pfill { display: block; height: 100%; }
-.row .pfill .gt { display: block; height: 50%; border-radius: 5dp 5dp 0dp 0dp; decorator: vertical-gradient(#fff6c8 #ffe06a); }
-.row .pfill .gb { display: block; height: 50%; border-radius: 0dp 0dp 5dp 5dp; decorator: vertical-gradient(#e8a800 #ffcf3a); }
+.row .pfill .gt { display: block; height: 50%; border-radius: 5dp 0dp 0dp 0dp; decorator: vertical-gradient(#fff6c8 #ffe06a); }
+.row .pfill .gb { display: block; height: 50%; border-radius: 0dp 0dp 0dp 5dp; decorator: vertical-gradient(#e8a800 #ffcf3a); }
+.row .pfill.full .gt { border-radius: 5dp 5dp 0dp 0dp; }
+.row .pfill.full .gb { border-radius: 0dp 0dp 5dp 5dp; }
 .row .value.pvalue { flex: 0 0 auto; width: 190dp; }
+/* A slider (the volumes): the same bar, taller to be pressed and dragged. Past 100% (the arcade's level) the fill
+   turns orange (the owner's choice of the mockups, D: no mark), so that it's clear the level goes past it. */
+.row .pbar.slider { position: relative; flex: 0 0 auto; width: 220dp; height: 16dp; margin-top: 7dp; border-radius: 8dp; }
+.row .value.svalue { flex: 0 0 auto; width: 100dp; } /* (all the sliders the same length, lined up) */
+.row .slider .pfill { position: absolute; left: 0; top: 0; }
+.row .slider .pfill .gt { border-radius: 7dp 0dp 0dp 0dp; }
+.row .slider .pfill .gb { border-radius: 0dp 0dp 0dp 7dp; }
+.row .slider .pfill.full .gt { border-radius: 7dp 7dp 0dp 0dp; }
+.row .slider .pfill.full .gb { border-radius: 0dp 0dp 7dp 7dp; }
+.row .slider .pfill.over .gt { border-radius: 0dp; decorator: vertical-gradient(#ffd2a8 #ff9a3c); }
+.row .slider .pfill.over .gb { border-radius: 0dp; decorator: vertical-gradient(#d84a10 #ff7a2c); }
+.row .slider .pfill.over.full .gt { border-radius: 0dp 7dp 0dp 0dp; }
+.row .slider .pfill.over.full .gb { border-radius: 0dp 0dp 7dp 0dp; }
 
 .row .arrow { color: #c99a8a; }
 .row.selected .arrow { color: #1a0705; }
