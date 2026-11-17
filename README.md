@@ -97,6 +97,19 @@ like Hong Kong, may well be close enough). Supermodel's network play works this 
 its simpler model of the network board copes with more distance than the board's own program, so this mode might
 use it, once it has been tested against the games in your reports.
 
+### Understanding the whole game
+
+Work is underway on understanding every part of the game's own program: a full map of its code, with the names SEGA
+gave things where the program still carries them, and the parts SEGA wrote in C rebuilt exactly. It already helped
+here: the Communication error turned out to be the game's check that a character stands in the same place on every
+cabinet ("Rob gpos error", in SEGA's words). This work stays private, as it's made from SEGA's program; what it's for
+is what it lets us build. Knowing how the game works opens things up, such as:
+
+- **Your own look for your character:** a different outfit, colours, hairstyle or props, chosen from a menu and
+  seen by the other players in network play (drawn by our renderer, off by default; nothing of SEGA's shipped)
+- fixes that go to the cause, like the one above, instead of working around what we see
+- later, perhaps: new ways to play built on the game's own rules
+
 ## About
 
 Spikeout was SEGA's four-player beat 'em up for linked arcade cabinets: each player stood at their own cabinet, and
@@ -425,6 +438,8 @@ Every report helps: most of the network fixes so far came from a game that went 
 - Smarter guessing of the other players' buttons, learnt from real games' presses (fewer corrections, fewer stutters)
 - macOS: signed and notarized apps
 - Smooth motion: pictures made between the game's frames, for high-refresh screens
+- Your own look for your character: outfits, colours, hairstyles and props, seen by the others online (see
+  [Understanding the whole game](#understanding-the-whole-game))
 - HD texture packs: the game's textures replaced by sharper ones you make or share (off by default; packs are never
   part of the downloads)
 - An arcade link mode (an idea, see [above](#an-idea-arcade-link-mode)): each PC runs only its own cabinet, the
