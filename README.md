@@ -51,6 +51,52 @@ four-player co-op over the internet, one player a PC, as four linked cabinets pl
   freezing the game (with thanks to cerroverb, pull request 26).
 - **Next:** finding and fixing the "Communication error" (see [Roadmap](#roadmap)).
 
+### Coming in the next release
+
+- **The "Communication error", found.** Your reports made it possible: the game in one of them was played again here,
+  frame for frame, until the error appeared. The cause was in how our copy of the cable between cabinets timed when
+  each cabinet sees the others' data: at an area change, two cabinets could take the change one step apart, and the
+  game's own check then found a character in two different places. With the fix, all 40 games from preview6's
+  reports play through without the error (two of them showed it before). We hope this fixes most of the
+  Communication errors you've seen; please keep **Send reports** on, so we hear about any that are left.
+- **A crash in long linked games, found.** After a long session of network play, the game could close by itself.
+  The fix is being tested.
+- These change how cabinets talk to each other, so everyone in a room will need the new version.
+
+### An idea: arcade link mode
+
+Not decided yet, just an idea we'd like to hear about.
+
+**Why network play can't be the arcade exactly.** Linked cabinets stood side by side, joined by cables: every frame,
+each cabinet's data reached the others in a fraction of a millisecond, and the game was built around that. Over a
+network, data takes time to travel: a few milliseconds across a city, tens across a country, more between
+continents. No code can make it travel faster. So every online game has to choose what to do while it waits for the
+other players: wait (and run slower, or add a delay to every press), or guess what the others did and correct
+itself when the real presses arrive (rollback: an occasional small jump on screen). Today's network play does the
+second, and adds more on top so it works for everyone, anywhere: every PC can run every cabinet, players can join a
+game in progress, spectators can watch. It plays well, but it can never be exactly the cabinets: that is the nature
+of a network, not something better code could remove.
+
+For die-hard friends who want the real thing, and live close enough to have it, an **arcade link mode** would leave
+all of that out and link the cabinets the way the arcade did:
+
+- each PC runs only its own cabinet, and the cabinets' own link messages go between the PCs, nothing guessed
+- its own rooms, in a separate part of the lobby, for friends who all want to play this way
+- everyone presses Ready, and the game starts on every PC at the same moment; no joining once it has started
+- no rollback and no smoothing: if the connection can't keep up, the game slows down, as linked cabinets would
+- direct connections only, found through our lobby as today (no addresses to type in); never through a relay, which
+  alone would add more time than the link allows. If two neighbouring players can't connect directly, the room says
+  so and doesn't start
+- before anyone presses Ready, the room shows how fast and how steady each link is, so you know beforehand whether
+  the game will run at the arcade's speed
+
+The catch is distance. The cabinets expected a cable: we measured that the game copes with only about 4 ms from one
+cabinet to the next. A wired home network manages that; Wi-Fi is borderline, and the internet usually isn't close
+enough, so the game would run slower than the arcade's speed there (some players close to each other, in a city
+like Hong Kong, may well be close enough). Supermodel's network play works this way too, with addresses typed in;
+its simpler model of the network board copes with more distance than the board's own program, so this mode might
+use it, once it has been tested against the games in your reports.
+
 ## About
 
 Spikeout was SEGA's four-player beat 'em up for linked arcade cabinets: each player stood at their own cabinet, and
@@ -381,7 +427,9 @@ Every report helps: most of the network fixes so far came from a game that went 
 - Smooth motion: pictures made between the game's frames, for high-refresh screens
 - HD texture packs: the game's textures replaced by sharper ones you make or share (off by default; packs are never
   part of the downloads)
-- A direct cable mode: each PC runs only its own cabinet, the link over your network, for handhelds on one hotspot
+- An arcade link mode (an idea, see [above](#an-idea-arcade-link-mode)): each PC runs only its own cabinet, the
+  cabinets' link over your network as the cable was, for players who want the arcade's link exactly (and for
+  handhelds on one hotspot)
 - Maybe direct connections by address
 - The menu in Chinese and Japanese
 - Later: Android, iOS, Xbox, Switch (one player)
