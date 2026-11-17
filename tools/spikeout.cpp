@@ -101,6 +101,7 @@
 #include "net_frame.hpp"
 #include "netplay.hpp"
 #include "net/compress.hpp"
+#include "net/install.hpp"
 #include "net/update.hpp"
 #include "one_board.hpp"
 #include "rollback.hpp"
@@ -1921,13 +1922,9 @@ public:
         line("PREPARING THE GAME", 0.30f, small * 2, kTitle);
         line("Translating the game from your ROM set.", 0.42f, small, kText);
         line("This happens on the first start only.", 0.47f, small, kText);
-        const float bw = static_cast<float>(w) * 0.6f, bh = 12 * small;
-        const SDL_FRect frame{(static_cast<float>(w) - bw) / 2, static_cast<float>(h) * 0.56f, bw, bh};
-        SDL_FRect bar{frame.x + 2, frame.y + 2, (frame.w - 4) * std::clamp(share, 0.0f, 1.0f), frame.h - 4};
-        SDL_SetRenderDrawColor(r_, kTitle.r, kTitle.g, kTitle.b, 255);
-        SDL_RenderFillRect(r_, &bar);
-        SDL_SetRenderDrawColor(r_, kText.r, kText.g, kText.b, 255);
-        SDL_RenderRect(r_, &frame);
+        const float bw = std::round(static_cast<float>(w) * 0.6f), bh = 14 * small;
+        const SDL_FRect frame{std::round((static_cast<float>(w) - bw) / 2), std::round(static_cast<float>(h) * 0.56f), bw, bh};
+        glossy_bar(frame, share);
         line(doing, 0.56f + bh / static_cast<float>(h) + 0.03f, small, kText);
         SDL_RenderPresent(r_);
     }
@@ -1946,6 +1943,38 @@ private:
     void clear() {
         SDL_SetRenderDrawColor(r_, 0x0b, 0x0d, 0x12, 255);
         SDL_RenderClear(r_);
+    }
+    // A progress bar as the menu's (the owner's choice, 2026-11-17: glossy): a black outline, a sunken dark track, the
+    // fill a light yellow top half and a darker bottom half, the ends round. Drawn a pixel row at a time (SDL's 2D
+    // renderer has no gradients), each row as long as the round ends allow at its height.
+    void glossy_bar(const SDL_FRect& f, float share) {
+        struct Rgb {
+            float r, g, b;
+        };
+        auto lerp = [](Rgb a, Rgb b, float t) { return Rgb{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t}; };
+        auto hex = [](uint32_t c) { return Rgb{float(c >> 16 & 0xFF), float(c >> 8 & 0xFF), float(c & 0xFF)}; };
+        // one rounded shape (x, y, w, h), its colour by the height within it (0 top, 1 bottom)
+        auto shape = [&](float x, float y, float sw, float sh, auto colour) {
+            const float r = sh / 2;
+            for (int row = 0; row < static_cast<int>(sh); ++row) {
+                const float dy = std::abs(static_cast<float>(row) + 0.5f - r);
+                const float in = r - std::sqrt(std::max(0.0f, r * r - dy * dy)); // (the round ends' inset at this row)
+                const float len = sw - 2 * in;
+                if (len <= 0) continue;
+                const Rgb c = colour((static_cast<float>(row) + 0.5f) / sh);
+                SDL_SetRenderDrawColor(r_, static_cast<Uint8>(c.r), static_cast<Uint8>(c.g), static_cast<Uint8>(c.b), 255);
+                const SDL_FRect line{x + in, y + static_cast<float>(row), len, 1};
+                SDL_RenderFillRect(r_, &line);
+            }
+        };
+        shape(f.x, f.y, f.w, f.h, [&](float) { return hex(0x000000); }); // (the outline)
+        const float b = std::max(1.0f, std::round(f.h / 12));
+        shape(f.x + b, f.y + b, f.w - 2 * b, f.h - 2 * b, [&](float t) { return lerp(hex(0x08090c), hex(0x262a33), t); });
+        const float fill = (f.w - 2 * b) * std::clamp(share, 0.0f, 1.0f);
+        if (fill >= f.h - 2 * b) // (narrower than its round ends: not drawn yet)
+            shape(f.x + b, f.y + b, fill, f.h - 2 * b, [&](float t) {
+                return t < 0.5f ? lerp(hex(0xfff6c8), hex(0xffe06a), t * 2) : lerp(hex(0xe8a800), hex(0xffcf3a), t * 2 - 1);
+            });
     }
     // A centred line at a height (a share of the window's), `scale` times the 8x8 font; its box in render pixels.
     SDL_FRect line(const std::string& text, float y, float scale, SDL_Color c) {
@@ -2138,6 +2167,24 @@ int main(int argc, char** argv) {
         if (!std_handle_set(STD_ERROR_HANDLE)) freopen_s(&f, "CONOUT$", "w", stderr);
     }
 #endif
+    // The in-game update (src/net/install.hpp): --version prints the version and quits (the update runs a download
+    // that way before using it: it starts here, and is the version offered); a start after an update gets a note of
+    // it (--updated-from, --update-failed with --update-why, --went-back-from). The rest of the command line is kept,
+    // to start another version with.
+    std::string updated_from, update_failed, update_why, went_back_from;
+    std::vector<std::string> pass_on;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--version") {
+            std::printf("spikeout %s\n", net::kVersion);
+            std::fflush(stdout);
+            return 0;
+        }
+        std::string* note = a == "--updated-from" ? &updated_from : a == "--update-failed" ? &update_failed
+                            : a == "--update-why" ? &update_why : a == "--went-back-from" ? &went_back_from : nullptr;
+        if (note && i + 1 < argc) *note = argv[++i];
+        else pass_on.push_back(a);
+    }
     const char* dir = nullptr;
     std::string record_path, load_state;
     int scale = 0, cli_render_scale = 0, cli_sound = -1, cli_music = -1;
@@ -2184,6 +2231,8 @@ int main(int argc, char** argv) {
         else if (arg == "--render-scale" && i + 1 < argc) cli_render_scale = std::clamp(std::atoi(argv[++i]), 1, 6);
         else if (arg == "--sound-volume" && i + 1 < argc) cli_sound = std::clamp(std::atoi(argv[++i]), 0, 200);
         else if (arg == "--music-volume" && i + 1 < argc) cli_music = std::clamp(std::atoi(argv[++i]), 0, 200);
+        else if ((arg == "--updated-from" || arg == "--update-failed" || arg == "--update-why" || arg == "--went-back-from") && i + 1 < argc)
+            ++i; // (read above)
         else if (!dir) dir = argv[i];
     }
     if (list_audio) { // the sound outputs, with the channels each has (front and rear apart need 4)
@@ -2221,6 +2270,16 @@ int main(int argc, char** argv) {
     tools::report::catch_crashes(report_folder, net::kVersion);
     tools::report::name_thread("the window (its main thread)");
     const std::string last_crash = tools::report::last_crash(report_folder);
+    // The in-game update: a new version that stopped twice before its first picture is gone back on here (the one
+    // before started instead); leftovers of an update deleted.
+    const std::optional<net::install::Place> install_place = net::install::here();
+    if (install_place) {
+        net::install::tidy(*install_place);
+        if (net::install::on_start(*install_place, pass_on) == net::install::Start::quit) return 0;
+    }
+    auto start_went_well = [&] { // (this version reached its first picture, or closed normally)
+        if (install_place) net::install::mark(*install_place, net::install::Mark::ok);
+    };
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "spikeout: SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -2267,6 +2326,10 @@ int main(int argc, char** argv) {
         watchdog.beat_here();
         watchdog.set_step(step, kStartSeconds);
     };
+    // (tests: SPIKEOUT_TEST_BARS=PERCENT[,seat]: the progress bars shown at that share, their look checked: the
+    // preparing screen 2 s at the start, then the joining screen's, or a joining seat's)
+    const int test_bars = std::getenv("SPIKEOUT_TEST_BARS") ? std::atoi(std::getenv("SPIKEOUT_TEST_BARS")) : -1;
+    const bool test_bars_seat = test_bars >= 0 && std::strstr(std::getenv("SPIKEOUT_TEST_BARS"), "seat") != nullptr;
     // (tests: SPIKEOUT_TEST_START_HANG=SECONDS stands the start still that long at its first step)
     const int test_start_hang = std::getenv("SPIKEOUT_TEST_START_HANG") ? std::atoi(std::getenv("SPIKEOUT_TEST_START_HANG")) : 0;
     watchdog.arm(true);
@@ -2303,6 +2366,22 @@ int main(int argc, char** argv) {
     net::UpdateCheck update_check;
     std::optional<net::Release> newer_version;
     bool update_told = false;
+    // Installing it from the menu (src/net/install.hpp; docs/updating.md): downloaded and checked on a thread, then
+    // the game closed and started again as it (or, Game > Go back, as the version before). SPIKEOUT_UPDATE_INSTALL=0:
+    // never offered (tests).
+    net::install::Download update_download;
+    enum class UpdateExit { none, restart, go_back } update_exit = UpdateExit::none;
+    const bool update_install_off = [] {
+        const char* e = std::getenv("SPIKEOUT_UPDATE_INSTALL");
+        return e && e[0] == '0';
+    }();
+    bool update_noted = false; // (the note of an update at this start said)
+    auto update_stage_seen = net::install::Download::Stage::idle;
+    uint64_t update_percent_seen = 0; // (the page made again at each 1% of the download: its bar moves)
+    auto update_percent = [&update_download] {
+        const uint64_t total = update_download.total();
+        return total ? update_download.done() * 100 / total : uint64_t{0};
+    };
     // Detailed logging (the menu's, from the next start): the network and timing lines (SPIKEOUT_NET_DEBUG) in the log
     if (settings.detailed_log && !std::getenv("SPIKEOUT_NET_DEBUG")) {
 #ifdef _WIN32
@@ -2331,6 +2410,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "spikeout: %s\n", SDL_GetError());
         return 1;
     }
+    // (the in-game update: a version just put in place has started; the one before stops waiting for it)
+    if (install_place) net::install::mark(*install_place, net::install::Mark::alive);
     // The app's icon (its title bar and taskbar; macOS's Dock too; the .exe's own is its resource on Windows).
     if (SDL_Surface* icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(ui::assets::app_icon_png.data, ui::assets::app_icon_png.size), true)) {
         SDL_SetWindowIcon(window, icon);
@@ -2347,6 +2428,13 @@ int main(int argc, char** argv) {
         const bool given = dir != nullptr;
         std::filesystem::path rom_path = given ? std::filesystem::path(dir) : utf8_path(settings.rom_path);
         RomScreen screen(window);
+        if (test_bars >= 0) // (tests: the preparing screen's bar, 2 s)
+            for (auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2); std::chrono::steady_clock::now() < until;) {
+                for (SDL_Event e; SDL_PollEvent(&e);) {
+                }
+                screen.preparing(static_cast<float>(test_bars) / 100.0f, "Part 19 of 48");
+                SDL_Delay(16);
+            }
         std::string why;
         for (bool chosen = false;; chosen = true) {
             if (!rom_path.empty()) {
@@ -2384,6 +2472,7 @@ int main(int argc, char** argv) {
             const auto picked = screen.choose(why);
             watchdog.arm(true);
             if (!picked) {
+                start_went_well();
                 SDL_DestroyWindow(window);
                 SDL_Quit();
                 return 0;
@@ -2451,6 +2540,7 @@ int main(int argc, char** argv) {
         }
         worker.join();
         if (quit) {
+            start_went_well();
             screen.close();
             SDL_DestroyWindow(window);
             SDL_Quit();
@@ -3496,6 +3586,7 @@ int main(int argc, char** argv) {
 
 #ifdef SPIKEOUT_GPU
     // ---- The menu's pages ----
+    std::function<ui::MenuPage()> update_page_made; // (the update's page: update_page, below)
     bool settings_changed = false;
     auto changed = [&] { settings_changed = true; };
     auto back_item = [&] { return ui::MenuItem{"Back", "Back to the previous page.", {}, {}, [&] { menu.pop(); }}; };
@@ -4353,6 +4444,81 @@ int main(int argc, char** argv) {
         }
         return p;
     };
+    // A newer version: installed from here (src/net/install.hpp). Its page is made again as the download goes on.
+    auto update_page = [&] {
+        using Stage = net::install::Download::Stage;
+        const net::Release& r = *newer_version;
+        ui::MenuPage p{"Update to " + r.version, "This is version " + std::string(net::kVersion) + ".", {}};
+        const auto mb = [](uint64_t bytes) {
+            char text[32];
+            std::snprintf(text, sizeof text, "%.1f", static_cast<double>(bytes) / 1e6);
+            return std::string(text);
+        };
+        const std::string kept = "Your settings, saves, rankings and the translated game are kept. A game in progress isn't: "
+                                 "F9 saves your place first. The version before is kept too: Game > Go back.";
+        std::string cant;
+        if (!net::install::Download::available() || update_install_off) cant = "This build can't install updates itself.";
+        else if (r.download.empty()) cant = "The release has no download for this computer.";
+        else if (!install_place) cant = "The game can't find where its program is.";
+        else if (const std::string why = net::install::cant_install(*install_place); !why.empty()) cant = "Can't install here: " + why + ".";
+        if (!cant.empty()) {
+            p.items.push_back({cant, "", {}, {}, {}, true});
+        } else if (netgame) {
+            p.items.push_back({"Install it after the network game", "Restarting would take you out of the room.", {}, {}, {}, true});
+        } else {
+            switch (update_download.stage()) {
+            case Stage::idle:
+                p.items.push_back({"Install now",
+                                   "Downloads version " + r.version + " (" + mb(r.download_size) +
+                                       " MB), checks it, then restarts the game as it. " + kept,
+                                   {}, {}, [&] {
+                                       update_download.start(*newer_version, install_place->work);
+                                       menu.replace(update_page_made());
+                                   }});
+                break;
+            case Stage::downloading: {
+                ui::MenuItem it{"Downloading", "Enter stops it.", [&] {
+                                    return mb(update_download.done()) + " of " + mb(update_download.total()) + " MB";
+                                },
+                                {}, [&] {
+                                    update_download.cancel();
+                                    menu.replace(update_page_made());
+                                }};
+                const uint64_t total = update_download.total();
+                it.progress = total ? static_cast<int>(update_download.done() * 100 / total) : 0;
+                p.items.push_back(std::move(it));
+                break;
+            }
+            case Stage::checking: // (a row that can be selected, as the others: the selection stays on the first row)
+                p.items.push_back({"Checking the download...", "Its size, its SHA-256, the project's signature, and that it starts.",
+                                   {}, {}, [] {}});
+                break;
+            case Stage::ready:
+                p.items.push_back({"Restart as version " + r.version,
+                                   "Downloaded and checked. The game closes and starts again as version " + r.version + ". " + kept,
+                                   {}, {}, [&] {
+                                       update_exit = UpdateExit::restart;
+                                       menu.close();
+                                       running = false;
+                                   }});
+                break;
+            case Stage::failed:
+                p.items.push_back({"Try again", "It failed: " + update_download.error() + ".", {}, {}, [&] {
+                                       update_download.start(*newer_version, install_place->work);
+                                       menu.replace(update_page_made());
+                                   }});
+                p.items.push_back({"Failed: " + update_download.error(), "", {}, {}, {}, true});
+                break;
+            }
+        }
+        if (update_failed == r.version) // (this start came back from a failed try at this version: why, said here)
+            p.items.push_back({"Tried at the last start: " + update_why, "", {}, {}, {}, true});
+        p.items.push_back({"What's new", "Opens its page on GitHub: what changed, and the downloads.", {}, {},
+                           [&] { SDL_OpenURL(newer_version->page.c_str()); }});
+        p.items.push_back(back_item());
+        return p;
+    };
+    update_page_made = update_page;
     auto game_page = [&] {
         ui::MenuPage p{"Game", "", {}};
         p.items.push_back({"Reset game", "Restarts the game, as switching the arcade off and on.", {}, {}, [&] {
@@ -4378,13 +4544,24 @@ int main(int argc, char** argv) {
                            [&] { menu.push(rom_page()); }});
         if (net::UpdateCheck::available())
             p.items.push_back({"Check for updates",
-                               "At each start, asks GitHub whether a newer version is out, and says so in this menu (the game "
-                               "doesn't update itself). This is version " + std::string(net::kVersion) + ".",
+                               "At each start, asks GitHub whether a newer version is out, and says so in this menu, where "
+                               "it can be installed. This is version " + std::string(net::kVersion) + ".",
                                [&] { return on_off(settings.check_updates); },
                                [&](int) {
                                    settings.check_updates = !settings.check_updates;
                                    changed();
                                }});
+        // (the version an update replaced, kept beside the game until the next update: started again from here)
+        if (install_place && !netgame && !update_install_off && net::install::can_go_back(*install_place))
+            if (const auto last = net::install::read_state(*install_place); last && !last->from.empty())
+                p.items.push_back({"Go back to version " + last->from,
+                                   "The version before the last update, kept beside the game. The game closes and starts "
+                                   "again as it; version " + std::string(net::kVersion) + " is deleted (the menu offers it again).",
+                                   {}, {}, [&] {
+                                       update_exit = UpdateExit::go_back;
+                                       menu.close();
+                                       running = false;
+                                   }});
         p.items.push_back({"Report a problem",
                            "A bug report: what happened, the game's log and settings, this computer's details. Sent to the "
                            "project's GitHub page, or saved as a zip.",
@@ -4617,10 +4794,10 @@ int main(int argc, char** argv) {
             // Games the lobby has on other versions: not listed, but said, so a player whose friends updated knows why.
             std::string help = "Their players have another version of the game (this is " + std::string(net::kVersion) +
                                "): players need the same one to play together.";
-            if (newer_version) help += " Version " + newer_version->version + " is out: Enter opens its page.";
+            if (newer_version) help += " Version " + newer_version->version + " is out: Enter to install it.";
             p.items.push_back({std::to_string(internet_others) + (internet_others == 1 ? " game" : " games") + " on another version",
                                help, {}, {}, [&] {
-                                   if (newer_version) SDL_OpenURL(newer_version->page.c_str());
+                                   if (newer_version) menu.push(update_page_made());
                                }});
         }
         if (!lobby_note.empty()) p.items.push_back({lobby_note, "", {}, {}, {}, true});
@@ -4775,8 +4952,16 @@ int main(int argc, char** argv) {
         if (newer_version)
             p.items.push_back({"Version " + newer_version->version + " is out",
                                "This is version " + std::string(net::kVersion) +
-                                   ". Opens its page on GitHub, with the downloads. Players need the same version to play together.",
-                               {}, {}, [&] { SDL_OpenURL(newer_version->page.c_str()); }});
+                                   ". Install it from here, or see what's new. Players need the same version to play together.",
+                               [&] { // (how its download is going, on the right)
+                                   using Stage = net::install::Download::Stage;
+                                   const auto s = update_download.stage();
+                                   if (s == Stage::downloading && update_download.total())
+                                       return std::to_string(update_download.done() * 100 / update_download.total()) + "%";
+                                   return std::string(s == Stage::checking ? "Checking" : s == Stage::ready ? "Ready"
+                                                      : s == Stage::failed ? "Failed" : "");
+                               },
+                               {}, [&] { menu.push(update_page()); }});
         p.items.push_back({"Network play", netgame ? "The game you're in." : "Play with others, on this network or the internet.", {},
                            {}, [&] {
                                menu.push(netgame ? lobby_page() : network_page());
@@ -4815,13 +5000,21 @@ int main(int argc, char** argv) {
             if (sc != SDL_SCANCODE_UNKNOWN) test_keys.push_back(sc);
             at = comma + 1;
         }
+        // (this window's own: a program it starts, another version by the in-game update, doesn't press them again)
+#ifdef _WIN32
+        _putenv_s("SPIKEOUT_MENU_KEYS", "");
+#else
+        unsetenv("SPIKEOUT_MENU_KEYS");
+#endif
     }
     std::size_t test_key = 0;
     bool test_key_ready = false; // (frame 300 reached once)
     auto test_key_due = std::chrono::steady_clock::time_point{};
 
     uint64_t frames_seen = 0;
+    uint64_t loops_run = 0;
     while (running) {
+        if (++loops_run == 2) start_went_well(); // (the first picture shown: an update to this version went well)
 #ifdef SPIKEOUT_GPU
         // (F12's picture, drawn again by the presenter at the last present: written on a thread of its own, the game not
         // waiting for a large PNG)
@@ -5279,6 +5472,41 @@ int main(int argc, char** argv) {
             } else if (const std::string why = update_check.error(); !why.empty()) {
                 std::printf("spikeout: the update check: %s\n", why.c_str());
             }
+        }
+        // The in-game update: this start's note (after an update, a failed one, or going back), said once.
+        if (!update_noted) {
+            update_noted = true;
+            auto upper = [](std::string s) {
+                for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                return s;
+            };
+            if (!updated_from.empty()) {
+                std::printf("spikeout: updated from version %s\n", updated_from.c_str());
+                shared.say("UPDATED TO VERSION " + upper(net::kVersion), 8);
+            } else if (!update_failed.empty()) {
+                std::printf("spikeout: the update to %s failed: %s\n", update_failed.c_str(), update_why.c_str());
+                shared.say("UPDATE TO " + upper(update_failed) + " FAILED: STILL VERSION " + upper(net::kVersion), 10);
+            } else if (!went_back_from.empty()) {
+                std::printf("spikeout: went back from version %s\n", went_back_from.c_str());
+                shared.say("BACK ON VERSION " + upper(net::kVersion), 8);
+            }
+        }
+        // ... and its download going on: said when it's ready or failed, its page made again as it moves.
+        if (const auto stage = update_download.stage(); stage != update_stage_seen || update_percent() != update_percent_seen) {
+            using Stage = net::install::Download::Stage;
+            if (stage != update_stage_seen && newer_version) {
+                std::string v = newer_version->version;
+                for (char& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (stage == Stage::ready) shared.say("VERSION " + v + " IS READY: RESTART AS IT IN THE MENU (ESC)", 8);
+                if (stage == Stage::failed) shared.say("THE UPDATE TO " + v + " FAILED: SEE THE MENU (ESC)", 8);
+            }
+            update_stage_seen = stage, update_percent_seen = update_percent();
+#ifdef SPIKEOUT_GPU
+            if (menu_ready && menu.is_open()) {
+                if (menu.top_name().rfind("Update to ", 0) == 0 && newer_version) menu.replace(update_page_made());
+                else menu.refresh();
+            }
+#endif
         }
         // The host closed the room before the game started: out of it, and told.
         // A spectator's game ended (its host gone, no new one): out of it too.
@@ -5773,6 +6001,20 @@ int main(int argc, char** argv) {
             // (Network status off: the seats left out, the room's line still shown)
             menu.set_net(settings.show_net ? net_rows : std::vector<ui::NetRow>(), net_header,
                          settings.show_net ? net_pills : ui::NetPills{});
+            // (tests: SPIKEOUT_TEST_BARS=PERCENT shows the joining screen's bar at that share with no network game,
+            // PERCENT,seat a joining seat's in the seat list: their look checked)
+            if (test_bars >= 0 && !netgame) {
+                if (!test_bars_seat) {
+                    menu.set_loading("JOINING ROOM TEST", test_bars, "Receiving the game: 3.1 of 7.8 MB", "HOST TEST",
+                                     {"JOINED", "RECEIVING THE GAME", "CATCHING UP", "YOUR CABINET"}, 1);
+                } else {
+                    ui::NetRow you, joining;
+                    you.seat = "1P", you.name = "YOU", you.look = ui::NetRow::Look::you;
+                    joining.seat = "2P", joining.name = "KAI", joining.status = "RECEIVING", joining.progress = test_bars;
+                    joining.look = ui::NetRow::Look::fresh;
+                    menu.set_net({you, joining}, "HOST TEST \xC2\xB7 ROOM TEST");
+                }
+            }
         }
         if (menu_open && now - net_refreshed > std::chrono::milliseconds(250)) {
             net_refreshed = now;
@@ -6021,5 +6263,23 @@ int main(int argc, char** argv) {
     SDL_DestroyWindow(window);
     SDL_Quit();
     std::printf("spikeout: closed normally\n");
+    // The in-game update: started again as the downloaded version (it waited for; any failure put back, and this
+    // version started again saying so), or as the version before.
+    if (install_place && update_exit == UpdateExit::restart && update_download.stage() == net::install::Download::Stage::ready) {
+        std::printf("spikeout: restarting as version %s\n", update_download.release().version.c_str());
+        tools::report::end_log(); // (the new version's log is spikeout.log; a failure is said in this version's next log)
+        const std::string why = net::install::restart_into(*install_place, update_download.staged(), net::kVersion,
+                                                           update_download.release().version, pass_on);
+        std::printf(why.empty() ? "spikeout: version %s started\n" : "spikeout: version %s didn't start\n",
+                    update_download.release().version.c_str());
+    } else if (install_place && update_exit == UpdateExit::go_back) {
+        std::printf("spikeout: going back to the version before\n");
+        tools::report::end_log();
+        if (const std::string why = net::install::go_back(*install_place, pass_on); !why.empty())
+            std::printf("spikeout: couldn't go back: %s\n", why.c_str());
+    } else {
+        start_went_well();
+    }
+    std::fflush(stdout);
     return 0;
 }

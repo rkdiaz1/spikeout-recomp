@@ -22,6 +22,8 @@ public:
         uint32_t crc = 0;
         uint16_t method = 0; // 0 stored, 8 deflated
         uint64_t header = 0; // the local header's offset
+        std::string path;    // the whole name inside the zip, folders and all (the in-game update unpacks folders)
+        uint32_t mode = 0;   // the Unix mode, when the zip was made on a Unix (0: none said)
     };
 
     // Opens a zip and reads its directory; throws std::runtime_error if it isn't one it can read.
@@ -29,12 +31,15 @@ public:
 
     // The files, by lower-case name (a name in two folders: the first).
     const std::map<std::string, Entry>& entries() const { return entries_; }
+    // Every file, in the zip's order, with its whole path (entries() keeps one a name).
+    const std::vector<Entry>& files() const { return files_; }
     // A file's bytes (throws if it's damaged or packed some other way).
     std::vector<uint8_t> read(const Entry& e);
 
 private:
     std::ifstream in_;
     std::map<std::string, Entry> entries_;
+    std::vector<Entry> files_;
 };
 
 // Raw DEFLATE data into exactly `size` bytes; false if the data is bad.

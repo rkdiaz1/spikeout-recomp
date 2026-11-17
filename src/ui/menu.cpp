@@ -26,6 +26,9 @@ namespace ui {
 
 namespace {
 
+// A progress bar's fill, glossy: its light top half and darker bottom half (styled .gt, .gb).
+constexpr const char* kGloss = "<span class=\"gt\"></span><span class=\"gb\"></span>";
+
 std::string escape(const std::string& s) {
     std::string o;
     for (char c : s) {
@@ -232,8 +235,14 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         ".seat.player { color: #ffffff; } .seat.fresh { color: #7fe07f; } .seat.dim { color: #9a9a9a; } "
         ".seat .p { margin-right: 6dp; } .seat .name { white-space: nowrap; } " // (right-aligned, each as wide as it is: a long name the row out to the left)
         ".seat .st { margin-left: 8dp; white-space: nowrap; } "
-        ".seat .pbar { display: inline-block; width: 60dp; height: 8dp; margin: 0 0 3dp 8dp; background-color: #3a3f4a; "
-        "border: 1dp #000000; border-radius: 4dp; } .seat .pfill { display: block; height: 100%; background-color: #5fd35f; } "
+        // (the progress bars, glossy (the owner's choice, 2026-11-17): a sunken track, the fill two halves, a light top
+        // and a darker bottom (RmlUi's gradients here have two colours); yellow, the seat list's green)
+        ".seat .pbar { display: inline-block; width: 60dp; height: 10dp; margin: 0 0 3dp 8dp; decorator: vertical-gradient(#08090c #262a33); "
+        "border: 1dp #000000; border-radius: 5dp; } .seat .pfill { display: block; height: 100%; } "
+        ".seat .pfill .gt { border-radius: 4dp 4dp 0dp 0dp; } .seat .pfill .gb { border-radius: 0dp 0dp 4dp 4dp; } "
+        ".gt { display: block; height: 50%; decorator: vertical-gradient(#fff6c8 #ffe06a); } "
+        ".gb { display: block; height: 50%; decorator: vertical-gradient(#e8a800 #ffcf3a); } "
+        ".green .gt { decorator: vertical-gradient(#d8ffd8 #8fe88f); } .green .gb { decorator: vertical-gradient(#3fae3f #6fd46f); } "
         ".conn { display: flex; justify-content: flex-end; align-items: flex-end; margin-left: 8dp; } "
         ".bars { display: flex; align-items: flex-end; height: 16dp; margin-bottom: 3dp; margin-left: 5dp; } "
         ".bar { width: 3dp; margin-left: 1dp; background-color: #4a4a4a; border: 1dp #000000; } "
@@ -273,16 +282,17 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         "#loading .box { position: absolute; left: 0; width: 100%; top: 42%; text-align: center; } "
         "#loading .title { display: block; font-size: 44dp; color: #ffd34a; font-effect: outline(2dp #000000); } "
         "#loading .detail { display: block; margin-top: 10dp; font-size: 22dp; color: #c8ccd4; } "
-        "#lbar { display: block; width: 420dp; height: 22dp; margin: 18dp auto 0 auto; background-color: #2a2e38; "
+        "#lbar { display: block; width: 420dp; height: 22dp; margin: 18dp auto 0 auto; decorator: vertical-gradient(#08090c #262a33); "
         "border: 2dp #000000; border-radius: 11dp; } "
-        "#lfill { display: block; height: 100%; width: 0%; background-color: #ffd34a; border-radius: 9dp 0dp 0dp 9dp; } "
+        "#lfill { display: block; height: 100%; width: 0%; } "
+        "#lfill .gt { border-radius: 9dp 9dp 0dp 0dp; } #lfill .gb { border-radius: 0dp 0dp 9dp 9dp; } "
         "#lpct { display: block; margin-top: 8dp; font-size: 26dp; color: #ffffff; font-effect: outline(2dp #000000); } "
         "#lsub { display: block; margin-top: 4dp; font-size: 20dp; color: #8d939e; } "
         "#lsteps { display: block; margin-top: 22dp; font-size: 20dp; color: #5d636e; } "
         "#lsteps .done { color: #5fd35f; } #lsteps .now { color: #ffffff; } #lsteps .sep { color: #3d424c; padding: 0 10dp; } "
         "</style></head><body><div id=\"loading\"><div class=\"box\"><span class=\"title\" id=\"ltitle\"></span>"
         "<span id=\"lsub\"></span>"
-        "<div id=\"lbar\"><div id=\"lfill\"></div></div><span id=\"lpct\"></span>"
+        "<div id=\"lbar\"><div id=\"lfill\"><div class=\"gt\"></div><div class=\"gb\"></div></div></div><span id=\"lpct\"></span>"
         "<span class=\"detail\" id=\"ldetail\"></span><div id=\"lsteps\"></div></div></div>"
         "<div id=\"swcover\"><span class=\"t\" id=\"swtext\"></span></div><div id=\"corner\"><div id=\"fps\"></div></div><div id=\"net\"></div><div id=\"watchb\"></div></body></rml>");
     return true;
@@ -327,8 +337,8 @@ void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, c
         if (!r.status.empty()) { // (our own row: none, its name at the right edge as the others' bars)
             rml += "<span class=\"st\">" + escape(r.status) + "</span>";
             if (r.progress >= 0)
-                rml += "<span class=\"pbar\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(r.progress, 0, 100)) +
-                       "%;\"></span></span>";
+                rml += "<span class=\"pbar green\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(r.progress, 0, 100)) +
+                       "%;\">" + kGloss + "</span></span>";
         } else if (r.bars >= 0) {
             // (the time against the bars, the gap after the name the same at any time; each digit as wide as any (the
             // font's aren't), and as many digit places as it has had until it has had fewer for 5 s: the name moves
@@ -544,8 +554,11 @@ void Menu::build() {
                        "; width: " + impl_->px(4) + "; margin-left: " + impl_->px(2) + "; border-width: " + impl_->px(1) + ";\"></span>";
             rml += "</span><span>~" + std::to_string(ms) + " ms</span></span>"; // (its own span: loose text in a flex box isn't drawn)
         }
+        if (it.progress >= 0) // (a bar: its fill as wide as the share done)
+            rml += "<span class=\"pbar\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(it.progress, 0, 100)) +
+                   "%;\">" + kGloss + "</span></span>";
         if (it.value) {
-            rml += "<span class=\"value\">";
+            rml += it.progress >= 0 ? "<span class=\"value pvalue\">" : "<span class=\"value\">"; // (beside a bar: a fixed width)
             if (it.change) rml += "<span class=\"arrow back\">&lt;&nbsp;&nbsp;</span>";
             rml += escape(it.value());
             if (it.change) rml += "<span class=\"arrow\">&nbsp;&nbsp;&gt;</span>";

@@ -44,6 +44,9 @@ struct MenuItem {
     std::string image;
     std::string detail;
     bool dim = false;
+    // A bar on the right, before the value: how far something has come, 0-100 (-1: none). The in-game update's
+    // download; the page is made again as it moves.
+    int progress = -1;
 };
 
 // A seat of a network game, in the list under the frame rate.

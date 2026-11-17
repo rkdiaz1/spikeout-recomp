@@ -248,6 +248,23 @@ jobs:
         with:
           path: files
           merge-multiple: true
+      - name: The downloads' signatures (the in-game update, docs/updating.md)
+        env:
+          SPIKEOUT_UPDATE_SECRET: ${{ secrets.SPIKEOUT_UPDATE_SECRET }}
+        run: |
+          # (each download signed into <file>.sig with the project's update key, kept in this secret only; the game
+          # installs only a download whose signature matches the public key built into it, CMake's SPIKEOUT_UPDATE_KEY)
+          if [ -z "$SPIKEOUT_UPDATE_SECRET" ]; then
+            echo "::warning::No SPIKEOUT_UPDATE_SECRET: the downloads aren't signed, so the game won't install this version itself (it still says it's out)"
+            exit 0
+          fi
+          cc -O2 -Ithird_party/monocypher -Isrc tools/update_sign.c third_party/monocypher/monocypher.c -o update_sign
+          downloads=$(ls files/* | grep -v -- '-debug-symbols\.')
+          ./update_sign sign $downloads
+          # (the secret and the key the game was built with must be a pair: checked, else the game would refuse them)
+          key=$(sed -n 's/^set(SPIKEOUT_UPDATE_KEY "\([0-9a-f]*\)".*/\1/p' CMakeLists.txt)
+          if [ -n "$key" ]; then ./update_sign check "$key" $downloads; else echo "::warning::CMake's SPIKEOUT_UPDATE_KEY is empty: this version's game installs no updates"; fi
+          rm update_sign
       - name: The draft release
         env:
           GH_TOKEN: ${{ github.token }}

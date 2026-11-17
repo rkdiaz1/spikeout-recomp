@@ -219,6 +219,26 @@ else()
     message(STATUS "No libcurl: the internet lobby is left out (LAN play only)")
 endif()
 
+# The in-game update (src/net/install.hpp, docs/updating.md): a newer release downloaded, checked against the
+# project's update key (Monocypher EdDSA; tools/update_sign.c signs the downloads in the release workflow), put in
+# place of the program and started. SPIKEOUT_UPDATE_KEY: the public key (hex); empty: the game never installs.
+set(SPIKEOUT_UPDATE_KEY "9fbdba2f72c5d62f0064caf73ec14bb9ff11c9cf9142bbd075cc9f3a2ef692b3" CACHE STRING "The project's update key (public, hex: tools/update_sign.c keygen, 2026-11-17); empty: no in-game installing")
+add_library(m3install src/net/install.cpp)
+target_link_libraries(m3install PUBLIC m3net m3runtime PRIVATE spikeout_warnings)
+target_compile_definitions(m3install PRIVATE SPIKEOUT_UPDATE_KEY="${SPIKEOUT_UPDATE_KEY}")
+if(SPIKEOUT_LOBBY AND TARGET CURL::libcurl)
+    target_sources(m3install PRIVATE src/net/install_download.cpp)
+else()
+    target_sources(m3install PRIVATE src/net/install_download_none.cpp)
+endif()
+# The signer (C only: the release workflow builds it with cc, without CMake)
+add_executable(update_sign tools/update_sign.c)
+target_link_libraries(update_sign PRIVATE monocypher)
+target_include_directories(update_sign PRIVATE src)
+if(WIN32)
+    target_link_libraries(update_sign PRIVATE bcrypt)
+endif()
+
 # Moira 68000 core (MIT, Dirk W. Hoffmann, v3.0; third_party/moira) for the
 # network board's 68000. Musashi was rejected: its bundled SoftFloat 2b
 # license has a disputed indemnity clause.
@@ -551,7 +571,7 @@ if(SPIKEOUT_ROM_DIR)
     # through the GPU.
     if(SPIKEOUT_FRONTEND)
         add_executable(spikeout tools/spikeout.cpp)
-        target_link_libraries(spikeout PRIVATE game_ram boot_rom m3net SDL3::SDL3 spikeout_warnings)
+        target_link_libraries(spikeout PRIVATE game_ram boot_rom m3net m3install SDL3::SDL3 spikeout_warnings)
         spikeout_window_app(spikeout)
         if(SPIKEOUT_GPU)
             target_link_libraries(spikeout PRIVATE m3gpu m3ui)
@@ -620,7 +640,7 @@ if(SPIKEOUT_LLVM_JIT)
     # game" screen on its first start, from the ROM set chosen in the window.
     if(SPIKEOUT_FRONTEND)
         add_executable(spikeout-jit tools/spikeout.cpp)
-        target_link_libraries(spikeout-jit PRIVATE spikeout_jit m3net SDL3::SDL3 spikeout_warnings)
+        target_link_libraries(spikeout-jit PRIVATE spikeout_jit m3net m3install SDL3::SDL3 spikeout_warnings)
         spikeout_window_app(spikeout-jit)
         target_compile_definitions(spikeout-jit PRIVATE SPIKEOUT_JIT)
         if(SPIKEOUT_GPU)
@@ -641,8 +661,9 @@ if(SPIKEOUT_BUILD_TESTS)
         tests/test_net.cpp
         tests/test_snapshots.cpp
         tests/test_state_load.cpp
-        tests/test_delay.cpp)
-    target_link_libraries(spikeout_tests PRIVATE analysis m3runtime m3net spikeout_warnings)
+        tests/test_delay.cpp
+        tests/test_install.cpp)
+    target_link_libraries(spikeout_tests PRIVATE analysis m3runtime m3net m3install spikeout_warnings)
     if(SPIKEOUT_GPU)
         target_sources(spikeout_tests PRIVATE tests/test_gpu.cpp)
         target_link_libraries(spikeout_tests PRIVATE m3gpu)

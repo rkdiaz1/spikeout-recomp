@@ -121,6 +121,17 @@ div { display: block; }
 .row.dim { color: #7a6e6a; }
 .row.dim .value, .row.dim .detail { color: #6a605c; }
 
+/* A bar before the value (the in-game update's download), glossy as the game's other progress bars (the owner's
+   choice, 2026-11-17): a sunken track, the fill a light yellow top half and a darker bottom half. Its value in a box of
+   a fixed width, right-aligned, so that the bar stays still as the numbers change. */
+.row .pbar { display: block; flex: 0 6 auto; width: 240dp; min-width: 60dp; height: 12dp; margin: 9dp 14dp 0 0;
+	decorator: vertical-gradient(#08090c #262a33); border: 1dp #000000; border-radius: 6dp; }
+.row.selected .pbar { decorator: vertical-gradient(#3a0a05 #6a1a10); }
+.row .pfill { display: block; height: 100%; }
+.row .pfill .gt { display: block; height: 50%; border-radius: 5dp 5dp 0dp 0dp; decorator: vertical-gradient(#fff6c8 #ffe06a); }
+.row .pfill .gb { display: block; height: 50%; border-radius: 0dp 0dp 5dp 5dp; decorator: vertical-gradient(#e8a800 #ffcf3a); }
+.row .value.pvalue { flex: 0 0 auto; width: 190dp; }
+
 .row .arrow { color: #c99a8a; }
 .row.selected .arrow { color: #1a0705; }
 

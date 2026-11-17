@@ -3,10 +3,13 @@ param(
     [string]$WindowsExe = "build-jit\spikeout-jit.exe", # the JIT window (no game code inside)
     [string]$LinuxExe = "",                            # the Linux JIT window, copied out of WSL (optional)
     [string]$Deps = "build-jit\_deps",                 # FetchContent's sources (their licences)
-    [string]$Out = "build-jit\release")
+    [string]$Out = "build-jit\release",
+    [string]$Signer = "")                              # update_sign.exe: each download signed (<file>.sig), with
+                                                       # the secret in SPIKEOUT_UPDATE_SECRET(_FILE) (docs/updating.md)
 # The downloads: the game's window built with the JIT (the game is translated from the player's own ROM set at its
 # first start; nothing made from the ROM is inside), stripped, with the licences and a short readme:
 #   spikeout-<version>-windows-x64.zip, spikeout-<version>-linux-x64.tar.gz
+# (the release workflow, tools/package-release.sh, makes the published ones and signs them itself)
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path "$PSScriptRoot\..").Path
 Set-Location $repo
@@ -97,8 +100,10 @@ beside it. Save states (F9) go in its saves folder, screenshots (F12) in its
 screenshots folder.
 
 New versions: at start the game asks GitHub whether a newer one is out, and the menu
-says so (Esc > Game > Check for updates turns that off). Players need the same
-version to play together.
+says so (Esc > Game > Check for updates turns that off). Choose it there to install
+it: the game downloads it, checks it, and starts again as it. The version before is
+kept in the spikeout-update folder beside the game (Esc > Game > Go back). Players
+need the same version to play together.
 
 Linux: needs glibc 2.38 or later (Ubuntu 24.04, Fedora 39 and later, current SteamOS) and
 OpenSSL 3. Make it runnable (chmod +x spikeout) if your file manager doesn't.
@@ -125,5 +130,10 @@ if ($LinuxExe) {
     $wsl_dir = (wsl -e wslpath -a ($lin -replace '\\', '/')).Trim()
     $wsl_out = (wsl -e wslpath -a ((Resolve-Path $Out).Path -replace '\\', '/')).Trim()
     wsl -e bash -c "strip '$wsl_dir/spikeout' && chmod +x '$wsl_dir/spikeout' && cd '$wsl_out' && tar -czf 'spikeout-$Version-linux-x64.tar.gz' --owner=0 --group=0 'spikeout-$Version-linux-x64'"
+}
+if ($Signer) {
+    $downloads = @(Get-ChildItem $Out -File | Where-Object { $_.Name -match '\.(zip|tar\.gz)$' } | ForEach-Object { $_.FullName })
+    & $Signer sign @downloads
+    if ($LASTEXITCODE -ne 0) { throw "signing failed" }
 }
 Get-ChildItem $Out -File | ForEach-Object { "{0,-45} {1,6:N1} MB" -f $_.Name, ($_.Length / 1MB) }

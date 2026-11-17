@@ -63,9 +63,47 @@ std::optional<Release> newer_release(const Json& releases, std::string_view curr
         if (r["prerelease"].as_bool() && !prerelease(current)) continue; // (test builds only offered to test builds)
         if (compare_versions(tag, current) <= 0) continue;
         if (best && compare_versions(tag, best->version) <= 0) continue;
-        best = Release{tag, r["html_url"].as_string()};
+        best = Release{};
+        best->version = tag, best->page = r["html_url"].as_string();
+        // its download for this system, and that download's signature
+        const std::string name = download_name(tag);
+        const Json* file = nullptr;
+        const Json* sig = nullptr;
+        if (!name.empty() && r["assets"].is_array())
+            for (const Json& a : r["assets"].items()) {
+                if (a["name"].as_string() == name) file = &a;
+                if (a["name"].as_string() == name + ".sig") sig = &a;
+            }
+        if (file && sig && ((*file)["state"].as_string().empty() || (*file)["state"].as_string() == "uploaded")) {
+            best->download = name;
+            best->download_url = (*file)["browser_download_url"].as_string();
+            best->download_size = static_cast<uint64_t>((*file)["size"].as_number(0));
+            best->digest = (*file)["digest"].as_string();
+            best->signature_url = (*sig)["browser_download_url"].as_string();
+            if (best->download_url.empty() || best->signature_url.empty() || best->download_size == 0) best->download.clear();
+        }
     }
     return best;
+}
+
+const char* platform() {
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+    return "windows-x64";
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return "macos-arm64";
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return "macos-x64";
+#elif defined(__linux__) && defined(__x86_64__)
+    return "linux-x64";
+#else
+    return "";
+#endif
+}
+
+std::string download_name(std::string_view version) {
+    const std::string p = platform();
+    if (p.empty() || version.empty()) return {};
+    return "spikeout-" + std::string(version) + "-" + p + (p.rfind("linux", 0) == 0 ? ".tar.gz" : ".zip");
 }
 
 } // namespace net

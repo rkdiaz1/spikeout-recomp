@@ -111,8 +111,10 @@ or speed problems, turn on Detailed logging there first, start the game again an
 make the problem happen.
 
 New versions: at start the game asks GitHub whether a newer one is out, and the menu
-says so (Esc > Game > Check for updates turns that off). Players need the same
-version to play together.
+says so (Esc > Game > Check for updates turns that off). Choose it there to install
+it: the game downloads it, checks it, and starts again as it. The version before is
+kept in the spikeout-update folder beside the game (Esc > Game > Go back). Players
+need the same version to play together.
 EOF
     case $platform in
     linux-*)

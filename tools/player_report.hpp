@@ -89,6 +89,7 @@ struct Log {
     std::deque<std::string> lines; // (the last kLastLines)
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     std::atomic<bool> crashed{false};
+    std::atomic<bool> ended{false}; // (end_log done)
 };
 inline Log& log() {
     static Log* l = new Log; // (never destroyed: a crash at exit still finds it)
@@ -182,6 +183,7 @@ inline std::string old_log_name(int i) { return i <= 1 ? "spikeout-prev.log" : "
 
 // The data folder's log, started first thing in main: the last runs' kept as spikeout-prev.log, -prev2.log... False:
 // no log (the output stays where it was).
+inline void end_log();
 inline bool start_log(const std::string& folder) {
     detail::Log& l = detail::log();
     l.folder = folder;
@@ -249,25 +251,30 @@ inline bool start_log(const std::string& folder) {
         detail::pump();
     });
     // (at the end: the pipe closed, so that the thread writes the last lines and stops)
-    std::atexit([] {
-        detail::Log& g = detail::log();
-        std::fflush(stdout), std::fflush(stderr);
-#ifdef _WIN32
-        _dup2(g.echo >= 0 ? g.echo : _fileno(stdin), _fileno(stdout));
-        _dup2(g.echo >= 0 ? g.echo : _fileno(stdin), _fileno(stderr));
-#else
-        const int none = ::open("/dev/null", O_WRONLY);
-        ::dup2(g.echo >= 0 ? g.echo : none, 1);
-        ::dup2(g.echo >= 0 ? g.echo : none, 2);
-#endif
-        if (g.thread.joinable()) g.thread.join();
-        std::lock_guard guard(g.lock);
-        if (g.file) std::fclose(g.file), g.file = nullptr;
-    });
+    std::atexit([] { end_log(); });
     // (the clock time once: the lines after count seconds from here, and a crash report's name is the clock's)
     std::printf("log: started %s (this computer's time; the numbers in [ ] are seconds from now)\n", detail::clock_text().c_str());
     if (!busy.empty()) std::printf("log: %s is in use (the game open twice?): this run's log is %s\n", busy.c_str(), l.name.c_str());
     return true;
+}
+
+// The log finished: the last lines written, the file closed, the output back where it went before (at the end; or
+// before the game starts another version of itself, the in-game update, whose own log is spikeout.log).
+inline void end_log() {
+    detail::Log& g = detail::log();
+    if (g.read_end < 0 || g.ended.exchange(true)) return;
+    std::fflush(stdout), std::fflush(stderr);
+#ifdef _WIN32
+    _dup2(g.echo >= 0 ? g.echo : _fileno(stdin), _fileno(stdout));
+    _dup2(g.echo >= 0 ? g.echo : _fileno(stdin), _fileno(stderr));
+#else
+    const int none = ::open("/dev/null", O_WRONLY);
+    ::dup2(g.echo >= 0 ? g.echo : none, 1);
+    ::dup2(g.echo >= 0 ? g.echo : none, 2);
+#endif
+    if (g.thread.joinable()) g.thread.join();
+    std::lock_guard guard(g.lock);
+    if (g.file) std::fclose(g.file), g.file = nullptr;
 }
 
 namespace detail {

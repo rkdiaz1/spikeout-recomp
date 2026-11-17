@@ -210,8 +210,15 @@ Read this first; the older hand-off below is history.
   of 2-5 s, LAN one board needs real packets (Mode A; memory note). Next
   (owner): bot longplays with 2-4 players through every area, the finder
   on each checkpoint.
+  IN-GAME UPDATE (2026-11-17, step 2, docs/updating.md): the menu's
+  "Version X is out" installs it (src/net/install.*: download, size,
+  SHA-256, the project's EdDSA signature (tools/update_sign.c, secret
+  SPIKEOUT_UPDATE_SECRET, public key CMake SPIKEOUT_UPDATE_KEY: empty =
+  no installing), --version run, renames into place, the old kept in
+  spikeout-update/previous, Game > Go back; a new version that doesn't
+  start is put back by itself). Tested on Windows with a local release.
   UPDATE CHECK (2026-11-05, the owner's step 1 of 2; step 2, the game
-  updating itself, later): the version is built in (CMake
+  updating itself, above): the version is built in (CMake
   SPIKEOUT_VERSION, default PROJECT_VERSION-dev; a release is built with
   -DSPIKEOUT_VERSION=<tag without v>, and tools/make-release.ps1 refuses an
   exe whose SPIKEOUT_VERSION= mark differs). src/net/update.*: at start the

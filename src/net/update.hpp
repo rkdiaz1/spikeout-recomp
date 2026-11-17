@@ -1,13 +1,14 @@
 // The update check: at start the window asks GitHub's release list
 // (SPIKEOUT_RELEASES_URL) whether a newer version than this build's
 // (SPIKEOUT_VERSION) is out, on a thread of its own, and says so in its
-// menu. It only tells: the player downloads it. Builds whose version ends
-// in "-dev" (any build that isn't a release) don't ask.
+// menu. Builds whose version ends in "-dev" (any build that isn't a
+// release) don't ask. Installing it from the game: net/install.hpp.
 #pragma once
 
 #include "net/json.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,9 +31,21 @@ int compare_versions(std::string_view a, std::string_view b);
 bool prerelease(std::string_view version); // a label ("-preview1")
 bool dev_build(std::string_view version);  // "-dev": not a release
 
+// This build's downloads: its system's name in them ("windows-x64", "linux-x64", "macos-arm64", "macos-x64"; ""
+// none), and a version's download for it (spikeout-<version>-<platform>.zip, .tar.gz on Linux; "" none), as
+// tools/package-release.sh names them.
+const char* platform();
+std::string download_name(std::string_view version);
+
 struct Release {
     std::string version; // without the "v"
     std::string page;    // its page on GitHub (the downloads)
+    // The download for this system (the in-game update, install.hpp), if the release has it and its signature:
+    std::string download;     // its file name ("" none)
+    std::string download_url; // GitHub's link to it
+    uint64_t download_size = 0;
+    std::string digest;       // GitHub's "sha256:<hex>" ("" if it gave none)
+    std::string signature_url; // <file name>.sig's link
 };
 
 // The newest release in GitHub's list (an array of releases) newer than

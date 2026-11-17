@@ -287,7 +287,10 @@ ZipReader::ZipReader(const std::filesystem::path& path) : in_(path, std::ios::bi
         e.packed = le32(h + 20);
         e.size = le32(h + 24);
         e.header = le32(h + 42);
+        e.path = name;
+        if ((le16(h + 4) >> 8) == 3) e.mode = le32(h + 38) >> 16; // (made on a Unix: its mode in the external attributes)
         entries_.emplace(lower(e.name), e);
+        files_.push_back(e);
     }
 }
 
