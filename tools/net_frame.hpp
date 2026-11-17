@@ -30,9 +30,11 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -378,18 +380,67 @@ inline bool behind_own_seat(NetPlay& net, uint64_t frame) {
 // than the game: the cabinet asked for from where we'll meet the others (take_at), they play on. Not faster than the
 // game: the cabinet taken anyway; the others then wait for this machine as for any slow player. A spectator runs
 // net::kWatchLag behind every seat.
+// Each catch-up as it ended, for the network game's stats (the window's game_stats: taken and cleared there): a JSON
+// object each, at most kMost a game. Any thread. (2026-11-17: joins that never ended showed nothing in the reports)
+struct JoinLog {
+    static constexpr std::size_t kMost = 32;
+    static JoinLog& get() {
+        static JoinLog log;
+        return log;
+    }
+    void add(std::string j) {
+        std::lock_guard guard(lock_);
+        if (joins_.size() < kMost) joins_.push_back(std::move(j));
+    }
+    // (a catch-up started: one started again before the last ended is a restart, as a spectator's Left/Right makes)
+    int started() {
+        std::lock_guard guard(lock_);
+        return open_++;
+    }
+    int ended() {
+        std::lock_guard guard(lock_);
+        const int restarts = open_ > 0 ? open_ - 1 : 0;
+        open_ = 0;
+        return restarts;
+    }
+    std::string take_json() {
+        std::lock_guard guard(lock_);
+        std::string s = "[";
+        for (std::size_t i = 0; i < joins_.size(); ++i) s += (i ? "," : "") + joins_[i];
+        joins_.clear();
+        return s + "]";
+    }
+
+private:
+    std::mutex lock_;
+    std::vector<std::string> joins_;
+    int open_ = 0;
+};
+
 struct CatchUp {
     uint64_t from = 0; // (the first frame run here; 0: not started)
     std::chrono::steady_clock::time_point at{};
     uint64_t start_behind = 0; // (frames behind then)
     uint64_t behind = 0;       // (and now)
+    // A catch-up going on past kStuckSeconds: told once (the window: a "join" problem report), with what it waits for.
+    static constexpr double kStuckSeconds = 20;
+    std::function<void(const std::string& what, uint64_t frame)> on_stuck;
 
     // True: caught up (or taken anyway).
     bool frame_end(NetPlay& net, std::size_t boards, std::size_t me, bool spectating, uint64_t frame, const char* tag) {
-        uint64_t front = 0;
+        // (the furthest input of the others, and the least: every frame below that one has all its inputs in, so it is as
+        // far as this machine can run; the seat holding it back)
+        uint64_t front = 0, least = ~0ull;
+        std::size_t holder = 0;
         for (std::size_t s = 0; s < boards; ++s)
-            if (s != me || spectating) front = std::max(front, net.session().inputs_known(static_cast<uint8_t>(s)));
-        if (spectating) front = front > ::net::kWatchLag ? front - ::net::kWatchLag : 0; // (it runs that far behind them)
+            if (s != me || spectating) {
+                const uint64_t known = net.session().inputs_known(static_cast<uint8_t>(s));
+                front = std::max(front, known);
+                if (known < least) least = known, holder = s;
+            }
+        if (least == ~0ull) least = 0;
+        const auto lagged = [](uint64_t f) { return f > ::net::kWatchLag ? f - ::net::kWatchLag : 0; };
+        if (spectating) front = lagged(front), least = lagged(least); // (it runs that far behind them)
         behind = front > frame ? front - frame : 0;
         // (tests: SPIKEOUT_TEST_CATCHUP_MS=N, each frame caught up N ms longer: a slow PC's join, to see it)
         static const int test_catchup_ms = std::getenv("SPIKEOUT_TEST_CATCHUP_MS") ? std::atoi(std::getenv("SPIKEOUT_TEST_CATCHUP_MS")) : 0;
@@ -397,10 +448,31 @@ struct CatchUp {
         const auto now = std::chrono::steady_clock::now();
         if (!from) { // (how long it takes: from the first frame run here to the others)
             from = frame, at = now, start_behind = behind, said_waiting = false;
-            std::printf("%s: catching up from frame %llu, the others at %llu\n", tag, static_cast<unsigned long long>(frame),
-                        static_cast<unsigned long long>(front));
+            said_at = now, said_frame = frame, stuck_said = false, waiting = "";
+            JoinLog::get().started();
+            std::printf("%s: catching up from frame %llu, the others at %llu, as %s %zu\n", tag, static_cast<unsigned long long>(frame),
+                        static_cast<unsigned long long>(front), spectating ? "a spectator, watching seat" : "a player, seat", me + 1);
         }
         const double so_far = std::chrono::duration<double>(now - at).count();
+        // (every 5 s while it goes on: where it is, what holds it, which rule waits; past kStuckSeconds, told once)
+        if (std::chrono::duration<double>(now - said_at).count() >= 5) {
+            const double secs = std::chrono::duration<double>(now - said_at).count();
+            const double rate = frame > said_frame ? static_cast<double>(frame - said_frame) / secs : 0.0;
+            char line[400];
+            std::snprintf(line, sizeof line,
+                          "after %.0f s, as a %s: frame %llu; every input in to %llu (seat %zu's the least), the furthest to %llu; "
+                          "%llu frames short of the furthest, %.1f frames a second over the last %.0f s (%.2fx); waiting: %s",
+                          so_far, spectating ? "spectator" : "player", static_cast<unsigned long long>(frame),
+                          static_cast<unsigned long long>(least), holder + 1, static_cast<unsigned long long>(front),
+                          static_cast<unsigned long long>(behind), rate, secs, rate / recomp::FrameTiming::kRefreshHz,
+                          waiting.empty() ? "nothing yet" : waiting.c_str());
+            std::printf("%s: still catching up %s\n", tag, line);
+            if (so_far >= kStuckSeconds && !stuck_said) {
+                stuck_said = true;
+                if (on_stuck) on_stuck(std::string("catching up ") + line, frame);
+            }
+            said_at = now, said_frame = frame;
+        }
         // (no input from past the state yet: the others' inputs since come after the state, queued behind it on the
         // way, so the furthest known is still older than the state: not caught up whatever it says (2026-11-09: taken
         // at once, the seat came 390 frames ahead, run to at the game's pace: the others held 6.2 s). Never taken
@@ -408,6 +480,7 @@ struct CatchUp {
         // 2026-11-13: it was taken after 10 s anyway, the joiner still receiving the inputs, the room stood still 16 s);
         // the others quiet meanwhile, nobody waits either way)
         if (front < from) {
+            waiting = "no inputs past the state yet";
             if (so_far >= 10 && !said_waiting) {
                 said_waiting = true;
                 std::printf("%s: no inputs past the state yet after %.0f s (the others at %llu, the state at %llu): our "
@@ -422,12 +495,33 @@ struct CatchUp {
             std::printf("%s: caught up at frame %llu: %llu frames in %.1f s (%.2fx the game's speed)\n", tag,
                         static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame - from), so_far,
                         so_far > 0 ? static_cast<double>(frame - from) / so_far / recomp::FrameTiming::kRefreshHz : 0.0);
-            return finish();
+            return finish("caught", spectating, frame, so_far);
+        }
+        // Run as far as every input is in, for a second, the rest of the gap only the seats' inputs apart (input delays,
+        // the authority's fills of empty cabinets a few frames ahead: 8-9 frames seen, 2026-11-17): caught up too. It
+        // waited for the furthest input before, which a machine at the room's pace never reaches: a joiner of a slow room
+        // (a far, slow player in it) and spectators waited for good, nothing said (reports 3730, 3925, 4236; reproduced
+        // with Codespaces). A spread over kSpreadMost is a seat stopped (a player gone): left to the rules below.
+        if (frame + 1 >= least && front - least <= kSpreadMost) {
+            if (bound_since == std::chrono::steady_clock::time_point{}) bound_since = now;
+            if (now - bound_since >= std::chrono::seconds(1)) {
+                std::printf("%s: caught up at frame %llu, as far as every input is in (the furthest %llu frames on): %llu frames "
+                            "in %.1f s (%.2fx the game's speed)\n",
+                            tag, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(front - frame),
+                            static_cast<unsigned long long>(frame - from), so_far,
+                            so_far > 0 ? static_cast<double>(frame - from) / so_far / recomp::FrameTiming::kRefreshHz : 0.0);
+                return finish("caught", spectating, frame, so_far);
+            }
+        } else {
+            bound_since = {};
         }
         // (5 s of running: from the first frame it could run, not from the first here: a far joiner's inputs past the state
         // come late (through the relay, ~95 ms each way: after 4.6 s), so 5 s from the first frame left it half a second
         // of running, its speed none, and the cabinet was taken anyway, the room stood 8-10 s (2026-11-14, the window test))
-        if (std::chrono::duration<double>(now - run_at).count() <= 5) return false;
+        if (std::chrono::duration<double>(now - run_at).count() <= 5) {
+            waiting = "caught up needs 4 frames of the furthest; its first 5 s of running";
+            return false;
+        }
         // Not caught up after 5 s. Gaining on the room (this machine runs the game faster than the arcade's pace): the
         // cabinet asked for from the frame where we'll meet the room, by our speed, a second's margin; the others play
         // on meanwhile, nobody waits (2026-11-13, the owner's choice for 0.1.0-preview5.1: before, it was taken at once,
@@ -441,25 +535,32 @@ struct CatchUp {
             const double gain = rate - game;
             if (gain >= 0.05 * game) {
                 const double seconds = static_cast<double>(front - frame) / gain;
-                if (seconds > kMeetMost) return false; // (too far yet: on catching up, nobody waits)
+                if (seconds > kMeetMost) { // (too far yet: on catching up, nobody waits)
+                    waiting = "gaining, but the meeting over 20 s off yet";
+                    return false;
+                }
                 take_at = front + static_cast<uint64_t>((seconds + 1.0) * game);
                 take_frame = frame, take_rate = rate; // (for the authority's own sum: the room may be further on)
                 std::printf("%s: catching up at %.2fx, %llu frames behind after %.0f s: our cabinet asked for from frame %llu, "
                             "where we'll be in %.0f s (the others play on)\n",
                             tag, rate / game, static_cast<unsigned long long>(front - frame), so_far,
                             static_cast<unsigned long long>(take_at), seconds + 1.0);
-                return finish();
+                return finish("asked", spectating, frame, so_far);
             }
         }
         // Not faster than the game (or a spectator not gaining): as before, the cabinet taken anyway; the others then
         // wait for this machine as for any slow player (what to do for those is still open: memory taken-anyway-rule)
-        if (front - frame + 30 < start_behind) return false; // (a spectator still gaining: on)
-        std::printf("%s: not gaining on the others (%llu frames behind after %.0f s): the cabinet taken anyway\n", tag,
-                    static_cast<unsigned long long>(front - frame), so_far);
+        if (front - frame + 30 < start_behind) { // (a spectator still gaining: on)
+            waiting = "caught up needs 4 frames of the furthest; closed 30+ frames of its start, so not taken anyway";
+            return false;
+        }
+        std::printf("%s: not gaining on the others (%llu frames behind after %.0f s): %s\n", tag,
+                    static_cast<unsigned long long>(front - frame), so_far,
+                    spectating ? "watching from here" : "the cabinet taken anyway");
         std::printf("%s: caught up at frame %llu: %llu frames in %.1f s (%.2fx the game's speed)\n", tag,
                     static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame - from), so_far,
                     so_far > 0 ? static_cast<double>(frame - from) / so_far / recomp::FrameTiming::kRefreshHz : 0.0);
-        return finish();
+        return finish("anyway", spectating, frame, so_far);
     }
     bool said_waiting = false; // (the wait for inputs past the state logged)
     // When true came back: the frame to ask our cabinet from (Session::take_seat), 0 for the authority's own choice.
@@ -470,13 +571,31 @@ struct CatchUp {
     // out later than ours, then half again and a second, and it hands a cabinet over at most a minute ahead (it says not
     // yet past that): 20 s here keeps the ask inside it)
     static constexpr double kMeetMost = 20;
+    // (frames: the most the seats' inputs may be apart for "as far as every input is in" to count as caught up)
+    static constexpr uint64_t kSpreadMost = 30;
 
 private:
+    std::chrono::steady_clock::time_point bound_since{}; // (since when every input in has been run, the spread small)
     bool running = false;
     uint64_t run_from = 0;
     std::chrono::steady_clock::time_point run_at{};
-    bool finish() {
-        from = 0, said_waiting = false, running = false;
+    std::chrono::steady_clock::time_point said_at{}; // (the last progress line, and our frame then)
+    uint64_t said_frame = 0;
+    bool stuck_said = false;
+    std::string waiting; // (the rule that last said not yet, for the progress line)
+    // (ended: "caught" (caught up), "asked" (the cabinet asked for ahead), "anyway" (not gaining: taken anyway, or a
+    // spectator watching from there); into the game's stats)
+    bool finish(const char* ended, bool spectating, uint64_t frame, double seconds) {
+        char j[256];
+        std::snprintf(j, sizeof j,
+                      "{\"spectator\":%s,\"ended\":\"%s\",\"seconds\":%.1f,\"start_behind\":%llu,\"frames\":%llu,\"speed\":%.2f,"
+                      "\"restarts\":%d}",
+                      spectating ? "true" : "false", ended, seconds, static_cast<unsigned long long>(start_behind),
+                      static_cast<unsigned long long>(frame - from),
+                      seconds > 0 ? static_cast<double>(frame - from) / seconds / recomp::FrameTiming::kRefreshHz : 0.0,
+                      JoinLog::get().ended());
+        JoinLog::get().add(j);
+        from = 0, said_waiting = false, running = false, bound_since = {};
         return true;
     }
 };
@@ -705,10 +824,11 @@ inline uint64_t set_up_one_board(one_board::Game& game, const OneBoardSetUp& u) 
                 std::printf("%s: one board: the other cabinets' real packets put in as they come (the safety net)\n", tag);
             }
             u.ring->on_patch([net, local = u.local, at = &stays](std::size_t from, uint64_t seq, std::vector<uint8_t>& data) {
-                if (spoil && from != local && data.size() >= NodeCheck::kNodeBytes) {
+                if (spoil && from != local && data.size() >= NodeCheck::kNodeBytes && !m3::ring_pass(data)) {
                     if (spoiled.seq.load() == 0 && at->timing.frames() >= spoil) spoiled.from = from, spoiled.seq = seq;
                     const uint64_t first = spoiled.seq.load();
-                    if (first && seq >= first && seq < first + 2 * spoil_count && from == spoiled.from.load()) { // (a link's: every other number)
+                    // (a link's data frames: every third number, between a sync frame and the ring's second pass)
+                    if (first && seq >= first && seq < first + 3 * spoil_count && from == spoiled.from.load()) {
                         data[0x10B] ^= 0x40;
                         std::printf("node spoil: board %zu's packet %llu spoiled (frame %llu)\n", from, (unsigned long long)seq,
                                     (unsigned long long)at->timing.frames());

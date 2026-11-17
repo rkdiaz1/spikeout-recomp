@@ -114,7 +114,7 @@ private:
 
 CommBoard::CommBoard(std::unique_ptr<NetLink> link, const Options& options)
     : options_(options), link_(link ? std::move(link) : std::make_unique<LoopbackLink>()),
-      cpu_(std::make_unique<Cpu>(*this)), ram_(0x10000, 0), comm_(0x20000, 0) {}
+      cpu_(std::make_unique<Cpu>(*this)), ram_(0x10000, 0), comm_(0x20000, 0), late_(kLateTable, 0) {}
 
 CommBoard::~CommBoard() = default;
 
@@ -131,15 +131,15 @@ std::string CommBoard::disassemble(uint32_t addr, uint32_t* length) const {
 }
 
 std::string CommBoard::describe() const {
-    char buf[200];
+    char buf[260];
     std::snprintf(buf, sizeof buf,
                   "68000 board, %s, PC %06x, %llu cycles; status0 %04x, status1 %04x; IRQs 2:%llu 4:%llu 5:%llu "
-                  "6:%llu; packets %llu out, %llu in; set up as %s",
+                  "6:%llu; packets %llu out, %llu in, %llu second passes; set up as %s",
                   in_reset_ ? "held in reset" : "running", pc(), static_cast<unsigned long long>(cpu_cycles()),
                   io_[kIoStatus0], io_[kIoStatus0 + 1], static_cast<unsigned long long>(irqs_taken[2]),
                   static_cast<unsigned long long>(irqs_taken[4]), static_cast<unsigned long long>(irqs_taken[5]),
                   static_cast<unsigned long long>(irqs_taken[6]), static_cast<unsigned long long>(packets_sent),
-                  static_cast<unsigned long long>(packets_received), ram_[0x400] == 0 && ram_[0x401] == 0 ? "master" : "slave");
+                  static_cast<unsigned long long>(packets_received), static_cast<unsigned long long>(ring_passes), ram_[0x400] == 0 && ram_[0x401] == 0 ? "master" : "slave");
     return buf;
 }
 
@@ -239,9 +239,42 @@ void CommBoard::update_ipl() {
 
 // ---- Link ----
 
+// The ring's second pass (ring_second_pass), taken in as it comes, whatever the firmware is doing: it isn't the
+// firmware's. A slave `hop` nodes on from the master puts in its data frame's parts after its own hop (the nodes after
+// it and itself, which on the first pass came from last exchange), where the main board reads them, and passes it on a
+// node's part on, as the first pass; the master, its own pass come back, drops it.
+void CommBoard::take_passes() {
+    for (;;) {
+        const std::vector<uint8_t>* next = link_->peek();
+        if (!next || !ring_pass(*next)) return;
+        const std::vector<uint8_t> pass = link_->receive();
+        if (!slave()) continue;
+        auto field = [&](std::size_t k) { return static_cast<std::size_t>(pass[9 + 2 * k] | pass[10 + 2 * k] << 8); };
+        const std::size_t hop = pass[8], offset = field(0), size = field(1), part = field(2);
+        const std::size_t stream = pass.size() - kRingPassHeader;
+        if (part == 0 || offset < part || offset >= 0x10000u) continue;
+        const uint8_t* in = pass.data() + kRingPassHeader;
+        uint8_t* comm = options_.double_buffer ? bank(true) : bank(false);
+        const std::size_t from = hop * part, to = std::min({stream, size, 0x10000u - offset});
+        if (options_.slave_table_late && late_size_) { // (into the table being built: shown at the next data frame)
+            const std::size_t end = std::min<std::size_t>(to, late_size_);
+            if (from < end) std::memcpy(late_.data() + from, in + from, end - from);
+        } else if (from < to) std::memcpy(comm + offset + from, in + from, to - from);
+        // (on, as a slave's data frame: its own part first, then what came, a node's part on)
+        std::vector<uint8_t> on(pass.begin(), pass.begin() + static_cast<std::ptrdiff_t>(kRingPassHeader));
+        on[8] = static_cast<uint8_t>(hop + 1);
+        const uint8_t* own = bank(false) + (offset - part);
+        on.insert(on.end(), own, own + part);
+        if (stream > part) on.insert(on.end(), in, in + (stream - part));
+        link_->send(on.data(), on.size());
+        ++ring_passes;
+    }
+}
+
 void CommBoard::deliver_receive() {
-    if (!receive_enabled_ || !receive_armed_) return;
     link_->set_time(rescale(cpu_cycles(), options_.cpu_hz, options_.main_hz));
+    take_passes();
+    if (!receive_enabled_ || !receive_armed_) return;
     std::vector<uint8_t> packet = link_->receive();
     if (packet.empty()) return; // nothing yet (or the link is down)
     ++packets_received;
@@ -259,6 +292,33 @@ void CommBoard::deliver_receive() {
         if (at < out) std::memcpy(frame.data() + at, packet.data(), std::min(size, out - at));
         send_done_ = cpu_cycles() + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(at));
         transmit(frame.data(), out);
+        if (options_.slave_table_late && options_.ring_second_pass && data_frame && size <= kLateTable) {
+            // (slave_table_late: the main board shown the table of the exchange before, the one built since; this
+            // exchange's built in its place, from this frame and its second pass; the first one: as it came)
+            const bool had = late_size_ != 0;
+            if (had) std::memcpy(comm + recv_offset_, late_.data(), std::min<std::size_t>(size, late_size_));
+            std::memcpy(late_.data(), packet.data(), size);
+            late_size_ = static_cast<uint32_t>(size);
+            if (had) {
+                set_irq(6, true); // receive complete
+                return;
+            }
+        }
+    } else if (options_.ring_second_pass && !slave() && data_frame && options_.ring_forwarding) {
+        // The master's data frame come back round, every node's part of this exchange in it: on once more
+        // (ring_second_pass), for the slaves' parts after their own.
+        const std::size_t out = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
+        const std::size_t part = std::size_t{recv_offset_} - send_offset_;
+        std::vector<uint8_t> pass(kRingPassHeader);
+        std::copy(std::begin(kRingPassMagic), std::end(kRingPassMagic), pass.begin());
+        pass[8] = 1;
+        const uint16_t fields[3] = {recv_offset_, static_cast<uint16_t>(recv_size_ & 0x7FFFu), static_cast<uint16_t>(part)};
+        for (int k = 0; k < 3; ++k) pass[9 + 2 * k] = static_cast<uint8_t>(fields[k]), pass[10 + 2 * k] = static_cast<uint8_t>(fields[k] >> 8);
+        pass.insert(pass.end(), bank(false) + send_offset_, bank(false) + send_offset_ + part);
+        pass.insert(pass.end(), packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(std::min(packet.size(), out - part)));
+        link_->set_time(rescale(cpu_cycles(), options_.cpu_hz, options_.main_hz));
+        link_->send(pass.data(), pass.size());
+        ++ring_passes;
     }
     std::memcpy(comm + recv_offset_, packet.data(), size);
     set_irq(6, true); // receive complete
@@ -542,6 +602,15 @@ void CommBoard::state(State& s) {
     s.io(frame_irq5_left_), s.io(recv_offset_), s.io(recv_size_), s.io(send_offset_), s.io(send_size_);
     s.io(receive_enabled_), s.io(receive_armed_), s.io(send_done_), s.io(send_irq_armed_), s.io(send_waiting_);
     s.io(irqs_taken), s.io(packets_sent), s.io(packets_received);
+    // (Options::slave_table_late's table, 2026-11-16: a state from before has none, the next data frame shown as it
+    // comes, the table built from there)
+    if (s.loading() && !s.tagged("commboard late")) {
+        late_size_ = 0;
+        return;
+    }
+    if (!s.loading()) s.tag("commboard late");
+    s.fixed(late_), s.io(late_size_);
+    if (late_size_ > kLateTable) late_size_ = 0; // (safe loading)
 }
 
 } // namespace m3

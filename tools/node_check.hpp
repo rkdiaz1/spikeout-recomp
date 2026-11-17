@@ -12,6 +12,7 @@
 
 #include "net/compress.hpp"
 #include "net/session.hpp"
+#include "runtime/netboard.hpp"
 
 #include <algorithm>
 #include <array>
@@ -70,7 +71,7 @@ public:
 
     // The ring's on_patch: a packet board `from` sends (number `seq` on its link), before it leaves.
     void patch(std::size_t from, uint64_t seq, std::vector<uint8_t>& data) {
-        if (data.size() < kNodeBytes) return;
+        if (data.size() < kNodeBytes || m3::ring_pass(data)) return;
         std::lock_guard guard(lock_);
         if (!run_again_ || from == local_) return;
         const auto s = real_.find(from);
@@ -87,7 +88,8 @@ public:
         if (!boards_) return;
         const std::size_t from = (to + boards_ - 1) % boards_;
         (void)at;
-        const bool data_frame = data.size() >= kNodeBytes; // (else a small sync frame: its hash alone)
+        // (else a small sync frame or the ring's second pass (m3::ring_pass): its hash alone)
+        const bool data_frame = data.size() >= kNodeBytes && !m3::ring_pass(data);
         const Whole whole_packet{static_cast<uint32_t>(data.size()), hash(data)};
         if (from == local_) { // (our own board's: to the others, once settled)
             Outgoing& out = outgoing_[seq]; // (a frame run again: its packet anew)

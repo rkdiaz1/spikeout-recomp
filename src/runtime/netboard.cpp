@@ -74,6 +74,10 @@ public:
         ++state_->taken[index_];
         return packet;
     }
+    const std::vector<uint8_t>* peek() override {
+        const auto& inbox = state_->inbox[index_];
+        return inbox.empty() || inbox.front().at > now_ ? nullptr : &inbox.front().data;
+    }
     bool loopback() const override { return state_->inbox.size() == 1; }
     void set_time(uint64_t main_cycles) override { now_ = main_cycles; }
     // The board's counts at its point (the packets go in the ring's part).

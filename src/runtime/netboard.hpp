@@ -39,6 +39,19 @@ namespace m3 {
 
 class State;
 
+// The ring's second pass (CommBoard, CommBoardOptions::ring_second_pass): a packet of the emulation's own, not the
+// firmware's, starting with these 8 bytes, then the hop from the master (1 byte), the data frame's receive offset,
+// receive size and a node's part (2 bytes each, little-endian), then the stream as the sender passes it on.
+inline constexpr uint8_t kRingPassMagic[8] = {'M', '3', 'R', 'I', 'N', 'G', 'P', '2'};
+inline constexpr std::size_t kRingPassHeader = 15;
+inline bool ring_pass(const uint8_t* data, std::size_t size) {
+    if (size < kRingPassHeader) return false;
+    for (std::size_t i = 0; i < 8; ++i)
+        if (data[i] != kRingPassMagic[i]) return false;
+    return true;
+}
+inline bool ring_pass(const std::vector<uint8_t>& p) { return ring_pass(p.data(), p.size()); }
+
 // What the board sends its segments over: the next cabinet in the ring,
 // receiving from the previous one.
 class NetLink {
@@ -47,6 +60,8 @@ public:
     virtual void send(const uint8_t* data, std::size_t size) = 0;
     // The next packet from the previous cabinet; empty if the link broke.
     virtual std::vector<uint8_t> receive() = 0;
+    // The packet receive() would give now, left in place (none: nullptr).
+    virtual const std::vector<uint8_t>* peek() = 0;
     // True when this cabinet is linked to itself (a ring of one).
     virtual bool loopback() const = 0;
     // The board's time in main board cycles, set before each send() and
@@ -63,6 +78,7 @@ class LoopbackLink : public NetLink {
 public:
     void send(const uint8_t* data, std::size_t size) override { queue_.emplace_back(data, data + size); }
     std::vector<uint8_t> receive() override;
+    const std::vector<uint8_t>* peek() override { return queue_.empty() ? nullptr : &queue_.front(); }
     bool loopback() const override { return true; }
     void state(State& s) override;
 

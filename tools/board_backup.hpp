@@ -366,6 +366,10 @@ public:
         ++next_;
         return data;
     }
+    const std::vector<uint8_t>* peek() override {
+        if (!pending_) pending_ = log_.get(next_);
+        return !pending_ || pending_->at > now_ ? nullptr : &pending_->data;
+    }
     bool loopback() const override { return false; }
     void set_time(uint64_t main_cycles) override { now_ = main_cycles; }
     void state(m3::State& s) override { s.tag("ring port"); }
@@ -468,8 +472,7 @@ struct Replay {
         };
         if (!wait_frame(timing.frames() + 1)) return std::nullopt;
         try {
-            c.resume_block(c.cpu.pc);
-            c.call(c.cpu.pc);
+            c.run(c.cpu.pc, true); // (Context::run: its loop restarts taken)
         } catch (const Stop&) {
         }
         if (over || !result) return std::nullopt;

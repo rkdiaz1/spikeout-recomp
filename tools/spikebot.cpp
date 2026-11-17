@@ -281,11 +281,8 @@ private:
         bool resume = true; // (from a loaded state: the snapshot's block)
         for (;;) {
             try {
-                if (resume) {
-                    serve();
-                    c_.resume_block(c_.cpu.pc);
-                }
-                c_.call(c_.cpu.pc);
+                if (resume) serve();
+                c_.run(c_.cpu.pc, resume); // (Context::run: resumed or called, its loop restarts taken)
                 stopped_ = "the reset code returned";
                 break;
             } catch (const Rewind& r) {
@@ -588,7 +585,7 @@ private:
         for (;;) {
             if (quit_) break;
             try {
-                b.c.resume_block(b.c.cpu.pc);
+                b.c.run(b.c.cpu.pc, true);
             } catch (const Rewound&) {
                 continue;
             } catch (const Quit&) {

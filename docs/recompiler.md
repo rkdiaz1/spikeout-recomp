@@ -47,6 +47,27 @@ outer call waits for that address, the frames in between return at once
 (`follow_return` says so) instead of running it as new code, which nested
 the scheduler one level deeper each time until the C++ stack ran out.
 
+**Jumps back to the main loop (2026-11-17).** The network frame
+(`link_frame`, `0x6D758`) waits for the other cabinets by jumping back
+to the top of the main loop (`b 0x118AC`) without returning. The lifter
+made that a tail call into a copy of the main loop inside `f_6d758`, so
+the C++ stack and the return stack grew by one frame for every frame
+the game held: the return stack filled with `0x119CC`, and a long
+network game (a player's report, about 220,000 frames, many of them
+held) stopped with a stack overflow (`0xC00000FD` on Windows, with no
+message). Now a hook at `0x118AC` (`games/spikeofe_hooks.cpp`,
+`kLoopTop`) throws `recomp::LoopRestart` when it is reached inside a
+call (`Context::restart_allowed`: inside `Context::run`, no task being
+resumed, something on the return stack). `Context::run` catches it,
+empties the return stack and starts again at `0x118AC` from the top. The
+block's tick is taken back before the throw and counted again when the
+hook runs at the restart (`restart_landed` checks it is the same
+block), so cycles, interrupts and every hash stay the same:
+reports replayed, the test suites, and save states all match the run
+without it (`SPIKEOUT_NO_LOOP_RESTART=1` turns it off). Runners call
+`Context::run(pc, resume)` instead of the block function. This changes no
+network play result; it only keeps the stack flat.
+
 Register state lives in `ppc::CpuState` (`s.gpr[n]`, `s.cr`, `s.xer`, ...);
 flags are computed by the small inline helpers in `recomp/guest.hpp`.
 Every instruction's disassembly is kept as a comment.

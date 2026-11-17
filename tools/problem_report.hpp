@@ -4,7 +4,8 @@
 //   problem-<time>-<kind>.zip.locked   (gamerun --unlock FILE --report-key KEY gives the zip back)
 // Kinds: desync (this machine's boards differ from another's), node (a made packet differs from its real one: one board a
 // PC), hang (the game stood still kHangSeconds), stall (a frame over kStallMs late), crash (the run before crashed),
-// startup (the start stood still: Watchdog::set_step), hang-alone (a hang in a game alone, no network game).
+// startup (the start stood still: Watchdog::set_step), hang-alone (a hang in a game alone, no network game), join (a
+// joiner or spectator still catching up after 20 s: tools/net_frame.hpp CatchUp::on_stuck, what holds it).
 // In the zip: problem.txt (what, when, the counts), the log's last lines, the newest network game's recording
 // (saves/net-game-*.inputs and .state), and for a hang every thread's stack (hang-stacks.txt; Windows: hang.dmp too).
 // Report a problem takes the newest few in (tools::report::make_report); part 2 sends them by itself if the player

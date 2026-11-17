@@ -177,6 +177,46 @@ void Context::resume_block(uint32_t pc) {
     for (;;) jump(returned_to);
 }
 
+void Context::run(uint32_t pc, bool resume) {
+    struct Leave {
+        bool& flag;
+        ~Leave() { flag = false; }
+    } leave{in_run_};
+    in_run_ = true;
+    for (;;) {
+        try {
+            if (resume) resume_block(pc);
+            call(pc);
+            return;
+        } catch (const LoopRestart& r) { // (its frames gone: on from the loop's top with none waiting)
+            pc = r.pc, resume = true;
+            return_depth_ = 0;
+        }
+    }
+}
+
+void Context::restart_at(uint32_t pc, uint32_t block_cycles) {
+    restart_blocks_ = blocks, restart_cycles_ = cycles_;
+    --blocks, cycles_ -= block_cycles; // (the block's tick, counted again as it is resumed)
+    restart_pending_ = true;
+    ++restarts;
+    throw LoopRestart{pc};
+}
+
+void Context::restart_landed() {
+    if (!restart_pending_) return;
+    restart_pending_ = false;
+    if (blocks == restart_blocks_ && cycles_ == restart_cycles_) return;
+    static bool said = false; // (the hook's block's cycles not as given: the clock put where it was, said once)
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "loop restart at %08x: the block's tick was not the one taken back (%llu/%llu blocks, %llu/%llu cycles)\n",
+                     cpu.pc, static_cast<unsigned long long>(blocks), static_cast<unsigned long long>(restart_blocks_),
+                     static_cast<unsigned long long>(cycles_), static_cast<unsigned long long>(restart_cycles_));
+    }
+    blocks = restart_blocks_, cycles_ = restart_cycles_;
+}
+
 bool Context::follow_return(uint32_t next) {
     for (int hops = 0; returned_to != next; ++hops) {
         // An outer call waits for this address: unwind to it.

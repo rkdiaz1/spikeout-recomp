@@ -52,6 +52,7 @@ inline uint64_t build_id(const m3::RomSet& roms, std::size_t functions, const m3
         mix(link->irq5_per_frame), mixd(link->irq5_phase), mix(link->irq5_on_e0), mix(link->slave_irq5_per_frame);
         mixd(link->link_cycles_per_byte), mix(link->send_waits_for_receive), mix(link->ring_forwarding);
         mix(link->double_buffer), mixd(link->main_frame_hz), mix(link->main_hz), mix(link->link_status);
+        mix(link->ring_second_pass), mix(link->slave_table_late);
     }
     for (std::size_t r = 0; r < static_cast<std::size_t>(m3::RomRegionId::Count); ++r) {
         const auto& region = roms.region(static_cast<m3::RomRegionId>(r));

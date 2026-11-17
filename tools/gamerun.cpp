@@ -122,7 +122,9 @@
 // --net-other-bank, --link-byte-cycles C (68000 cycles a byte on the wire),
 // --net-irq5-per-frame N, --net-slave-irq5-per-frame N, --net-irq5-phase F,
 // and the ring model's parts: --net-ring-forwarding off, --net-double-buffer
-// off; --net-old-link puts the link back as it was before the ring model
+// off, --net-ring-pass off and --net-slave-late off (each cabinet's view of the
+// table as before 2026-11-16: CommBoardOptions::slave_table_late);
+// --net-old-link puts the link back as it was before the ring model
 // (linked games at 2/(N+1) speed). --net-host-trace FRAME:N adds the main
 // board's accesses to the network board, by time, to the report.
 // --rollback-probe FRAME:N[:speed] measures what rollback would cost over N
@@ -441,6 +443,8 @@ struct Options {
     double irq5_phase = 0; // --net-irq5-phase F (a part of a frame)
     bool ring_forwarding = m3::CommBoardOptions().ring_forwarding; // --net-ring-forwarding on/off
     bool double_buffer = m3::CommBoardOptions().double_buffer; // --net-double-buffer on/off
+    bool ring_second_pass = m3::CommBoardOptions().ring_second_pass; // --net-ring-pass on/off
+    bool slave_table_late = m3::CommBoardOptions().slave_table_late; // --net-slave-late on/off
     bool old_link = false; // --net-old-link: the link before the ring model (CommBoardOptions::use_old_link)
 };
 
@@ -1497,6 +1501,8 @@ m3::CommBoardOptions link_options(const Options& o) {
     options.irq5_phase = o.irq5_phase;
     options.ring_forwarding = o.ring_forwarding;
     options.double_buffer = o.double_buffer;
+    options.ring_second_pass = o.ring_second_pass;
+    options.slave_table_late = o.slave_table_late;
     if (o.old_link) options.use_old_link();
     options.link_cycles_per_byte = o.link_cycles_per_byte;
     options.send_waits_for_receive = o.send_waits_for_receive;
@@ -2992,8 +2998,7 @@ void run(Machine& m, tools::Turns& turns) {
     const auto start = std::chrono::steady_clock::now();
     for (bool resume = m.loaded;;) {
         try {
-            if (resume) m.c.resume_block(m.c.cpu.pc);
-            m.c.call(m.c.cpu.pc);
+            m.c.run(m.c.cpu.pc, resume); // (Context::run: resumed or called, its loop restarts taken)
             m.why = "the reset code returned";
         } catch (const Rewound&) { // (--rollback-test: back at an earlier frame, on from there)
             resume = true;
@@ -3977,6 +3982,8 @@ int main(int argc_given, char** argv_given) {
         else if (arg == "--net-irq5-per-frame" && i + 1 < argc) o.irq5_per_frame = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
         else if (arg == "--net-ring-forwarding" && i + 1 < argc) o.ring_forwarding = std::string(argv[++i]) != "off";
         else if (arg == "--net-double-buffer" && i + 1 < argc) o.double_buffer = std::string(argv[++i]) != "off";
+        else if (arg == "--net-ring-pass" && i + 1 < argc) o.ring_second_pass = std::string(argv[++i]) != "off";
+        else if (arg == "--net-slave-late" && i + 1 < argc) o.slave_table_late = std::string(argv[++i]) != "off";
         else if (arg == "--net-old-link") o.old_link = true;
         else if (arg == "--net-irq5-phase" && i + 1 < argc) o.irq5_phase = std::strtod(argv[++i], nullptr);
         else if (arg == "--net-slave-irq5-per-frame" && i + 1 < argc) o.slave_irq5_per_frame = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
@@ -4564,7 +4571,9 @@ int main(int argc_given, char** argv_given) {
                 return 1;
             }
             join_state = std::move(*state);
-            g_catching_up = o.net_catch_up && !o.net_spectate; // (--net-catch-up: the cabinet once caught up)
+            // (--net-catch-up: the cabinet once caught up; a spectator catches up too, as the window's does (since issue
+            // 9), only taking no cabinet: gamerun's spectators left it out, the window's code untested by them)
+            g_catching_up = o.net_catch_up;
             std::printf("net: running on from the host's frame %llu (%zu KB, %zu KB packed)\n",
                         static_cast<unsigned long long>(*start->state_frame), join_state.size() / 1024, start->state.size() / 1024);
         }
@@ -4646,7 +4655,7 @@ int main(int argc_given, char** argv_given) {
         else if (o.link_dump) // each data frame's first part, the sender's own node (comm RAM 0x100-0x9FF)
             ring->on_send([file = std::shared_ptr<std::FILE>(std::fopen(o.link_dump, "wb"), std::fclose),
                            lock = std::make_shared<std::mutex>()](std::size_t from, uint64_t at, const std::vector<uint8_t>& data) {
-                if (!file || data.size() < kNodeBytes) return; // (the small sync frames)
+                if (!file || data.size() < kNodeBytes || m3::ring_pass(data)) return; // (the small sync frames, second passes)
                 const uint32_t head[2] = {static_cast<uint32_t>(from),
                                           static_cast<uint32_t>(at / recomp::FrameTiming().frame_cycles())};
                 std::lock_guard guard(*lock);

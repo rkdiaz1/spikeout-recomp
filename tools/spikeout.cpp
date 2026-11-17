@@ -1477,6 +1477,9 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             // player left, its inputs stopped where they did), our cabinet then.
             // (tools/net_frame.hpp; Auto may go to one board for a machine that isn't gaining)
             if (index == shown && shared.catching_up) {
+                // (a catch-up going on past 20 s: a "join" problem report, its timeline and recording, as a stall's)
+                if (!catch_up.on_stuck && shared.problems)
+                    catch_up.on_stuck = [&shared](const std::string& what, uint64_t at) { shared.problems->note("join", what, at); };
                 const bool done = catch_up.frame_end(*shared.netplay, shared.boards, shown, shared.spectating, frame, "spikeout");
                 shared.catch_up_behind = catch_up.behind; // (for the loading screen)
                 shared.catch_up_start = catch_up.start_behind;
@@ -1694,8 +1697,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
     for (bool resume = loaded;;) {
         try {
             if (!load_error.empty()) throw recomp::GuestError(c.cpu.pc, "save state " + load_error);
-            if (resume) c.resume_block(c.cpu.pc);
-            c.call(c.cpu.pc);
+            c.run(c.cpu.pc, resume); // (Context::run: resumed or called, its loop restarts taken)
             why = "the reset code returned";
         } catch (const tools::rollback::Rewound&) { // (rollback: on from this board's snapshot)
             resume = true;
@@ -3690,6 +3692,9 @@ int main(int argc, char** argv) {
                 if (shared.stage_ids_seen.load() >> n & 1) j += (first_id ? "" : ",") + std::to_string(n), first_id = false;
             j += "]";
         }
+        // (each catch-up this game, as it ended: player or spectator, how, how long, from how far, how fast; restarts:
+        // a spectator's Left/Right starting it again)
+        j += ",\"joins\":" + tools::net_frame::JoinLog::get().take_json();
         j += ",\"node_check\":" + json_text(netgame->play->node_check().report()) + ",\"problems\":{";
         bool first = true;
         for (const auto& [kind, n] : problems.counts_by_kind()) j += (first ? "" : ",") + json_text(kind) + ":" + std::to_string(n), first = false;
@@ -5261,6 +5266,15 @@ int main(int argc, char** argv) {
             if (!asked && shown_number[0] >= 300) {
                 asked = true;
                 net_join_code(test_join);
+                to_room();
+            }
+        }
+        // (SPIKEOUT_TEST_WATCH=CODE: the same, watching it, as Watch by code does)
+        if (static const char* test_watch = std::getenv("SPIKEOUT_TEST_WATCH"); test_watch && *test_watch && !netgame) {
+            static bool asked = false;
+            if (!asked && shown_number[0] >= 300) {
+                asked = true;
+                net_watch_code(test_watch);
                 to_room();
             }
         }

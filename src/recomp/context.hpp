@@ -190,6 +190,26 @@ public:
     // the caller's return site, as the CPU would, for as long as the game
     // runs. Throws as call() does.
     [[noreturn]] void resume_block(uint32_t pc);
+
+    // A game's main loop that a routine leaves by a branch back to the loop's top (Spikeout's link_frame, holding a
+    // frame back: `b 0x118AC`), not a return: the CPU just goes on there, but here the branch runs the loop again as a
+    // call inside the one still running, a C++ frame more each time, never given back (a long linked game's stack
+    // overflowed, 2026-11-16). A hook at the loop's top (the game's) calls restart_at when the code is nested: this
+    // block's tick taken back and the C++ frames dropped (LoopRestart), run() going on from the block with none
+    // waiting, as after a state's load. The guest's own state is untouched: the game runs as before, cycle for cycle.
+    // Only inside run(), with a scheduler (not code run aside) and outside any exception.
+    struct LoopRestart {
+        uint32_t pc;
+    };
+    // Run the game from `pc`: resumed there (resume, as resume_block) or called (as call). Returns when the code
+    // returns (call's); throws as they do, a LoopRestart taken here.
+    void run(uint32_t pc, bool resume);
+    bool restart_allowed() const { return in_run_ && scheduler_ != nullptr && resume_.empty() && return_depth_ > 0; }
+    // From the loop top's hook, after its block's tick of `block_cycles`: that tick taken back, the frames dropped.
+    [[noreturn]] void restart_at(uint32_t pc, uint32_t block_cycles);
+    // From the same hook, on every visit: a restart landed as it should (the tick counted once); else said, once.
+    void restart_landed();
+    uint64_t restarts = 0; // (loop restarts, for reports)
     // Game-specific observers (m3::GameSpec::hooks): the generated code calls
     // hook(pc) at the start of each such block, after its tick, before its
     // instructions. They read the guest's state and never change it, so the
@@ -322,6 +342,9 @@ private:
     std::vector<uint32_t> resume_;
     std::array<uint32_t, 4096> return_stack_{};
     size_t return_depth_ = 0;
+    bool in_run_ = false;          // (run())
+    bool restart_pending_ = false; // (restart_at: its block's tick to be counted again, once)
+    uint64_t restart_cycles_ = 0, restart_blocks_ = 0;
 
     uint64_t cycles_ = 0;
     uint64_t next_check_ = 0; // cycle at which tick() calls slow_tick()

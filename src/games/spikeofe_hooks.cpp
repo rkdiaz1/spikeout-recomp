@@ -55,6 +55,11 @@ constexpr uint32_t kVblankLoop = 0x36E08;
 // (0x36F24), the vblank's other byte changing (0x36F44: -32709(r13), read into r3 at 0x36F40).
 constexpr uint32_t kWordLoop = 0x36EF8, kDecLoop = 0x36F24, kIdleLoop = 0x36F44;
 std::atomic<bool> idle_skip{std::getenv("SPIKEOUT_NO_IDLE_SKIP") == nullptr}; // (tests: SPIKEOUT_NO_IDLE_SKIP=1 off)
+// The main loop's top (0x118AC, 8 cycles: lwz, addi, stw ... as the lifter counts its block), where link_frame
+// (0x6D758) branches back when it holds a frame back (b 0x118AC after main_after_link, 0x36E94): the branch nests the
+// loop in a C++ call that never returns (recomp::Context::restart_at). Off with SPIKEOUT_NO_LOOP_RESTART=1 (tests).
+constexpr uint32_t kLoopTop = 0x118AC, kLoopTopCycles = 8;
+const bool loop_restart = std::getenv("SPIKEOUT_NO_LOOP_RESTART") == nullptr;
 constexpr uint32_t kNameTables = 0xF10F8000, kNameTableSize = 0x2000;
 constexpr uint16_t kBlank = 0x20; // the tile the clear flag fills with
 // The staff credits' set-up fills their names' column (layer 0, 28 x 64
@@ -211,6 +216,11 @@ void clear(recomp::Context& c) {
 
 namespace {
 void hook(recomp::Context& c, uint32_t pc) {
+    if (pc == kLoopTop) { // (the main loop's top: a branch back to it from link_frame dropped its C++ frames)
+        c.restart_landed();
+        if (loop_restart && c.restart_allowed()) c.restart_at(pc, kLoopTopCycles);
+        return;
+    }
     if (pc == kDrawHook) draw(c);
     else if (pc == kFillHook) fill(c);
     else if (pc == kCopyHook) copy(c);

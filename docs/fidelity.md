@@ -797,6 +797,61 @@ What the firmware's handlers settle (`hardware-notes.md` has the detail):
   network play (`tools::build_id`), so machines with different ones can't
   join each other ("a different game or build", tested with
   `--net-old-link` on one side).
+- **The Communication error: each cabinet's view of the table (2026-11-16;
+  `CommBoardOptions::ring_second_pass` and `slave_table_late`, both on by
+  default; `gamerun --net-ring-pass off --net-slave-late off` for the ring
+  model as it was).** Players' reports (preview6 and before, issues 32 and
+  33) showed "Communication error !! Please call service staff. (code:
+  0x 1)" at an area change. Report 3612 (two cabinets, LAN) replays to it
+  exactly (`gamerun --net-replay`, every recorded RAM hash before it the
+  same): the game's own check of the cabinets against each other
+  (`0x74458`, bit 0 "incoherent Gpos": the 12 entries at node `+0x114` of a
+  cabinet's own node and its copy of the other's must agree) failed after
+  an area change.
+  What the game needs: each cabinet reads every node, its own too, from
+  what came over the link (`0xC0001908` and on, a node's part `0xC00` a
+  slot); the shared world is the same on every cabinet count for count (page
+  hashes of two cabinets' RAM by logic count: every shared page equal at
+  every count, both models below), but a mode change (`0x4B4C0`, from the
+  main loop) is taken from what the link shows, and the master runs a logic
+  count ahead of the slaves. So every cabinet has to see the same nodes at
+  the same count of its own: a slave the table the master saw a count
+  before, one exchange later. The ring model gave a slave the master's part
+  of this exchange (a count fresher than the master's own view of itself)
+  and its own of the one before (as the master saw it): usually harmless,
+  but at an area change a slave's player set off the cabinets switched a
+  count apart, wrote their positions at different counts, and Gpos failed.
+  Tried first and withdrawn: every cabinet the whole table of the same
+  exchange (as Supermodel's `SimNetBoard`: `ring_second_pass` alone). It
+  fixed report 3612 and passed every test suite, but replaying preview6's
+  40 problem-bundle games (`Z:\Emu\spikeout-reports\replay`, gamerun
+  `--net-replay` of each game's recording, on-screen errors watched)
+  showed 9 games with the error where the ring model had 2: with views
+  equal by frame the cabinets switched in the same frame, a count apart.
+  The model now: the master passes the data frame that comes back round
+  (every node's part of this exchange) on once more, as a packet of the
+  emulation's own (`m3::ring_pass`: a magic, the hop, the data frame's
+  receive offset, size and node's part), each slave putting it into the
+  table it is building (no IRQ, the firmware not involved) and passing it
+  on, the master dropping it when it comes back; a slave's main board is
+  shown that table at the next data frame (`CommBoard::late_`, in save
+  states, `kStateFormat` 3, and rollback's snapshots). The 40 games:
+
+  | link | games with the Communication error |
+  |---|---|
+  | ring model (preview6) | 2 (report 3612 at 27480; a "hang" report's game at 217470, unreported) |
+  | every cabinet the same exchange (withdrawn) | 9 |
+  | every cabinet the master's view at the same count (now) | 0 |
+
+  The ring model's two, replayed as they were (every recorded RAM hash the
+  same up to the error), run to their recordings' ends with no error now.
+  Then the next 82 games (preview6's reports to 2026-11-17, each game's
+  longest recording): the ring model 7 with the error (frames 8190 to
+  289650; three bundles reported it, four were reported as a hang, a stall
+  or a desync), now 0; every one of the 82 ran to its end both ways.
+  The cabinets' counts keep the ring model's relation (the master a count
+  ahead), so one board a PC's hand-backs (`tools/one_board.hpp`, `ahead`)
+  are unchanged. Part of the build's id for network play.
 - **How late a packet may arrive (measured 2026-10-25, with IRQ 5 once a
   frame and the wire at 4 MB/s: the limit is to measure again).** The real link is
   a cable, so a packet takes next to no time; ours adds a delay in game

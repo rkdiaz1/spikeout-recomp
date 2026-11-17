@@ -92,6 +92,21 @@ struct CommBoardOptions {
     // reads came in last exchange, and what it and they write goes out with
     // the next swap. See docs/fidelity.md.
     bool double_buffer = true;
+    // Every cabinet sees the table the master saw at the same logic count (2026-11-16, docs/fidelity.md, "The
+    // Communication error: each cabinet's view of the table"). The master runs a count ahead of the slaves; each
+    // cabinet's game reads the other nodes from what came over the link, and the game's mode changes (an area's start,
+    // the cabinets' positions compared: Gpos) need every cabinet to see the same nodes at the same count. Two parts:
+    // ring_second_pass: the master passes the data frame that comes back round (every node's part of this exchange)
+    // on once more, as a packet of the emulation's own (m3::ring_pass), each slave taking it in silently (no IRQ, the
+    // firmware not involved) and passing it on: the whole table of the exchange at every slave.
+    // slave_table_late: a slave's main board shown that table one exchange later, as the master saw it (a count
+    // earlier by the slave's own count: the same count). Before (both off), a slave saw the master's part of this
+    // exchange and its own of the one before: its view of the master a count ahead of the master's own, of itself as
+    // the master's; at a mode change the cabinets could switch a count apart and Gpos failed ("Communication error",
+    // code 1; report 3612 and 1 in 40 replayed games). The second pass alone (every cabinet the same exchange): 9 in
+    // 40. Both: none.
+    bool ring_second_pass = true;
+    bool slave_table_late = true;
 
     // These three (ring_forwarding, double_buffer, slave_irq5_per_frame 0)
     // are the ring model, the default since 2026-10-26: linked games at an
@@ -101,6 +116,8 @@ struct CommBoardOptions {
         ring_forwarding = false;
         double_buffer = false;
         slave_irq5_per_frame = kSame;
+        ring_second_pass = false;
+        slave_table_late = false;
     }
     double main_frame_hz = 57.524160;
     uint64_t main_hz = 166'000'000; // the main board's CPU clock
@@ -140,6 +157,7 @@ public:
     std::string disassemble(uint32_t addr, uint32_t* length = nullptr) const;
     std::array<uint64_t, 8> irqs_taken{}; // by level
     uint64_t packets_sent = 0, packets_received = 0;
+    uint64_t ring_passes = 0; // (second-pass packets sent, Options::ring_second_pass: not in save states)
 
     // The 68000's accesses to its control and I/O registers, the first
     // `trace_limit` of them: what the firmware does with the hardware.
@@ -192,6 +210,7 @@ private:
     void set_irq(int level, bool on);
     void update_ipl();
     void run_until(uint64_t cpu_cycle);
+    void take_passes();
     void deliver_receive();
     bool forwards(std::size_t size) const;
     bool slave() const { return ram_[0x400] != 0 || ram_[0x401] != 0; } // the link role the main board set
@@ -208,6 +227,12 @@ private:
     std::unique_ptr<Cpu> cpu_;
     WatchedVector<uint8_t> ram_;  // 64 KB, 68000 byte order (big-endian)
     WatchedVector<uint8_t> comm_; // 128 KB, two banks, 68000 byte order
+    // Options::slave_table_late: a slave's table of this exchange as it is built (its data frame, then the second
+    // pass), shown to its main board at the next data frame; late_size_ its bytes (0: none yet). In save states and
+    // rollback's snapshots, as the board's memory.
+    static constexpr std::size_t kLateTable = 0x8000;
+    WatchedVector<uint8_t> late_;
+    uint32_t late_size_ = 0;
     std::array<uint16_t, 128> io_{};
     std::array<uint16_t, 128> ctrl_{};
     uint16_t commbank_ = 0;

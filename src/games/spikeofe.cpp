@@ -152,7 +152,7 @@ constexpr std::array kHooks = {0x00009628u, 0x00007E34u, 0x00008230u, 0x0000795C
                                0x00033A6Cu, 0x00032578u, 0x0000C670u, 0x0005AB18u, 0x0005A874u,
                                0x0006DA90u, 0x00021C88u, 0x00022750u, 0x00026070u, 0x000492ACu, 0x00036E94u,
                                0x00036E04u, 0x00062AF4u, 0x00036E08u, 0x00004DD8u, 0x00036F24u,
-                               0x00036EF8u, 0x00036F44u};
+                               0x00036EF8u, 0x00036F44u, 0x000118ACu};
 
 } // namespace
 

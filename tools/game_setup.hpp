@@ -145,7 +145,8 @@ private:
 // seen there: the undo then). The rest of an update (the window, network play, the menu) keeps saves as they are.
 // kStateFormat: raised whenever what board_state writes changes shape (a device's state, a section).
 // 2: widescreen's tile sides 26 columns a side (21:9), 12 before (format 1's still load: m3::TileSides::state).
-inline constexpr uint64_t kStateFormat = 2;
+// 3: the network board's slave table (m3::CommBoardOptions::slave_table_late; format 2's still load: CommBoard::state).
+inline constexpr uint64_t kStateFormat = 3;
 inline uint64_t code_id() {
     static const uint64_t id = [] {
         uint64_t h = 0xCBF29CE484222325ull;
