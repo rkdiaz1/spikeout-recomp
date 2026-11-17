@@ -132,6 +132,11 @@ public:
     // (sub: a line under the title; steps: what the wait is made of, `step` the one now: those before it ticked off)
     void set_loading(const std::string& title, int percent = -1, const std::string& detail = {}, const std::string& sub = {},
                      const std::vector<std::string>& steps = {}, int step = -1);
+    // The loading screen as a question (the start's ROM set): buttons under its title, `selected` lit (none: no
+    // buttons), its detail line a problem (red). The caller moves the selection; loading_button_at: the button under
+    // a point in the window's coordinates (a mouse's), -1 none.
+    void set_loading_buttons(const std::vector<std::string>& buttons, int selected = -1, bool problem = false);
+    int loading_button_at(float x, float y) const;
     // A spectator's banner at the bottom: whom it watches and the keys that change it ("WATCHING KENJI (2P)  LEFT RIGHT /
     // LB RB  another player"; the owner's choice of the mockups); empty: none.
     // (`note`: that message instead, plain: "switching needs a faster device")

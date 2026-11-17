@@ -290,10 +290,16 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         "#lsub { display: block; margin-top: 4dp; font-size: 20dp; color: #8d939e; } "
         "#lsteps { display: block; margin-top: 22dp; font-size: 20dp; color: #5d636e; } "
         "#lsteps .done { color: #5fd35f; } #lsteps .now { color: #ffffff; } #lsteps .sep { color: #3d424c; padding: 0 10dp; } "
+        // (the loading screen as a question, Menu::set_loading_buttons: the start's ROM set; the reason in red)
+        "#loading .detail.problem { color: #ff7a6a; } "
+        "#lbtns { display: block; margin-top: 26dp; } "
+        "#lbtns .b { display: block; width: 360dp; margin: 10dp auto 0 auto; padding: 7dp 0; font-size: 26dp; color: #c8ccd4; "
+        "border: 2dp #3a3f4a; border-radius: 8dp; background-color: #14171e; } "
+        "#lbtns .b.sel { color: #0b0d12; background-color: #ffd34a; border-color: #000000; } "
         "</style></head><body><div id=\"loading\"><div class=\"box\"><span class=\"title\" id=\"ltitle\"></span>"
         "<span id=\"lsub\"></span>"
         "<div id=\"lbar\"><div id=\"lfill\"><div class=\"gt\"></div><div class=\"gb\"></div></div></div><span id=\"lpct\"></span>"
-        "<span class=\"detail\" id=\"ldetail\"></span><div id=\"lsteps\"></div></div></div>"
+        "<span class=\"detail\" id=\"ldetail\"></span><div id=\"lsteps\"></div><div id=\"lbtns\"></div></div></div>"
         "<div id=\"swcover\"><span class=\"t\" id=\"swtext\"></span></div><div id=\"corner\"><div id=\"fps\"></div></div><div id=\"net\"></div><div id=\"watchb\"></div></body></rml>");
     return true;
 }
@@ -412,6 +418,30 @@ void Menu::set_loading(const std::string& title, int percent, const std::string&
     }
     loading_shown_ = shown;
     show_corner();
+}
+
+void Menu::set_loading_buttons(const std::vector<std::string>& buttons, int selected, bool problem) {
+    if (!impl_->fps) return;
+    if (Rml::Element* e = impl_->fps->GetElementById("ldetail")) e->SetClass("problem", problem);
+    if (Rml::Element* e = impl_->fps->GetElementById("lbtns")) {
+        std::string rml;
+        for (std::size_t i = 0; i < buttons.size(); ++i)
+            rml += std::string("<div class=\"b") + (static_cast<int>(i) == selected ? " sel" : "") + "\">" + escape(buttons[i]) + "</div>";
+        e->SetInnerRML(rml);
+    }
+}
+
+int Menu::loading_button_at(float x, float y) const {
+    if (!impl_->fps || !loading_shown_) return -1;
+    Rml::Element* list = impl_->fps->GetElementById("lbtns");
+    if (!list) return -1;
+    const float d = SDL_GetWindowPixelDensity(impl_->window); // (the context's pixels: the window's points times it)
+    for (int i = 0; i < list->GetNumChildren(); ++i) {
+        Rml::Element* b = list->GetChild(i);
+        const Rml::Vector2f o = b->GetAbsoluteOffset(Rml::BoxArea::Border), s = b->GetBox().GetSize(Rml::BoxArea::Border);
+        if (x * d >= o.x && y * d >= o.y && x * d < o.x + s.x && y * d < o.y + s.y) return i;
+    }
+    return -1;
 }
 
 void Menu::set_switch_cover(const std::string& text) {

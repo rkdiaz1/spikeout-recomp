@@ -1841,9 +1841,13 @@ std::string rom_problem(const std::filesystem::path& path) {
     return path_utf8(p.root_path()) + "..." + sep + path_utf8(parts[parts.size() - 2]) + sep + path_utf8(parts.back());
 }
 
-// The ROM set chosen in the window (no location set yet, or the one set can't be used), drawn as the no-GPU screen is:
-// SDL's 2D renderer, its 8x8 font, the menu's colours. The keys, a pad or the mouse choose the zip with the
-// system's own dialog; checked at once. The renderer is let go before the GPU takes the window.
+// The start's screens: the ROM set chosen in the window (no location set yet, or the one set can't be used), "loading"
+// while it's read, the JIT's "preparing the game". One drawing system owns the window for its whole life (issue 16:
+// the window drawn into with SDL's 2D renderer, then handed to the GPU, was refused by Vulkan on some PCs,
+// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR, the start left frozen). With the GPU (use_gpu): the menu draws them, its pages
+// and its loading screen (as a network game's joining screen), over a black picture. Without one (--no-gpu, or none
+// SDL can use): SDL's 2D renderer, its 8x8 font, the menu's colours, its renderer then handed on to the game
+// (take_renderer). The keys, a pad or the mouse choose the zip with the system's own dialog; checked at once.
 class RomScreen {
 public:
     explicit RomScreen(SDL_Window* window) : window_(window) {}
@@ -1852,9 +1856,24 @@ public:
         if (r_) SDL_DestroyRenderer(r_);
         r_ = nullptr;
     }
+#ifdef SPIKEOUT_GPU
+    // The GPU's (opened before the start's first screen): the menu draws them (null: its fonts failed, nothing but black).
+    void use_gpu(gpu::Presenter* presenter, ui::Menu* menu) { presenter_ = presenter, menu_ = menu; }
+#endif
+    // The 2D renderer, if a screen made one: the game's now (without the GPU; never a second one on the window).
+    SDL_Renderer* take_renderer() { return std::exchange(r_, nullptr); }
+    // The start's screens done: the game's picture from here.
+    void done() {
+#ifdef SPIKEOUT_GPU
+        if (menu_) menu_->set_loading("");
+#endif
+    }
 
     // A location chosen and found good (nothing: the player quit); `why`: the last one's problem ("": none set).
     std::optional<std::filesystem::path> choose(std::string why) {
+#ifdef SPIKEOUT_GPU
+        if (presenter_) return choose_on_gpu(std::move(why));
+#endif
         if (!open()) {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Spikeout", "Spikeout needs its ROM set, spikeofe.zip.", window_);
             return std::nullopt;
@@ -1904,6 +1923,13 @@ public:
 
     // "Loading" over the window while the set is read (a few seconds from a zip).
     void loading() {
+#ifdef SPIKEOUT_GPU
+        if (presenter_) {
+            if (menu_) menu_->set_loading("LOADING", -1, "Reading the ROM set...");
+            present();
+            return;
+        }
+#endif
         if (!r_) return;
         clear();
         line("LOADING", 0.42f, 4, kTitle);
@@ -1914,6 +1940,16 @@ public:
     // The JIT build's first start: the game being translated from the ROM set, how far (a share, 0-1) and what
     // it's doing; once only, later starts load it.
     void preparing(float share, const std::string& doing) {
+#ifdef SPIKEOUT_GPU
+        if (presenter_) { // (the joining screen's look: its bar, its steps)
+            if (menu_)
+                menu_->set_loading("PREPARING THE GAME", static_cast<int>(std::clamp(share, 0.0f, 1.0f) * 100), doing,
+                                   "TRANSLATING THE GAME FROM YOUR ROM SET \xC2\xB7 FIRST START ONLY",
+                                   {"ROM SET READ", "TRANSLATING", "STARTING"}, share >= 0.98f ? 2 : 1);
+            present();
+            return;
+        }
+#endif
         if (!r_ && !open()) return;
         clear();
         int w = 0, h = 0;
@@ -1933,6 +1969,100 @@ private:
     static constexpr int kButtons = 2;
     static constexpr SDL_Color kTitle{0xff, 0xd3, 0x4a, 255}, kText{0xc8, 0xcc, 0xd4, 255}, kWhite{0xff, 0xff, 0xff, 255},
         kProblem{0xff, 0x7a, 0x6a, 255};
+
+#ifdef SPIKEOUT_GPU
+    gpu::Presenter* presenter_ = nullptr;
+    ui::Menu* menu_ = nullptr;
+    // A black picture, the menu over it (its page or its loading screen).
+    void present() {
+        static const uint32_t kBlack[1] = {0xFF000000};
+        presenter_->present(std::span<const uint32_t>(kBlack, 1), 1, 1);
+    }
+    std::optional<std::filesystem::path> choose_on_gpu(std::string why) {
+        SDL_ShowWindow(window_);
+        if (!menu_) { // (no menu: said in a message box, the system's dialog straight away)
+            const std::string text = "Spikeout needs the arcade's ROM set, spikeofe.zip, as MAME and Supermodel have it." +
+                                     (why.empty() ? std::string() : "\n\n" + why);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Spikeout", text.c_str(), window_);
+            pick();
+            for (;;) {
+                if (auto picked = take_picked()) {
+                    if (picked->empty()) return std::nullopt;
+                    std::filesystem::path p = utf8_path(*picked);
+                    why = rom_problem(p);
+                    if (why.empty()) return p;
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Spikeout", why.c_str(), window_);
+                    pick();
+                }
+                for (SDL_Event e; SDL_PollEvent(&e);)
+                    if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return std::nullopt;
+                present();
+                SDL_Delay(16);
+            }
+        }
+        // (the loading screen as a question, as the mockup the owner chose: the title, what's needed, the reason in red,
+        // two buttons; the keys, a pad or the mouse)
+        static const std::vector<std::string> kLabels = {"Choose the zip file", "Quit"};
+        const int buttons = static_cast<int>(kLabels.size());
+        int selected = 0;
+        auto show = [&] {
+            menu_->set_loading("CHOOSE THE ROM SET", -1, dialog_open_ ? "Choose it in the window that opened." : why,
+                               "SPIKEOUT NEEDS THE ARCADE'S ROM SET, SPIKEOFE.ZIP, AS MAME AND SUPERMODEL HAVE IT");
+            menu_->set_loading_buttons(kLabels, selected, !dialog_open_);
+        };
+        auto leave = [&] {
+            menu_->set_loading_buttons({});
+            menu_->set_loading("");
+        };
+        for (;;) {
+            if (auto picked = take_picked(); picked && !picked->empty()) { // (empty: cancelled)
+                std::filesystem::path p = utf8_path(*picked);
+                why = rom_problem(p);
+                if (why.empty()) {
+                    leave();
+                    return p;
+                }
+            }
+            for (SDL_Event e; SDL_PollEvent(&e);) {
+                if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                    leave();
+                    return std::nullopt;
+                }
+                if (dialog_open_) continue;
+                int act = -1;
+                if (e.type == SDL_EVENT_KEY_DOWN) {
+                    const SDL_Scancode k = e.key.scancode;
+                    if (k == SDL_SCANCODE_UP || k == SDL_SCANCODE_LEFT) selected = (selected + buttons - 1) % buttons;
+                    if (k == SDL_SCANCODE_DOWN || k == SDL_SCANCODE_RIGHT || k == SDL_SCANCODE_TAB) selected = (selected + 1) % buttons;
+                    if (k == SDL_SCANCODE_RETURN || k == SDL_SCANCODE_KP_ENTER || k == SDL_SCANCODE_SPACE) act = selected;
+                    if (k == SDL_SCANCODE_ESCAPE) act = 1;
+                } else if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+                    SDL_OpenGamepad(e.gdevice.which); // (the game's own list later: SDL_GetGamepads)
+                } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+                    const auto b = static_cast<SDL_GamepadButton>(e.gbutton.button);
+                    if (b == SDL_GAMEPAD_BUTTON_DPAD_UP) selected = (selected + buttons - 1) % buttons;
+                    if (b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) selected = (selected + 1) % buttons;
+                    if (b == SDL_GAMEPAD_BUTTON_SOUTH || b == SDL_GAMEPAD_BUTTON_START) act = selected;
+                } else if (e.type == SDL_EVENT_MOUSE_MOTION || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                    const bool click = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+                    const int at = menu_->loading_button_at(click ? e.button.x : e.motion.x, click ? e.button.y : e.motion.y);
+                    if (at >= 0) {
+                        selected = at;
+                        if (click && e.button.button == SDL_BUTTON_LEFT) act = at;
+                    }
+                }
+                if (act == 0) pick();
+                if (act == 1) {
+                    leave();
+                    return std::nullopt;
+                }
+            }
+            show();
+            present();
+            SDL_Delay(16);
+        }
+    }
+#endif
 
     bool open() {
         if (!r_) r_ = SDL_CreateRenderer(window_, nullptr);
@@ -2419,6 +2549,62 @@ int main(int argc, char** argv) {
     }
     if (settings.fullscreen && !test_run) SDL_SetWindowFullscreen(window, true);
 
+    // Shown through the GPU (Vulkan, Direct3D 12, Metal) when there is one SDL can use, otherwise through SDL's 2D
+    // renderer. Opened now, before the start's first screen, and the window's for its whole life: the start's screens
+    // (the ROM set's, the JIT's) are the menu's (issue 16: a window drawn into with the 2D renderer and then given to
+    // the GPU was refused by Vulkan on some PCs, the start frozen). Without one, the 2D renderer from the start, kept.
+#ifdef SPIKEOUT_GPU
+    auto gpu_device = std::make_unique<gpu::Device>();
+    auto presenter = std::make_unique<gpu::Presenter>();
+    bool on_gpu = false;
+    ui::Menu menu;
+    bool menu_ready = false;
+    if (use_gpu) {
+        SDL_ShowWindow(window); // (shown before it's claimed, as it always was)
+        start_step("opening the GPU");
+        on_gpu = gpu_device->open(window, fifo) && presenter->open(*gpu_device);
+        start_step(on_gpu ? "the GPU is ready" : "no GPU");
+        if (on_gpu) {
+            presenter->set_look(settings.crt_colours, settings.screen_filter);
+            std::printf("spikeout: drawing with the GPU (%s, %s)\n", gpu_device->driver(),
+                        gpu_device->mailbox() ? "mailbox" : "vsync");
+            // The menu, over the picture (and the start's screens).
+            menu_ready = menu.init(gpu_device->get(), window);
+            if (menu_ready) {
+                menu.set_footer(std::string("Spikeout: Final Edition recomp ") + net::kVersion);
+                presenter->overlay = [&](SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, uint32_t w, uint32_t h) {
+                    menu.render(cmd, swapchain, w, h);
+                };
+            } else {
+                std::printf("spikeout: no menu (%s)\n", menu.error().c_str());
+            }
+        } else { // (the owner's choice, 2026-11-02: a device without one doesn't run the game; --no-gpu still draws without)
+            const std::string why = gpu_device->error();
+            std::printf("spikeout: no GPU (%s)\n", why.c_str());
+            presenter.reset(); // (nothing drawn into the window yet: SDL's 2D renderer says so)
+            gpu_device.reset();
+            watchdog.arm(false); // (the player reading it: no time limit)
+            show_no_gpu(window);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 1;
+        }
+    }
+    // (the start's way out before the game: the menu and the GPU let go before the window)
+    auto close_gpu = [&] {
+        if (presenter) presenter->overlay = nullptr;
+        menu.shutdown();
+        presenter.reset();
+        gpu_device.reset();
+    };
+#else
+    const bool on_gpu = false;
+    const bool menu_ready = false;
+    (void)use_gpu;
+    auto close_gpu = [] {};
+#endif
+    SDL_Renderer* start_renderer = nullptr; // (without the GPU: the start's 2D renderer, if it made one, the game's)
+
     // The ROM set: the command line's, else the one chosen before (settings.ini), else chosen here (the release
     // checklist's picker: a zip or a folder, remembered). One that can't be used: chosen again, said why.
     m3::RomSet roms;
@@ -2428,6 +2614,9 @@ int main(int argc, char** argv) {
         const bool given = dir != nullptr;
         std::filesystem::path rom_path = given ? std::filesystem::path(dir) : utf8_path(settings.rom_path);
         RomScreen screen(window);
+#ifdef SPIKEOUT_GPU
+        if (on_gpu) screen.use_gpu(presenter.get(), menu_ready ? &menu : nullptr);
+#endif
         if (test_bars >= 0) // (tests: the preparing screen's bar, 2 s)
             for (auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2); std::chrono::steady_clock::now() < until;) {
                 for (SDL_Event e; SDL_PollEvent(&e);) {
@@ -2466,6 +2655,7 @@ int main(int argc, char** argv) {
             }
             if (given && !chosen) { // (a script's or a shortcut's: said, not asked)
                 std::fprintf(stderr, "spikeout: ROM set incomplete; run romcheck for details\n");
+                close_gpu();
                 return 1;
             }
             watchdog.arm(false); // (the player choosing: no time limit)
@@ -2473,6 +2663,8 @@ int main(int argc, char** argv) {
             watchdog.arm(true);
             if (!picked) {
                 start_went_well();
+                screen.close();
+                close_gpu();
                 SDL_DestroyWindow(window);
                 SDL_Quit();
                 return 0;
@@ -2542,6 +2734,7 @@ int main(int argc, char** argv) {
         if (quit) {
             start_went_well();
             screen.close();
+            close_gpu();
             SDL_DestroyWindow(window);
             SDL_Quit();
             return 0;
@@ -2551,46 +2744,21 @@ int main(int argc, char** argv) {
             const std::string text = "The game couldn't be translated from the ROM set:\n" + error;
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Spikeout", text.c_str(), window);
             screen.close();
+            close_gpu();
             SDL_DestroyWindow(window);
             SDL_Quit();
             return 1;
         }
 #endif
         start_step("closing the start screen");
-        screen.close(); // (the window given to the GPU)
+        screen.done(); // (the GPU's: the menu's loading screen taken off)
+        start_renderer = screen.take_renderer(); // (without it: the start's 2D renderer kept for the game)
     }
     SDL_ShowWindow(window);
-    // Shown through the GPU (Vulkan, Metal) when there is one SDL can use,
-    // otherwise through SDL's 2D renderer.
-#ifdef SPIKEOUT_GPU
-    auto gpu_device = std::make_unique<gpu::Device>();
-    auto presenter = std::make_unique<gpu::Presenter>();
-    bool on_gpu = false;
-    if (use_gpu) {
-        start_step("handing the window to the GPU");
-        on_gpu = gpu_device->open(window, fifo) && presenter->open(*gpu_device);
-        start_step(on_gpu ? "the GPU is ready" : "no GPU");
-        if (on_gpu) presenter->set_look(settings.crt_colours, settings.screen_filter);
-        if (on_gpu)
-            std::printf("spikeout: drawing with the GPU (%s, %s)\n", gpu_device->driver(),
-                        gpu_device->mailbox() ? "mailbox" : "vsync");
-        else { // (the owner's choice, 2026-11-02: a device without one doesn't run the game; --no-gpu still draws without)
-            const std::string why = gpu_device->error();
-            std::printf("spikeout: no GPU (%s)\n", why.c_str());
-            presenter.reset(); // (the window given back, for SDL's 2D renderer)
-            gpu_device.reset();
-            show_no_gpu(window);
-            return 1;
-        }
-    }
-#else
-    const bool on_gpu = false;
-    (void)use_gpu;
-#endif
     SDL_Renderer* renderer = nullptr;
     SDL_Texture* texture = nullptr;
     if (!on_gpu) {
-        renderer = SDL_CreateRenderer(window, nullptr);
+        renderer = start_renderer ? start_renderer : SDL_CreateRenderer(window, nullptr);
         if (!renderer) {
             std::fprintf(stderr, "spikeout: %s\n", SDL_GetError());
             return 1;
@@ -2759,23 +2927,6 @@ int main(int argc, char** argv) {
         m3::TilegenRenderer::composite(screen, gpu_frame.bottom, gpu_frame.top, three_d);
         return screen;
     };
-
-    // The menu, over the picture.
-    ui::Menu menu;
-    bool menu_ready = false;
-    if (on_gpu) {
-        menu_ready = menu.init(gpu_device->get(), window);
-        if (menu_ready) {
-            menu.set_footer(std::string("Spikeout: Final Edition recomp ") + net::kVersion);
-            presenter->overlay = [&](SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, uint32_t w, uint32_t h) {
-                menu.render(cmd, swapchain, w, h);
-            };
-        } else {
-            std::printf("spikeout: no menu (%s)\n", menu.error().c_str());
-        }
-    }
-#else
-    const bool menu_ready = false;
 #endif
 
     std::unique_ptr<m3::LinkRing> ring;
