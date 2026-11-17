@@ -79,6 +79,17 @@ public:
                                                       "NTSC Japan (9300 K)", "NTSC US (6500 K)", "PAL (6500 K)"};
     static constexpr const char* kFilterNames[] = {"Off", "Scanlines", "CRT"};
     void set_look(int crt_colours, int filter);
+    // How the 2D layers (the arcade's 496 x 384) are scaled to the window
+    // (shaders/screen.frag): 0 sharp (each pixel the arcade pixel it falls in,
+    // as before; the default here, so gamerun's picture hashes stay), 1
+    // sharp-smooth (blocks of one size, their edges blended: the window's
+    // default), 2 smooth (bilinear), 3 bicubic, 4 biquintic (Supermodel's 2D
+    // upscaling filters).
+    static constexpr const char* kLayerNames[] = {"Sharp", "Sharp-smooth", "Smooth", "Bicubic", "Biquintic"};
+    // Softness, 0-100: sharp-smooth's blended edge (25: one window pixel), the
+    // other filters' mix with the sharp picture (100: the filter's whole).
+    static constexpr int kSoftnessDefault[] = {0, 25, 100, 100, 100};
+    void set_layers(int scaling, int softness);
 
     // Draws into this texture (width x height, B8G8R8A8, a colour target)
     // instead of the window: gamerun, timing the screen's pass. Null: the
@@ -120,7 +131,8 @@ private:
     SDL_GPUTexture* target_ = nullptr;
     float shift_[2] = {}; // present_layers' shift, for draw
     uint32_t target_width_ = 0, target_height_ = 0;
-    int crt_colours_ = 0, filter_ = 0;
+    int crt_colours_ = 0, filter_ = 0, layers_ = 0;
+    float softness_ = 0.25f;
     // The filter's gain, for the picture's size and lines it was worked out for.
     float gain_ = 1;
     int gain_height_ = 0, gain_width_ = 0, gain_lines_ = 0, gain_filter_ = 0;

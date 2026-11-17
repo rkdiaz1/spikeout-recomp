@@ -7,7 +7,7 @@
 //           [--screenshot FILE.png] [--shot-every N] [--press [B:]NAME@FRAME[:N]]...
 //           [--wav FILE.wav] [--probe X,Y@FRAME] [--quads]
 //           [--boards N] [--slice LINES] [--link-latency CYCLES] [--input-delay N] [--renderer software|gpu|compare]
-//           [--gpu-scale N] [--gpu-time N] [--wide E] [--screen-time WxH] [--match-models] [--parallel] [--no-2d] [--no-sound]
+//           [--gpu-scale N] [--gpu-time N] [--wide E] [--screen-time WxH] [--screen-shot WxH] [--layers-2d N[:S]] [--match-models] [--parallel] [--no-2d] [--no-sound]
 //
 // Built only when CMake's SPIKEOUT_ROM_DIR is set. A run ends at the first
 // thing the runtime can't do yet (code that wasn't found, an exception, a
@@ -188,7 +188,11 @@
 // making their sides (on average and the worst frame), as the window's game
 // thread spends them. --screen-time WxH (with --wide and --screenshot)
 // times the window's screen pass at that size, drawn off screen, widescreen
-// and 4:3. --match-models builds each frame's scene and reports how many of
+// and 4:3. --screen-shot WxH (with --renderer gpu and --screenshot) draws
+// each screenshot again by that screen pass, as the window shows it at that
+// size (FILE-<frame>-screen.png); --layers-2d N[:SOFTNESS] its 2D scaling
+// (0 sharp, 1 sharp-smooth (the window's default), 2 smooth, 3 bicubic,
+// 4 biquintic) and softness, as the window's Display menu. --match-models builds each frame's scene and reports how many of
 // its models are found in the frame before's (smooth motion's matching: by
 // viewport, address and culling-node path).
 #include "games/games.hpp"
@@ -428,6 +432,12 @@ struct Options {
     int gpu_scale = 1;      // --gpu-scale: the GPU renderer's render scale (gpu, compare)
     int wide = 0;           // --wide: widescreen, the picture this many pixels wider each side (gpu)
     int screen_w = 0, screen_h = 0; // --screen-time WxH: the window's screen pass timed at that size
+    // --screen-shot WxH (with --renderer gpu and --screenshot): each screenshot drawn again by the window's own screen
+    // pass (gpu::Presenter, its 2D scaling and looks) at that size, as the window shows it: FILE-FRAME-screen.png
+    bool screen_shot = false;
+    // --layers-2d N[:SOFTNESS]: the 2D layers' scaling and softness, as the window's (settings.ini layers_2d; default
+    // sharp-smooth, the window's; softness -1: that mode's default, gpu::Presenter::kSoftnessDefault)
+    int layers_2d = 1, layers_softness = -1;
     bool match_models = false;      // --match-models: smooth motion's matching of models between frames, reported
     double gpu_profile_over = 0;    // --gpu-slow MS (with --gpu-time): the frames the GPU took longer than that, listed
     bool gpu_hash_frames = false;   // --gpu-hash-frames: each GPU picture's hash, printed
@@ -2815,7 +2825,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                 std::vector<uint32_t> wide(m.bottom_wide.size());
                 m3::WideLayer::composite(wide, m.bottom_wide, m.top_wide, m.gpu_wide, e);
 #ifdef SPIKEOUT_GPU
-                if (m.presenter) { // --screen-time: the screen pass (layers uploaded, shaded), widescreen and 4:3
+                if (m.presenter && !o.screen_shot) { // --screen-time: the screen pass (layers uploaded, shaded), widescreen and 4:3
                     constexpr int kRepeats = 50;
                     auto time_draws = [&](std::span<const uint32_t> bottom, std::span<const uint32_t> top, int extend) {
                         const int w = m3::TilegenRenderer::kWidth, h = m3::TilegenRenderer::kHeight;
@@ -2933,6 +2943,26 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                 write_3d(m.gpu_image, "-gpu");
             }
         }
+#ifdef SPIKEOUT_GPU
+        // --screen-shot WxH: the picture as the window shows it at that size, drawn by its own screen pass (the 3D at
+        // --gpu-scale, the 2D layers scaled as --layers-2d says), read back: FILE-FRAME-screen.png
+        if (o.screen_shot && o.screenshot && o.shot_every && frame % o.shot_every == 0 && !quiet && m.presenter && m.gpu) {
+            const std::string path = board_path(o.screenshot, m.index);
+            const size_t dot = path.find_last_of('.');
+            const int e = m.builder.extend();
+            const bool wide = e > 0 && !m.bottom_wide.empty() && m.tilegen.extend() == e; // (built above, --wide)
+            m.presenter->request_capture(o.screen_w, o.screen_h);
+            m.presenter->present_layers(wide ? std::span<const uint32_t>(m.bottom_wide) : m.tilegen.bottom(),
+                                        wide ? std::span<const uint32_t>(m.top_wide) : m.tilegen.top(), m.gpu->display_image(),
+                                        m3::TilegenRenderer::kWidth, m3::TilegenRenderer::kHeight, wide ? e : 0);
+            std::vector<uint32_t> pixels;
+            int pw = 0, ph = 0;
+            if (m.presenter->take_capture(pixels, pw, ph))
+                tools::write_png(path.substr(0, dot) + "-" + std::to_string(frame) + "-screen" + path.substr(dot), pixels, pw, ph);
+            else
+                std::fprintf(stderr, "gamerun: --screen-shot: no picture at frame %llu\n", static_cast<unsigned long long>(frame));
+        }
+#endif
         // (--net-rollback: this board's snapshot after the frame, the last asked: another state taken here leaves no cut)
         // (lazy, as the window: only the frames a going back may need, Linked::wants, the same for every board; the
         // boards filled here told by this machine's own)
@@ -4008,7 +4038,14 @@ int main(int argc_given, char** argv_given) {
             o.interp_trace_to = colon == std::string::npos ? o.interp_trace_from + 1
                                                            : std::strtoull(range.c_str() + colon + 1, nullptr, 0);
         }
-        else if (arg == "--screen-time" && i + 1 < argc) {
+        else if (arg == "--layers-2d" && i + 1 < argc) { // N[:SOFTNESS], as the window's 2D scaling and softness
+            const std::string v = argv[++i];
+            o.layers_2d = std::clamp(std::atoi(v.c_str()), 0, 4);
+            const size_t colon = v.find(':');
+            o.layers_softness = colon == std::string::npos ? -1 : std::clamp(std::atoi(v.c_str() + colon + 1), 0, 100);
+        }
+        else if ((arg == "--screen-time" || arg == "--screen-shot") && i + 1 < argc) {
+            if (arg == "--screen-shot") o.screen_shot = true;
             const std::string size = argv[++i];
             const size_t x = size.find('x');
             if (x != std::string::npos) {
@@ -4881,6 +4918,8 @@ int main(int argc_given, char** argv_given) {
                     return 1;
                 }
                 m.presenter->set_target(m.screen_target, static_cast<uint32_t>(o.screen_w), static_cast<uint32_t>(o.screen_h));
+                m.presenter->set_layers(o.layers_2d, o.layers_softness >= 0 ? o.layers_softness
+                                                                            : gpu::Presenter::kSoftnessDefault[o.layers_2d]);
             }
         }
 #endif

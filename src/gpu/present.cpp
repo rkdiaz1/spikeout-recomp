@@ -149,6 +149,7 @@ struct LookUniform {
     float area[4];
     float filter[4];
     float wide[4]; // widescreen (screen.frag): the 3D's extension each side, the 2D's width; smooth motion: the lower layers' shift
+    float layers[4]; // screen.frag: the 2D layers' scaling (Presenter::set_layers)
 };
 
 // The CRT colours' monitors (Supermodel's Src/Graphics/SuperAA.cpp, from Dan
@@ -199,6 +200,11 @@ void glass_at(int filter, int x, int y, float w, float h, float lines, float out
 void Presenter::set_look(int crt_colours, int filter) {
     crt_colours_ = std::clamp(crt_colours, 0, static_cast<int>(std::size(kCrtColours)) - 1);
     filter_ = std::clamp(filter, 0, 2);
+}
+
+void Presenter::set_layers(int scaling, int softness) {
+    layers_ = std::clamp(scaling, 0, static_cast<int>(std::size(kLayerNames)) - 1);
+    softness_ = static_cast<float>(std::clamp(softness, 0, 100)) / 100.0f;
 }
 
 bool Presenter::open(Device& device) {
@@ -312,7 +318,8 @@ void Presenter::pass_into(SDL_GPUCommandBuffer* cmd, SDL_GPUGraphicsPipeline* pi
     SDL_GPUTextureSamplerBinding bindings[3]{};
     Uint32 n = 0;
     for (SDL_GPUTexture* t : inputs) {
-        bindings[n] = {t, n == smooth_input ? smooth_ : sampler_};
+        // (the 2D layers filtered too when they are scaled smoothly: screen.frag's layer())
+        bindings[n] = {t, n == smooth_input || (layers_ && pipeline == screen_pipeline_) ? smooth_ : sampler_};
         ++n;
     }
     SDL_BindGPUFragmentSamplers(pass, 0, bindings, n);
@@ -353,6 +360,8 @@ void Presenter::pass_into(SDL_GPUCommandBuffer* cmd, SDL_GPUGraphicsPipeline* pi
     look.wide[1] = static_cast<float>(width);
     look.wide[2] = shift_[0];
     look.wide[3] = shift_[1];
+    look.layers[0] = static_cast<float>(layers_);
+    look.layers[1] = softness_;
     SDL_PushGPUFragmentUniformData(cmd, 0, &look, sizeof look);
     SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
     SDL_EndGPURenderPass(pass);

@@ -54,6 +54,11 @@ struct Settings {
     bool quads = true;     // quads drawn whole (on by default: the owner's choice, 2026-11-05)
     bool gpu_3d = true;    // the 3D on the GPU (else in software)
     bool fullscreen = false;
+    // The window as it was last left (not fullscreen): its size and place (0 x 0: the first start's, centred; the place
+    // kNoPlace: the system's), and whether it was maximised (the size then the one to go back to)
+    static constexpr int kNoPlace = -1000000;
+    int window_w = 0, window_h = 0, window_x = kNoPlace, window_y = kNoPlace;
+    bool window_maximized = false;
     bool show_fps = false; // the frames shown a second, in a corner
     bool show_net = true;  // a network game's seats (players, their connection) under it
     bool check_updates = true; // at each start, ask GitHub whether a newer version is out (src/net/update.hpp)
@@ -74,6 +79,10 @@ struct Settings {
     std::string front_output, rear_output;
     int crt_colours = 0;   // the window's looks (gpu::Presenter::set_look): 0 off, 1-5 monitors
     int screen_filter = 0; // 0 off, 1 scanlines, 2 CRT
+    int layers_2d = 1;     // the 2D layers scaled to the window (gpu::Presenter::set_layers): 0 sharp, 1 sharp-smooth, 2 smooth, 3 bicubic, 4 biquintic
+    // and each mode's softness, 0-100 (gpu::Presenter::kSoftnessDefault: sharp-smooth's edge, 25 one window pixel; the
+    // filters' mix with the sharp picture, 100 their whole; sharp's unused)
+    std::array<int, 5> layers_softness{0, 25, 100, 100, 100};
     // Sound, in percent: overall (0-100), and the effects and music (0-200) under it
     int volume = 100, sound_volume = 100, music_volume = 100;
     // Network play: the name the others see (clean_name's; empty: this computer's user name)
@@ -155,6 +164,11 @@ inline Settings load_settings(const std::string& path) {
     get_bool("quads", s.quads);
     get_bool("gpu_3d", s.gpu_3d);
     get_bool("fullscreen", s.fullscreen);
+    get("window_w", s.window_w, 0, 16384);
+    get("window_h", s.window_h, 0, 16384);
+    get("window_x", s.window_x, Settings::kNoPlace, 65536);
+    get("window_y", s.window_y, Settings::kNoPlace, 65536);
+    get_bool("window_maximized", s.window_maximized);
     get_bool("show_fps", s.show_fps);
     get_bool("show_net", s.show_net);
     get_bool("check_updates", s.check_updates);
@@ -168,6 +182,9 @@ inline Settings load_settings(const std::string& path) {
     if (auto it = v.find("rom_path"); it != v.end()) s.rom_path = it->second;
     if (auto it = v.find("jit_cache"); it != v.end()) s.jit_cache = it->second;
     get("screen_filter", s.screen_filter, 0, 2);
+    get("layers_2d", s.layers_2d, 0, 4);
+    for (std::size_t m = 1; m < s.layers_softness.size(); ++m)
+        get(("layers_2d_softness_" + std::to_string(m)).c_str(), s.layers_softness[m], 0, 100);
     get("volume", s.volume, 0, 100);
     get("sound_volume", s.sound_volume, 0, 200);
     get("music_volume", s.music_volume, 0, 200);
@@ -196,6 +213,11 @@ inline std::string settings_text(const Settings& s) {
     o << "quads = " << (s.quads ? 1 : 0) << "\n";
     o << "gpu_3d = " << (s.gpu_3d ? 1 : 0) << "\n";
     o << "fullscreen = " << (s.fullscreen ? 1 : 0) << "\n";
+    o << "window_w = " << s.window_w << "\n";
+    o << "window_h = " << s.window_h << "\n";
+    o << "window_x = " << s.window_x << "\n";
+    o << "window_y = " << s.window_y << "\n";
+    o << "window_maximized = " << (s.window_maximized ? 1 : 0) << "\n";
     o << "show_fps = " << (s.show_fps ? 1 : 0) << "\n";
     o << "show_net = " << (s.show_net ? 1 : 0) << "\n";
     o << "check_updates = " << (s.check_updates ? 1 : 0) << "\n";
@@ -209,6 +231,9 @@ inline std::string settings_text(const Settings& s) {
     o << "jit_cache = " << s.jit_cache << "\n";
     o << "crt_colours = " << s.crt_colours << "\n";
     o << "screen_filter = " << s.screen_filter << "\n";
+    o << "layers_2d = " << s.layers_2d << "\n";
+    for (std::size_t m = 1; m < s.layers_softness.size(); ++m)
+        o << "layers_2d_softness_" << m << " = " << s.layers_softness[m] << "\n";
     o << "volume = " << s.volume << "\n";
     o << "sound_volume = " << s.sound_volume << "\n";
     o << "music_volume = " << s.music_volume << "\n";

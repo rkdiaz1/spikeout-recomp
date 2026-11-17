@@ -2536,14 +2536,34 @@ int main(int argc, char** argv) {
     start_step("making the window");
     if (test_start_hang > 0) std::this_thread::sleep_for(std::chrono::seconds(test_start_hang));
     // (hidden until the ROM set is read, as before it was made after; shown at once if one must be chosen)
-    SDL_Window* window =
-        SDL_CreateWindow("Spikeout: Final Edition", width * scale, height * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
+    // (the size and place it was last left at, if any (a player's wish: not set again every start); test runs: the
+    // usual size, so their pictures don't depend on a settings file)
+    const bool remembered = !test_run && settings.window_w >= 160 && settings.window_h >= 120;
+    SDL_Window* window = SDL_CreateWindow("Spikeout: Final Edition", remembered ? settings.window_w : width * scale,
+                                          remembered ? settings.window_h : height * scale,
+                                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN |
+                                              (remembered && settings.window_maximized ? SDL_WINDOW_MAXIMIZED : 0));
     if (!window) {
         std::fprintf(stderr, "spikeout: %s\n", SDL_GetError());
         return 1;
     }
     // (the in-game update: a version just put in place has started; the one before stops waiting for it)
     if (install_place) net::install::mark(*install_place, net::install::Mark::alive);
+    if (remembered && settings.window_x != tools::Settings::kNoPlace && settings.window_y != tools::Settings::kNoPlace) {
+        // (only where its title bar is still on a display: one unplugged since leaves the system's place)
+        // (SDL_GetDisplayForPoint gives the nearest display for a point on none: each display's bounds looked at here)
+        const SDL_Point at{settings.window_x + 40, settings.window_y + 10};
+        bool on_display = false;
+        int count = 0;
+        if (SDL_DisplayID* displays = SDL_GetDisplays(&count)) {
+            for (int i = 0; i < count && !on_display; ++i) {
+                SDL_Rect r;
+                on_display = SDL_GetDisplayBounds(displays[i], &r) && SDL_PointInRect(&at, &r);
+            }
+            SDL_free(displays);
+        }
+        if (on_display) SDL_SetWindowPosition(window, settings.window_x, settings.window_y);
+    }
     // The app's icon (its title bar and taskbar; macOS's Dock too; the .exe's own is its resource on Windows).
     if (SDL_Surface* icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(ui::assets::app_icon_png.data, ui::assets::app_icon_png.size), true)) {
         SDL_SetWindowIcon(window, icon);
@@ -2568,6 +2588,7 @@ int main(int argc, char** argv) {
         start_step(on_gpu ? "the GPU is ready" : "no GPU");
         if (on_gpu) {
             presenter->set_look(settings.crt_colours, settings.screen_filter);
+            presenter->set_layers(settings.layers_2d, settings.layers_softness[settings.layers_2d]);
             std::printf("spikeout: drawing with the GPU (%s, %s)\n", gpu_device->driver(),
                         gpu_device->mailbox() ? "mailbox" : "vsync");
             // The menu, over the picture (and the start's screens).
@@ -3744,6 +3765,7 @@ int main(int argc, char** argv) {
     // ---- The menu's pages ----
     std::function<ui::MenuPage()> update_page_made; // (the update's page: update_page, below)
     bool settings_changed = false;
+    bool window_moved = false; // (its size or place changed by the player: settings.ini written at the end)
     auto changed = [&] { settings_changed = true; };
     auto back_item = [&] { return ui::MenuItem{"Back", "Back to the previous page.", {}, {}, [&] { menu.pop(); }}; };
     auto display_page = [&] {
@@ -3828,6 +3850,34 @@ int main(int argc, char** argv) {
                            [&](int d) {
                                settings.screen_filter = (settings.screen_filter + d + 3) % 3;
                                presenter->set_look(settings.crt_colours, settings.screen_filter);
+                               changed();
+                           }});
+        p.items.push_back({"2D scaling",
+                           "How the arcade's 2D (the score, the text, the title and map screens) is enlarged to the "
+                           "window, its 496 x 384 pixels drawn far larger. Sharp-smooth: every pixel a crisp block of "
+                           "the same size, its edges blended, also over the 3D. Sharp: each window pixel the arcade "
+                           "pixel it falls in, uneven where the scale isn't a whole number. Smooth: blended all over, "
+                           "softer. Bicubic: softer still. Biquintic: smooth, a little crisper than Smooth. (Smooth, "
+                           "Bicubic and Biquintic are Supermodel's 2D upscaling filters.)",
+                           [&] { return std::string(gpu::Presenter::kLayerNames[settings.layers_2d]); },
+                           [&](int d) {
+                               settings.layers_2d = (settings.layers_2d + d + 5) % 5;
+                               presenter->set_layers(settings.layers_2d, settings.layers_softness[settings.layers_2d]);
+                               changed();
+                           }});
+        p.items.push_back({"2D softness",
+                           "How soft the 2D scaling is, kept for each kind. Sharp-smooth: how wide the blend between "
+                           "two pixels is (25%: one screen pixel; 0%: as Sharp; 100%: close to Smooth). Smooth, Bicubic, Biquintic: "
+                           "how much of the filter is used (100%: all of it; less: crisper). Not used with Sharp.",
+                           [&] {
+                               return settings.layers_2d == 0 ? std::string("-")
+                                                              : std::to_string(settings.layers_softness[settings.layers_2d]) + "%";
+                           },
+                           [&](int d) {
+                               if (settings.layers_2d == 0) return;
+                               int& s = settings.layers_softness[settings.layers_2d];
+                               s = std::clamp(s + 5 * d, 0, 100);
+                               presenter->set_layers(settings.layers_2d, s);
                                changed();
                            }});
         p.items.push_back({"Show FPS",
@@ -5510,6 +5560,20 @@ int main(int argc, char** argv) {
             if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && (settings.render_scale == 0 || settings.picture_shape == 1))
                 set_up_3d();
 #endif
+            // The window's size and place as the player leaves them, for the next start (kept in settings.ini at the
+            // end: not written at every step of a drag). Maximised: only that, its size before kept to go back to.
+            if (!test_run && (e.type == SDL_EVENT_WINDOW_RESIZED || e.type == SDL_EVENT_WINDOW_MOVED ||
+                              e.type == SDL_EVENT_WINDOW_MAXIMIZED || e.type == SDL_EVENT_WINDOW_RESTORED)) {
+                const SDL_WindowFlags f = SDL_GetWindowFlags(window);
+                if (!(f & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
+                    settings.window_maximized = (f & SDL_WINDOW_MAXIMIZED) != 0;
+                    if (!settings.window_maximized) {
+                        SDL_GetWindowSize(window, &settings.window_w, &settings.window_h);
+                        SDL_GetWindowPosition(window, &settings.window_x, &settings.window_y);
+                    }
+                    window_moved = true;
+                }
+            }
         }
 #ifdef SPIKEOUT_GPU
         // The menu pauses the game (not a network game: the others play on);
@@ -6386,9 +6450,9 @@ int main(int argc, char** argv) {
     }
 
 #ifdef SPIKEOUT_GPU
-    if (settings_changed && !test_run) tools::save_settings(settings_path, settings);
+    if ((settings_changed || window_moved) && !test_run) tools::save_settings(settings_path, settings);
 #else
-    (void)menu_ready;
+    (void)menu_ready, (void)window_moved;
 #endif
     shared.paused = false;
     watchdog.arm(false); // (closing: the boards stop and frames end; not a hang)

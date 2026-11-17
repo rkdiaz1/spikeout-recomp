@@ -62,6 +62,8 @@ four-player co-op over the internet, one player a PC, as four linked cabinets pl
 - **A crash in long linked games, found.** After a long session of network play, the game could close by itself.
   The fix is being tested.
 - These change how cabinets talk to each other, so everyone in a room will need the new version.
+- **Sharper-looking 2D** next to the 3D: a new 2D scaling setting, with Sharp-smooth as the default (see Features).
+- **The window opens where you left it**, at the size you left it.
 
 ### An idea: arcade link mode
 
@@ -228,6 +230,12 @@ diagonals are as easy to hold as up, down, left and right. The d-pad and the key
 - **Picture shape**: the arcade's 4:3, the window's, 16:10, 16:9 or 21:9. In widescreen the fights see more to the
   sides, and the game's 2D screens are widened from its own tile maps.
 - **CRT colours** as arcade monitors showed them (Supermodel's), and **screen filters**: scanlines, or a CRT's.
+- **2D scaling**: how the game's 2D (the score, the text, the title and map screens: 496 x 384 pixels) is enlarged
+  to your screen next to the sharper 3D. **Sharp-smooth**, the default, keeps every pixel a crisp block of the same
+  size and blends only its edges, over the 3D too; **Sharp** is the pixels as they are, uneven where the screen isn't
+  a whole number of times larger; **Smooth**, **Bicubic** and **Biquintic** are Supermodel's softer filters. A
+  **2D softness** setting turns each up or down.
+- **The window remembers its size and place** (or that it was maximised) for the next start.
 - **The cabinet's sound**: the front and rear speakers apart, on a four-channel output or two outputs.
 - **The arcade's settings**, as an operator sets them: difficulty, region, free play, the demo's sound, and its test
   menu.
@@ -250,6 +258,11 @@ diagonals are as easy to hold as up, down, left and right. The d-pad and the key
 <p align="center">
   <img src="docs/images/crt-4x3.jpg" alt="The arcade's 4:3 with CRT colours and the CRT filter" width="60%">
   <br><sub>The arcade's 4:3, with a Sega arcade monitor's colours and the CRT filter</sub>
+</p>
+<p align="center">
+  <img src="docs/images/2d-scaling.png" alt="The same text over the 3D in the five 2D scaling modes, close up: Sharp, Sharp-smooth, Smooth, Bicubic, Biquintic" width="49%">
+  <img src="docs/images/2d-softness.png" alt="Sharp-smooth at 2D softness 0, 25, 50 and 100 percent, close up" width="49%">
+  <br><sub>2D scaling, close up (a 1920 x 1080 screen, enlarged 3x): the five modes, and Sharp-smooth's softness</sub>
 </p>
 <p align="center">
   <img src="docs/images/saves.jpg" alt="The saves list (F10): each save with a picture of the moment, its stage, area and difficulty, the date and the time played" width="80%">

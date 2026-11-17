@@ -20,6 +20,8 @@ layout(std140, set = 3, binding = 0) uniform Look {
     vec4 screen;    // the filter's kind (0 none, 1 scanlines, 2 CRT), the picture's lines, the gain, CRT colours on (1)
     vec4 wide;      // widescreen (screen.frag): the 3D's extension each side and the 2D's width, in screen pixels;
                     // smooth motion: the layers below the 3D shifted (x, y, in their pixels)
+    vec4 layers;    // screen.frag: the 2D layers' scaling (x: 0 sharp, 1 sharp-smooth, 2 smooth, 3 bicubic, 4 biquintic;
+                    // y: the softness, 0-1)
 };
 
 float to_linear(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
