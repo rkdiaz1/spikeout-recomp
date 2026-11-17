@@ -38,29 +38,17 @@ four-player co-op over the internet, one player a PC, as four linked cabinets pl
 
 **0.1.0-preview7** ([all the details](https://github.com/tastyrepublic/spikeout-recomp/releases/tag/v0.1.0-preview7))
 
-- **An experimental fix for the "Communication error".** Your reports made it possible: the game in one of them was
-  played again here, frame for frame, until the error appeared. The cause we found was in how our copy of the cable
-  between cabinets timed when each cabinet sees the others' data: at an area change, two cabinets could take the
-  change one step apart, and the game's own check then found a character in two different places. With the fix, the
-  122 games from preview6's reports that we played again all ran through without the error (9 of them showed it
-  before). It's still experimental: we hope it fixes most of the Communication errors you've seen, but please keep
-  **Send reports** on, so we hear about any that are left.
-- **An experimental fix for the crash in long network games.** After a long session of network play, the game could
-  close by itself (a stack overflow: the game's waits for the other cabinets piled up). Fixed and tested here, but
-  experimental too: tell us if a long game still closes.
-- **Joining a game that waited for ever.** A player or spectator joining a room slowed by a far or slow player could
-  stay on "catching up" for good (a spectator could get in with Left/Right). Fixed, and reported better: a report
-  is saved if a join takes over 20 seconds.
-- **The game updates itself.** When a new version is out, "Version X is out" in the menu now installs it: downloaded,
-  checked (its signature), put in place and started, and your settings, saves and the translated game kept. If the
-  new version doesn't start, the old one is put back (Game > Go back too). From this version on: getting this one is
-  still by hand.
-- **No more stuck start (issue 16).** On some PCs the first start stopped at about 95% after the game was prepared;
-  the start's screens are now drawn through the GPU from the beginning.
+- **"Communication error": an experimental fix.** Found thanks to your reports. We hope it fixes most of these errors;
+  please keep **Send reports** on so we hear about any that are left.
+- **The game closing by itself in long network games: an experimental fix** too. Tell us if it still happens.
+- **Joining could get stuck on "catching up"** in a slow room. Fixed.
+- **The game updates itself** from the menu when a new version is out, keeping your settings and saves (from this
+  version on).
+- **The first start no longer stops at about 95%** on some PCs (issue 16).
 - **Sharper-looking 2D** next to the 3D: a new 2D scaling setting, with Sharp-smooth as the default (see
   [Features](#features)).
 - **The window opens where you left it**, at the size you left it.
-- These change how cabinets talk to each other, so everyone in a room needs this version.
+- Everyone in a network room needs this version.
 - **Next:** a slow PC no longer slowing everyone (see [Roadmap](#roadmap)).
 
 ### An idea: arcade link mode
