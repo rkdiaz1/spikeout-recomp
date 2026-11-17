@@ -455,9 +455,14 @@ bool spawn(Child& child, const fs::path& program, const std::vector<std::string>
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     }
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(program.wstring().c_str(), line.data(), nullptr, nullptr, out ? TRUE : FALSE, out ? CREATE_NO_WINDOW : 0,
-                        nullptr, nullptr, &si, &pi))
-        return false;
+    // (a file that isn't a program: the error to us, not Windows' "unsupported 16-bit application" box, which held a
+    // test, and would hold a player's update check, until it was closed; the program started with the usual error mode)
+    DWORD mode = 0;
+    SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mode);
+    const BOOL made = CreateProcessW(program.wstring().c_str(), line.data(), nullptr, nullptr, out ? TRUE : FALSE,
+                                     (out ? CREATE_NO_WINDOW : 0) | CREATE_DEFAULT_ERROR_MODE, nullptr, nullptr, &si, &pi);
+    SetThreadErrorMode(mode, nullptr);
+    if (!made) return false;
     CloseHandle(pi.hThread);
     child.process = pi.hProcess;
     return true;
