@@ -36,6 +36,9 @@ public:
     SDL_GPUDevice* get() const { return device_; }
     SDL_Window* window() const { return window_; }
     const char* driver() const;
+    // The graphics card and its driver, as the driver names them, for the log and reports (issue 35: a picture
+    // fault seen on one player's PC only, and nothing saying which card): "NAME (API; driver NAME VERSION)".
+    std::string description() const;
     bool mailbox() const { return mailbox_; } // else FIFO: presenting waits for the display
     const std::string& error() const { return error_; }
 

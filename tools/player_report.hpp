@@ -393,6 +393,28 @@ inline std::string cpu_name() {
     return name + " (" + std::to_string(SDL_GetNumLogicalCPUCores()) + " threads, " + std::to_string(SDL_GetSystemRAM()) + " MB memory)";
 }
 
+// The graphics card the window draws with (gpu::Device::description, or why there is none), once it's open: a line of
+// system_lines() from then on, and of each problem bundle's problem.txt (issue 35: a picture fault on one PC only, and
+// nothing saying which card). Empty before the GPU is opened, and in gamerun.
+namespace detail {
+struct Gpu {
+    std::mutex lock;
+    std::string text;
+};
+inline Gpu& gpu() {
+    static Gpu g;
+    return g;
+}
+} // namespace detail
+inline void set_gpu(std::string text) {
+    std::lock_guard guard(detail::gpu().lock);
+    detail::gpu().text = std::move(text);
+}
+inline std::string gpu_line() {
+    std::lock_guard guard(detail::gpu().lock);
+    return detail::gpu().text.empty() ? std::string() : "system: GPU " + detail::gpu().text + "\n";
+}
+
 inline std::string system_lines() {
     std::ostringstream o;
     const int sdl = SDL_GetVersion();
@@ -401,6 +423,7 @@ inline std::string system_lines() {
     o << "system: SDL " << SDL_VERSIONNUM_MAJOR(sdl) << "." << SDL_VERSIONNUM_MINOR(sdl) << "." << SDL_VERSIONNUM_MICRO(sdl)
       << ", video " << (SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "none") << ", audio "
       << (SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none") << "\n";
+    o << gpu_line();
     int n = 0;
     if (SDL_DisplayID* displays = SDL_GetDisplays(&n)) {
         for (int i = 0; i < n; ++i) {

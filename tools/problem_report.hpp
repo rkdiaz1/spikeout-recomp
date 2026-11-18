@@ -181,6 +181,8 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(200)); // (the log's thread: the lines up to now in)
         std::string text = "Spikeout problem: " + n.kind + "\n" + n.detail + "\nframe " + std::to_string(n.frame) + "\nat " +
                            report::detail::clock_text() + "\n\n" + about_;
+        // (the graphics card: known only once the window has opened it, after `about` was made)
+        if (about_.find("system: GPU ") == std::string::npos) text += report::gpu_line();
         if (counts_) text += "\n" + counts_();
         std::vector<std::pair<std::string, std::string>> files;
         files.push_back({"problem.txt", report::detail::scrubbed(text)});

@@ -5079,7 +5079,7 @@ int main(int argc_given, char** argv_given) {
     } gpu_parts_first{machines, gpu_device};
     if (o.renderer != Options::Renderer::Software || o.gpu_time_scale) {
         if (gpu_device.open_headless()) {
-            std::printf("GPU: %s\n", gpu_device.driver());
+            std::printf("GPU: %s\n", gpu_device.description().c_str());
         } else {
             std::fprintf(stderr, "gamerun: no GPU (%s)\n", gpu_device.error().c_str());
             return 1;

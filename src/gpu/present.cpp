@@ -78,6 +78,26 @@ Device::~Device() {
 
 const char* Device::driver() const { return device_ ? SDL_GetGPUDeviceDriver(device_) : "none"; }
 
+std::string Device::description() const {
+    if (!device_) return "none";
+    const SDL_PropertiesID props = SDL_GetGPUDeviceProperties(device_);
+    const auto get = [props](const char* name) {
+        const char* s = props ? SDL_GetStringProperty(props, name, nullptr) : nullptr;
+        return std::string(s ? s : "");
+    };
+    const std::string name = get(SDL_PROP_GPU_DEVICE_NAME_STRING), driver_name = get(SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING);
+    // (the version where the driver gives one; its longer info, e.g. Mesa's, otherwise)
+    std::string version = get(SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING);
+    if (version.empty()) version = get(SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING);
+    std::string text = (name.empty() ? std::string("unknown card") : name) + " (" + driver();
+    if (!driver_name.empty() || !version.empty()) {
+        text += "; driver";
+        if (!driver_name.empty()) text += " " + driver_name;
+        if (!version.empty()) text += " " + version;
+    }
+    return text + ")";
+}
+
 SDL_GPUShader* Device::shader(const ShaderCode& code, Stage stage, const Resources& resources) {
     SDL_GPUShaderCreateInfo info{};
     const SDL_GPUShaderFormat formats = SDL_GetGPUShaderFormats(device_);

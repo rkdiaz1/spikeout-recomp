@@ -2670,8 +2670,9 @@ int main(int argc, char** argv) {
         if (on_gpu) {
             presenter->set_look(settings.crt_colours, settings.screen_filter);
             presenter->set_layers(settings.layers_2d, settings.layers_softness[settings.layers_2d]);
-            std::printf("spikeout: drawing with the GPU (%s, %s)\n", gpu_device->driver(),
-                        gpu_device->mailbox() ? "mailbox" : "vsync");
+            tools::report::set_gpu(gpu_device->description()); // (reports and Report a problem say which card)
+            std::printf("spikeout: drawing with the GPU (%s, %s): %s\n", gpu_device->driver(),
+                        gpu_device->mailbox() ? "mailbox" : "vsync", gpu_device->description().c_str());
             // The menu, over the picture (and the start's screens).
             menu_ready = menu.init(gpu_device->get(), window);
             if (menu_ready) {
@@ -2685,6 +2686,7 @@ int main(int argc, char** argv) {
         } else { // (the owner's choice, 2026-11-02: a device without one doesn't run the game; --no-gpu still draws without)
             const std::string why = gpu_device->error();
             std::printf("spikeout: no GPU (%s)\n", why.c_str());
+            tools::report::set_gpu("none (" + why + ")");
             presenter.reset(); // (nothing drawn into the window yet: SDL's 2D renderer says so)
             gpu_device.reset();
             watchdog.arm(false); // (the player reading it: no time limit)
