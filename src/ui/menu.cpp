@@ -243,6 +243,13 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         ".gt { display: block; height: 50%; decorator: vertical-gradient(#fff6c8 #ffe06a); } "
         ".gb { display: block; height: 50%; decorator: vertical-gradient(#e8a800 #ffcf3a); } "
         ".green .gt { decorator: vertical-gradient(#d8ffd8 #8fe88f); } .green .gb { decorator: vertical-gradient(#3fae3f #6fd46f); } "
+        ".red .gt { decorator: vertical-gradient(#ffd8d0 #ff8a7a); } .red .gb { decorator: vertical-gradient(#c03028 #e85a4a); } "
+        // (an arcade link game's speed: a line and a bar under the seats, right-aligned; the fill grows from the right)
+        ".sline { display: flex; justify-content: flex-end; height: 22dp; margin-top: 4dp; font-size: 17dp; "
+        "font-effect: outline(2dp #000000); } .sline.g { color: #7fe07f; } .sline.y { color: #ffd34a; } .sline.r { color: #ff7a6a; } "
+        ".sbar { display: block; width: 140dp; height: 10dp; decorator: vertical-gradient(#08090c #262a33); border: 1dp #000000; "
+        "border-radius: 5dp; } .sbar .pfill { display: block; height: 100%; margin-left: auto; } " // (shrinking towards the right)
+        ".sbar .pfill .gt { border-radius: 4dp 4dp 0dp 0dp; } .sbar .pfill .gb { border-radius: 0dp 0dp 4dp 4dp; } "
         ".conn { display: flex; justify-content: flex-end; align-items: flex-end; margin-left: 8dp; } "
         ".bars { display: flex; align-items: flex-end; height: 16dp; margin-bottom: 3dp; margin-left: 5dp; } "
         ".bar { width: 3dp; margin-left: 1dp; background-color: #4a4a4a; border: 1dp #000000; } "
@@ -382,6 +389,16 @@ void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, c
                        std::to_string(r.rollbacks) + "</span>";
             rml += "</div>";
         }
+    }
+    // (an arcade link game: the game's speed under the seats, a line and the same glossy bar as the others, its colour
+    // by how it goes)
+    if (!pills.speed_text.empty()) {
+        const char* look = pills.speed_look == 'r' ? "r" : pills.speed_look == 'y' ? "y" : "g";
+        rml += "<div class=\"sline " + std::string(look) + "\"><span>" + escape(pills.speed_text) + "</span></div>";
+        if (pills.speed_pct >= 0) // (the glossy bar, its fill against the right end: the owner's choices, 2026-11-18)
+            rml += "<div class=\"sline\"><span class=\"sbar" + std::string(pills.speed_look == 'r' ? " red" : pills.speed_look == 'y' ? "" : " green") +
+                   "\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(pills.speed_pct, 0, 100)) + "%;\">" + kGloss +
+                   "</span></span></div>";
     }
     net_shown_ = !rows.empty() || !header.empty();
     if (rml != net_rml_) {
@@ -542,7 +559,10 @@ void Menu::build() {
     std::string crumb;
     for (size_t i = 1; i < stack_.size(); i++) crumb += (i > 1 ? "  /  " : "") + stack_[i].name;
     impl_->doc->GetElementById("crumb")->SetInnerRML(escape(crumb));
-    impl_->doc->GetElementById("qrbox")->SetInnerRML(""); // (a page with one fills it below)
+    if (!p.side || p.text || p.code) { // (a page with a QR code fills it below; one with a side picture keeps its box)
+        impl_->doc->GetElementById("qrbox")->SetInnerRML("");
+        side_on_ = false;
+    }
     // (SDL's text input on only on a text page: elsewhere a key is a key; on a Steam Deck it brings up the keyboard)
     if (p.text && !text_input_on_) SDL_StartTextInput(impl_->window), text_input_on_ = true;
     else if (!p.text && text_input_on_) SDL_StopTextInput(impl_->window), text_input_on_ = false;
@@ -569,6 +589,12 @@ void Menu::build() {
 #endif
             picture = src.empty() ? "<div class=\"thumb none\"></div>" : "<img class=\"thumb\" src=\"" + escape(src) + "\"/>";
         }
+        if (it.button) { // (a button: a pill in the middle, its label only)
+            rml += "<div class=\"row btn" + std::string(it.button_on ? " on" : "") + (it.dim ? " dim" : "") + (it.info ? " info" : "") +
+                   (static_cast<int>(i) == selected_ ? " selected" : "") + "\" id=\"r" + std::to_string(i) + "\"><span class=\"label\">" +
+                   escape(it.label) + "</span></div>";
+            continue;
+        }
         rml += "<div class=\"row" + std::string(it.info ? " info" : "") + (it.tall ? " tall" : "") + (it.dim ? " dim" : "") +
                (static_cast<int>(i) == selected_ ? " selected" : "") + "\" id=\"r" + std::to_string(i) + "\">" + picture +
                "<span class=\"label\">" +
@@ -584,16 +610,21 @@ void Menu::build() {
                        "; width: " + impl_->px(4) + "; margin-left: " + impl_->px(2) + "; border-width: " + impl_->px(1) + ";\"></span>";
             rml += "</span><span>~" + std::to_string(ms) + " ms</span></span>"; // (its own span: loose text in a flex box isn't drawn)
         }
+        const char* look = it.progress_look == 'g' ? " green" : it.progress_look == 'r' ? " red" : "";
         if (it.progress >= 0) // (a bar: its fill as wide as the share done)
-            rml += "<span class=\"pbar\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(it.progress, 0, 100)) +
-                   "%;\">" + kGloss + "</span></span>";
+            rml += "<span class=\"pbar" + std::string(it.badge.empty() ? "" : " short") + look + "\"><span class=\"pfill\" style=\"width: " +
+                   std::to_string(std::clamp(it.progress, 0, 100)) + "%;\">" + kGloss + "</span></span>";
         if (it.value) {
-            rml += it.progress >= 0 ? "<span class=\"value pvalue\">" : "<span class=\"value\">"; // (beside a bar: a fixed width)
+            rml += it.progress >= 0 ? "<span class=\"value pvalue" + std::string(it.badge.empty() ? "" : " short") + "\">"
+                                    : "<span class=\"value\">"; // (beside a bar: a fixed width)
             if (it.change) rml += "<span class=\"arrow back\">&lt;&nbsp;&nbsp;</span>";
             rml += escape(it.value());
             if (it.change) rml += "<span class=\"arrow\">&nbsp;&nbsp;&gt;</span>";
             rml += "</span>";
         }
+        if (!it.badge.empty()) // (a pill at the end: READY, WAITING)
+            rml += "<span class=\"rbadge" + std::string(it.badge_look ? std::string(" ") + it.badge_look : std::string()) + "\">" +
+                   escape(it.badge) + "</span>";
         rml += "</div>";
     }
     // (a QR code beside the rows, never under them (a short window would cut it): its modules as squares, a light
@@ -607,7 +638,8 @@ void Menu::build() {
             qr += "</div>";
         }
     }
-    impl_->doc->GetElementById("qrbox")->SetInnerRML(qr);
+    if (p.side) show_side();
+    else impl_->doc->GetElementById("qrbox")->SetInnerRML(qr);
     impl_->doc->GetElementById("rows")->SetInnerRML(rml);
     scroll_to_selected();
     show_help();
@@ -878,12 +910,28 @@ void Menu::show_help() {
     impl_->doc->GetElementById("note")->SetInnerRML(escape(h));
 }
 
+void Menu::show_side() {
+    const MenuPage& p = stack_.back();
+    if (!side_on_) {
+        impl_->doc->GetElementById("qrbox")->SetInnerRML("<div id=\"sb\"></div><div id=\"sf\"></div>");
+        side_on_ = true;
+        side_fx_rml_.clear();
+    }
+    impl_->doc->GetElementById("sb")->SetInnerRML(p.side(selected_));
+    const std::string fx = p.side_fx ? p.side_fx(selected_) : std::string();
+    if (fx != side_fx_rml_) {
+        side_fx_rml_ = fx;
+        impl_->doc->GetElementById("sf")->SetInnerRML(fx);
+    }
+}
+
 void Menu::select(int i) {
     const MenuPage& p = stack_.back();
     if (i < 0 || i >= static_cast<int>(p.items.size()) || p.items[static_cast<size_t>(i)].info || i == selected_) return;
     if (auto* old = impl_->doc->GetElementById("r" + std::to_string(selected_))) old->SetClass("selected", false);
     selected_ = i;
     if (auto* e = impl_->doc->GetElementById("r" + std::to_string(selected_))) e->SetClass("selected", true);
+    if (p.side) show_side(); // (its picture follows the row)
     scroll_to_selected();
     show_help();
 }

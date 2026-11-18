@@ -132,6 +132,53 @@ div { display: block; }
 .row .pfill .gb { display: block; height: 50%; border-radius: 0dp 0dp 5dp 5dp; decorator: vertical-gradient(#e8a800 #ffcf3a); }
 .row .value.pvalue { flex: 0 0 auto; width: 190dp; }
 
+/* An arcade link room (docs/direct-connect.md): each player's row a bar of the link's time (green, yellow, red: its
+   grade; the same glossy bar), the time, and a pill (READY / WAITING); the Ready button a pill in the middle; beside
+   the rows, the ring of every link (#qrbox's place). */
+.row .pbar.short { width: 110dp; }
+.row .value.pvalue.short { width: 70dp; }
+.row .pbar.green .gt { decorator: vertical-gradient(#d8ffd8 #8fe88f); }
+.row .pbar.green .gb { decorator: vertical-gradient(#3fae3f #6fd46f); }
+.row .pbar.red .gt { decorator: vertical-gradient(#ffd8d0 #ff8a7a); }
+.row .pbar.red .gb { decorator: vertical-gradient(#c03028 #e85a4a); }
+/* (the ring's pings (the owner's choice, 2026-11-18): over each lit link a dot going out to the other seat and back,
+   as the room's own pings, in a layer the page doesn't make again (MenuPage::side_fx)) */
+#sf { position: absolute; left: 0; top: 0; }
+@keyframes ping { 0% { left: 0%; } 50% { left: 100%; } 100% { left: 0%; } }
+.rfx { position: absolute; height: 0dp; transform-origin: 0% 50%; }
+.rping { position: absolute; top: -5dp; left: 0%; width: 10dp; height: 10dp; margin-left: -5dp; border-radius: 5dp;
+	background-color: #ffffff; border: 1dp #000000; animation: 1.6s cubic-in-out infinite ping; }
+.rbadge.o { background-color: transparent; color: #ff9a3c; border: 2dp #ff6a1f; }
+.row.selected .rbadge.o { color: #1a0705; border-color: #1a0705; }
+.rbadge { flex: 0 0 auto; width: 76dp; height: 20dp; line-height: 20dp; margin: 4dp 0 0 10dp; text-align: center; font-size: 15dp;
+	border-radius: 10dp; border: 1dp #000000; background-color: #4a4a50; color: #e8e8ec; }
+.rbadge.g { background-color: #5fd35f; color: #0d2a0d; }
+.rbadge.y { background-color: #ffd34a; color: #2a2000; }
+.rbadge.r { background-color: #e05555; color: #ffffff; }
+.row.btn { justify-content: center; height: 36dp; line-height: 34dp; margin: 10dp 70dp 6dp 70dp; padding: 0 16dp; font-size: 25dp;
+	color: #ff9a3c; border: 2dp #ff6a1f; border-radius: 18dp; }
+.row.btn .label { flex: 0 0 auto; margin-right: 0; }
+.row.btn.selected { padding-left: 16dp; color: #1a0705; border-color: #ffd0a0; }
+.row.btn.on { color: #0d2a0d; border-color: #3fae3f; decorator: vertical-gradient(#8fe88f #3fae3f); }
+.row.btn.on.selected { border-color: #ffffff; }
+.row.btn.dim { color: #6a605c; border-color: #4a403c; }
+.row.btn.dim.selected { color: #2a1a16; }
+.row.btn.info { height: 36dp; line-height: 34dp; font-size: 25dp; font-weight: 600; margin: 10dp 70dp 6dp 70dp; color: #8a7a74; }
+.ring { position: relative; width: 250dp; height: 250dp; }
+.rl { position: absolute; height: 4dp; transform-origin: 0% 50%; border-radius: 2dp; }
+.rl.thin { height: 2dp; }
+.rl.g { background-color: #5fd35f; } .rl.y { background-color: #ffd34a; } .rl.r { background-color: #e05555; }
+.rl.off { background-color: #3a3436; } .rl.faint { opacity: 0.4; }
+.rs { position: absolute; width: 44dp; height: 44dp; border-radius: 22dp; border: 2dp #8a8a90; background-color: #22252b;
+	text-align: center; line-height: 40dp; font-size: 17dp; color: #ffffff; }
+.rs.me { border-color: #ff6a1f; }
+.rs.sel { background-color: #3a2a1e; border-color: #ffd0a0; }
+.rs.out { border-color: #3a3436; background-color: #1a1b1f; color: #55565c; }
+.rn { position: absolute; width: 90dp; text-align: center; font-size: 15dp; color: #e6d3cc; }
+.rn.out { color: #55565c; }
+.rt { position: absolute; width: 56dp; height: 18dp; line-height: 18dp; text-align: center; font-size: 14dp; color: #ffffff;
+	background-color: #16171bdd; border-radius: 4dp; }
+
 .row .arrow { color: #c99a8a; }
 .row.selected .arrow { color: #1a0705; }
 

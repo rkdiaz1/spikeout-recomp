@@ -68,6 +68,14 @@ public:
     // receive(): a link between boards in one process (LinkRing) delivers
     // a packet once the receiver has reached the time it was sent.
     virtual void set_time(uint64_t /*main_cycles*/) {}
+    // Direct connect's transport (net::DirectRoom, docs/direct-connect.md): every other cabinet's own segment of this
+    // frame in one exchange, by_distance[d - 1] the one d places before this cabinet on the ring; the simulated board
+    // fills its table from them as its ring passes would have (the same data, the same frame). false from gather: the
+    // link broke.
+    virtual bool gathers() const { return false; }
+    virtual bool gather(const uint8_t* /*own*/, std::size_t /*size*/, std::vector<std::vector<uint8_t>>& /*by_distance*/) {
+        return false;
+    }
     // Save states (runtime/state.hpp): packets on their way (a LinkRing's
     // port: its counts, the packets being in the ring's part).
     virtual void state(State& s);
@@ -241,6 +249,12 @@ public:
     // Once a frame, after the main board's frame.
     void run_frame();
     void reset();
+    // Taking over a linked game from the real board (gamerun --netboard sim on a state saved with m3::CommBoard):
+    // the net RAM the game wrote (the 68000's, big-endian words), the comm RAM banks as the main board reads them
+    // (the one it sees and the other), this cabinet's place on the ring; the link Ready, as after Testing. Without
+    // the banks (a board not linked yet): the net RAM only, the board at its start, running or not.
+    void take_over(const uint8_t* net_ram_68k, const uint8_t* host_bank, const uint8_t* other_bank, uint8_t machines,
+                   uint8_t index, bool running = true);
 
     enum class State : uint8_t { Start, Init, Testing, Ready, Error };
     State state() const { return state_; }

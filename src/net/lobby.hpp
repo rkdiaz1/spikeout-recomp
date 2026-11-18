@@ -31,7 +31,8 @@ public:
 
     // Connects (in the background) and says hello. `url`: the build's
     // lobby unless a test gives its own.
-    void connect(const std::string& build, const std::string& name, const std::string& url = kLobbyUrl);
+    // `kind`: "direct" for direct connect's rooms (docs/direct-connect.md), their own list; "" network play's.
+    void connect(const std::string& build, const std::string& name, const std::string& url = kLobbyUrl, const std::string& kind = "");
     bool connected() const { return connected_; }
     bool failed() const { return failed_; }
     std::string error() const;

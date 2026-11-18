@@ -395,6 +395,24 @@ void SimNetBoard::run_frame() {
         comm16(0x6, flip16(counter_));
         // Each cabinet's segment goes round the ring; every cabinet gets
         // all of them back, its own included.
+        if (link_->gathers()) { // (direct connect: the same table in one exchange; pass i brings the segment of the
+                                // cabinet i + 1 places before this one, the last pass this one's own back)
+            std::vector<std::vector<uint8_t>> by_distance;
+            const std::vector<uint8_t> own(comm_ram + 0x100, comm_ram + 0x100 + std::min<uint32_t>(segment_size_, 0xFF00));
+            if (!link_->gather(own.data(), own.size(), by_distance)) {
+                state_ = State::Error;
+                status1_ = 0x40;
+                break;
+            }
+            for (uint32_t i = 0; i < machines_; ++i) {
+                const uint32_t to = 0x100 + (i + 1) * segment_size_;
+                if (to + segment_size_ > 0x10000) break;
+                const std::vector<uint8_t>& in = i + 1 < machines_ && i < by_distance.size() ? by_distance[i] : own;
+                std::memcpy(comm_ram + to, in.data(), std::min<std::size_t>(in.size(), 0x10000 - to));
+            }
+            commbank_ = !commbank_;
+            break;
+        }
         for (uint32_t i = 0; i < machines_; ++i) {
             const uint32_t from = 0x100 + i * segment_size_, to = 0x100 + (i + 1) * segment_size_;
             if (to + segment_size_ > 0x10000) break;
@@ -414,6 +432,31 @@ void SimNetBoard::run_frame() {
     case State::Error:
         break;
     }
+}
+
+void SimNetBoard::take_over(const uint8_t* net_ram_68k, const uint8_t* host_bank, const uint8_t* other_bank, uint8_t machines,
+                            uint8_t index, bool running) {
+    // (net RAM: the PowerPC's 32-bit write of V << 16 puts flip16(V) here little-endian, and in the 68000's RAM
+    // big-endian: the same 16-bit value, so each word's bytes swapped)
+    for (std::size_t j = 0; j < 0x10000; j += 2) net_ram_[j] = net_ram_68k[j + 1], net_ram_[j + 1] = net_ram_68k[j];
+    if (!host_bank || !other_bank) {
+        running_ = running;
+        state_ = State::Start;
+        return;
+    }
+    commbank_ = false; // (external(): the first bank)
+    for (uint32_t a = 0; a < 0x10000; ++a) { // (read8: external()[a ^ 2])
+        buffer_[a ^ 2] = host_bank[a];
+        buffer_[0x10000 + (a ^ 2)] = other_bank[a];
+    }
+    running_ = true;
+    state_ = State::Ready;
+    irq2ack_ = 0x01;
+    machines_ = machines;
+    status0_ = 0;
+    status1_ = static_cast<uint16_t>(0x2021 + (machines - 1) * 0x20 + index);
+    segment_size_ = net_ram16(0x404);
+    counter_ = flip16(le16(&external()[0x6]));
 }
 
 // ---- Save states ----

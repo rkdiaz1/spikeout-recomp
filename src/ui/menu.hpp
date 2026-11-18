@@ -47,6 +47,14 @@ struct MenuItem {
     // A bar on the right, before the value: how far something has come, 0-100 (-1: none). The in-game update's
     // download; the page is made again as it moves.
     int progress = -1;
+    char progress_look = 0; // its fill: 0 yellow, 'g' green, 'r' red (an arcade link room's links: by their grade)
+    // A pill at the right end (an arcade link room's READY / WAITING): 'g' green, 'y' yellow, 'r' red, 'o' an orange
+    // outline (something to press: SET READY), 0 grey.
+    std::string badge;
+    char badge_look = 0;
+    // A button: the row drawn as a pill in the middle (an arcade link room's Ready); `on` filled green.
+    bool button = false;
+    bool button_on = false;
 };
 
 // A seat of a network game, in the list under the frame rate.
@@ -71,6 +79,11 @@ struct NetPills {
     bool auto_delay = false;
     int watchers = 0; // (spectators: an eye and their count after the header line; 0 none)
     int difficulty = -1; // (the room's: the arcade's level, 0 easiest - 4 hardest, a coloured pill after the header; -1 none)
+    // (an arcade link game: a line under the seats and a bar, the game's speed against the arcade's ("ARCADE SPEED",
+    // "94% SPEED · KIM'S LINK"), or, waiting for a player, the time left before the room ends; 'g' / 'y' / 'r')
+    std::string speed_text;
+    int speed_pct = -1;
+    char speed_look = 'g';
 };
 
 // A page for typing a short code (a game's): a box of its letters and an
@@ -107,6 +120,13 @@ struct MenuPage {
     std::shared_ptr<CodeInput> code; // a code page instead of items
     std::shared_ptr<TextInput> text; // a text page instead of items
     std::string qr;                  // shown as a QR code under the items (an address for a phone; "": none)
+    // A picture beside the rows, where a QR code goes (RML, absolute positions in dp inside a box of side_width x
+    // side_height), made again as the selected row changes (an arcade link room's ring of links: the selected
+    // player's lit).
+    std::function<std::string(int selected)> side;
+    // And moving things over it (the ring's pings), in a layer of their own, replaced only when it changes: the side's
+    // picture is made again as often as the page, which would start an animation over every time.
+    std::function<std::string(int selected)> side_fx;
 };
 
 class Menu {
@@ -193,6 +213,10 @@ private:
     bool open_ = false;
     bool fps_shown_ = false, net_shown_ = false, loading_shown_ = false, banner_shown_ = false, cover_shown_ = false;
     std::string net_rml_; // (what the seat list shows: not set again unchanged)
+    // A page's side picture (MenuPage::side) in its box, its moving layer only when it changes.
+    void show_side();
+    bool side_on_ = false;
+    std::string side_fx_rml_;
     void show_corner();   // the corner page shown while either is
     std::vector<MenuPage> stack_;
     std::vector<int> selected_stack_;

@@ -215,6 +215,7 @@
 #include "net_frame.hpp"
 #include "netplay.hpp"
 #include "net/compress.hpp"
+#include "direct_link.hpp"
 #include "input_log.hpp"
 #include "net/event_log.hpp" // (the network timeline: input delay changes, as the window's)
 #include "net_arrivals.hpp" // (--net-arrivals: a reported game's timing)
@@ -322,6 +323,13 @@ struct Options {
     std::optional<int64_t> clock;      // --clock SECONDS: the boards' clocks at power-on (else the host's time)
     // --net-host NAME --seats N / --net-join NAME: network play (tools::NetPlay)
     std::string net_host, net_join;
+    // Direct connect (docs/direct-connect.md): --direct-host SEATS[:PORT] or --direct-join ADDRESS:PORT, this process's
+    // own cabinet only, the link over the network; --direct-wait MS of the links measured before the start (host)
+    int direct_seats = 0;
+    uint16_t direct_port = 0;
+    std::string direct_join;
+    int direct_wait_ms = 2000;
+    bool direct_private = false; // (an internet room, --lobby URL: by its code only)
     bool net_spectate = false; // --net-spectate (with --net-join): a spectator: every board from the host's inputs, no seat
     uint8_t net_spectate_seat = 0; // --net-spectate-seat N: the seat (0-3) a spectator on one board watches
     bool pace = false; // --pace: at the arcade's speed (this process's own board held to the refresh)
@@ -1520,6 +1528,88 @@ m3::CommBoardOptions link_options(const Options& o) {
     return options;
 }
 
+// --netboard sim on linked boards: the simulated board's link as Supermodel's (TCP between cabinets): receive()
+// waits for the previous cabinet's packet, so each cabinet's frame end waits for the others' (lockstep). No time on
+// the wire. The boards run at once (--parallel), each frame's end in the same slice of each (a frame is 53 slices of 8
+// lines); a wait over kWaitLimit (a board stopped, or one in another slice) gives up: an empty packet, "the link
+// broke", said.
+class BlockingRing {
+public:
+    static constexpr auto kWaitLimit = std::chrono::seconds(20);
+    explicit BlockingRing(std::size_t boards) : inbox_(boards) {}
+    std::unique_ptr<m3::NetLink> port(std::size_t i) { return std::make_unique<Port>(*this, i); }
+    // Time spent waiting, by board (the stalls a late packet would be).
+    std::vector<double> waited() {
+        std::lock_guard lock(mutex_);
+        std::vector<double> w(waited_, waited_ + inbox_.size());
+        return w;
+    }
+
+private:
+    class Port : public m3::NetLink {
+    public:
+        Port(BlockingRing& ring, std::size_t i) : ring_(ring), i_(i) {}
+        void send(const uint8_t* data, std::size_t size) override {
+            {
+                std::lock_guard lock(ring_.mutex_);
+                ring_.inbox_[(i_ + 1) % ring_.inbox_.size()].emplace_back(data, data + size);
+            }
+            ring_.changed_.notify_all();
+        }
+        std::vector<uint8_t> receive() override {
+            std::unique_lock lock(ring_.mutex_);
+            auto& in = ring_.inbox_[i_];
+            const auto start = std::chrono::steady_clock::now();
+            if (!ring_.changed_.wait_for(lock, kWaitLimit, [&] { return !in.empty(); })) {
+                std::printf("sim link: board %zu waited %lld s for the previous cabinet's packet: given up (the link broke)\n", i_,
+                            static_cast<long long>(kWaitLimit.count()));
+                std::fflush(stdout);
+                return {};
+            }
+            ring_.waited_[i_ % 4] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::vector<uint8_t> p = std::move(in.front());
+            in.pop_front();
+            return p;
+        }
+        const std::vector<uint8_t>* peek() override {
+            std::lock_guard lock(ring_.mutex_);
+            return ring_.inbox_[i_].empty() ? nullptr : &ring_.inbox_[i_].front();
+        }
+        bool loopback() const override { return ring_.inbox_.size() == 1; }
+        // (SPIKEOUT_SIM_GATHER=1: direct connect's one exchange a frame instead of the ring's passes, to prove the
+        // tables the same)
+        bool gathers() const override { return ring_.gather_; }
+        bool gather(const uint8_t* own, std::size_t size, std::vector<std::vector<uint8_t>>& by_distance) override {
+            const std::size_t n = ring_.inbox_.size();
+            std::unique_lock lock(ring_.mutex_);
+            const uint64_t seq = seq_++;
+            ring_.table_[i_][seq].assign(own, own + size);
+            ring_.changed_.notify_all();
+            by_distance.assign(n - 1, {});
+            for (std::size_t d = 1; d < n; ++d) {
+                auto& from = ring_.table_[(i_ + n - d) % n];
+                if (!ring_.changed_.wait_for(lock, kWaitLimit, [&] { return from.count(seq) != 0; })) return false;
+                by_distance[d - 1] = from[seq];
+            }
+            ring_.table_[i_].erase(seq >= 2 ? seq - 2 : UINT64_MAX); // (each board takes its frame's before going on)
+            return true;
+        }
+
+    private:
+        BlockingRing& ring_;
+        std::size_t i_;
+        uint64_t seq_ = 0;
+    };
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<std::deque<std::vector<uint8_t>>> inbox_;
+    bool gather_ = std::getenv("SPIKEOUT_SIM_GATHER") != nullptr;
+    std::vector<std::map<uint64_t, std::vector<uint8_t>>> table_ = std::vector<std::map<uint64_t, std::vector<uint8_t>>>(inbox_.size());
+    double waited_[4] = {};
+};
+BlockingRing* g_blocking_ring = nullptr; // (--netboard sim with a state of linked boards)
+net::DirectRoom* g_direct_room = nullptr; // (--direct-host / --direct-join)
+
 // GAMERUN_ONEPC_CHECK: board 0's copy of player 2's first word, by frame, as board 0 wrote its own record's.
 std::map<uint64_t, uint32_t>& onepc_p2_word() {
     static std::map<uint64_t, uint32_t> seen;
@@ -1550,7 +1640,10 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         for (std::size_t i = 0; i < 64; ++i) bus.eeprom().words()[i] = static_cast<uint16_t>(eeprom[2 * i] << 8 | eeprom[2 * i + 1]);
     if (m.index < o.board_backup.size() && o.board_backup[m.index].size() == m3::Bus::kBackupRamSize)
         std::copy(o.board_backup[m.index].begin(), o.board_backup[m.index].end(), bus.backup_ram().begin());
-    if (o.real_netboard) {
+    // (--netboard sim from a state of linked boards, saved with the real board: loaded into the real one, then handed
+    // to the simulation, SimNetBoard::take_over)
+    const bool sim_takes_over = !o.real_netboard && ring && g_blocking_ring && (o.load_state || (m.linked && !m.linked->loaded.empty()));
+    if (o.real_netboard || sim_takes_over) {
         auto board = std::make_unique<m3::CommBoard>(ring ? ring->port(m.index) : nullptr, link_options(o));
         m.comm = board.get();
         m.comm->trace_limit = o.net_trace;
@@ -1560,6 +1653,8 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         else bus.use_netboard(std::move(board));
     } else if (ring) {
         bus.use_netboard(std::make_unique<m3::SimNetBoard>(ring->port(m.index)));
+    } else if (g_direct_room) {
+        bus.use_netboard(tools::direct_netboard(*g_direct_room));
     }
     m.c.set_scheduler(&m.timing);
     if (o.load_state || (m.linked && !m.linked->loaded.empty())) { // everything above that the game sees, as it was saved
@@ -1573,6 +1668,35 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         m.loaded = true;
         std::printf("Loaded %s: frame %llu, block %08x\n", o.load_state ? o.load_state : "the host's state",
                     static_cast<unsigned long long>(m.timing.frames()), m.c.cpu.pc);
+        if (sim_takes_over) {
+            std::vector<uint8_t> host(0x10000), other(0x10000);
+            m.comm->bank_view(true, host.data());
+            m.comm->bank_view(false, other.data());
+            auto sim = std::make_unique<m3::SimNetBoard>(g_blocking_ring->port(m.index));
+            uint32_t io_before[3], io_after[3];
+            const uint32_t io_addr[3] = {0xC0010000, 0xC0010110, 0xC0010114}; // (I/O 0x00 IRQ 2 ack, 0x88, 0x8A status)
+            for (int k = 0; k < 3; ++k) io_before[k] = m.comm->read32(io_addr[k]);
+            // (not linked yet, a state from power-on: the simulation from its start, as the game sets it up)
+            if (io_before[2] == 0) {
+                const bool run = m.comm->read32(0xC0010180) != 0; // (I/O 0xC0: the board let run)
+                sim->take_over(m.comm->ram().data(), nullptr, nullptr, 0, 0, run);
+                std::printf("board %zu: the real network board not linked yet (a state from power-on): the simulation from its "
+                            "start (%s)\n",
+                            m.index, sim->describe().c_str());
+            } else {
+                sim->take_over(m.comm->ram().data(), host.data(), other.data(), static_cast<uint8_t>(o.boards),
+                               static_cast<uint8_t>(m.index));
+                for (int k = 0; k < 3; ++k) io_after[k] = sim->read32(io_addr[k]);
+                std::printf("board %zu: the real network board's state handed to the simulation: %s; comm RAM header (as the "
+                            "main board reads it):",
+                            m.index, sim->describe().c_str());
+                for (int k = 0; k < 16; ++k) std::printf(" %02x", host[k]);
+                std::printf("; I/O 00/88/8A real %08x %08x %08x, simulated %08x %08x %08x\n", io_before[0], io_before[1],
+                            io_before[2], io_after[0], io_after[1], io_after[2]);
+            }
+            m.comm = nullptr;
+            bus.use_netboard(std::move(sim));
+        }
         // --inputs: the bot's writes after the state's frame and the first
         // frame's inputs, here where it resumed (as it did after its load)
         if (o.input_log && m.index == 0) {
@@ -2082,6 +2206,22 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         for (const Poke& k : o.pokes)
             if (for_board(k.board, m.index) && frame >= k.frame && frame < k.frame + k.frames)
                 m.bus.write8(k.addr, k.value);
+        if (g_direct_room) { // (direct connect: the room ended, the run with it; each 600 frames, how the link goes)
+            if (const std::string why = g_direct_room->ended(); !why.empty()) {
+                std::printf("direct: the room ended at frame %llu: %s\n", static_cast<unsigned long long>(frame), why.c_str());
+                std::fflush(stdout);
+                std::_Exit(3);
+            }
+            if (frame % 600 == 0) {
+                const auto c = g_direct_room->counters();
+                std::printf("direct: frame %llu: %llu exchanged, %llu stalled over 1 ms, %.2f s waited (longest %.1f ms), %llu "
+                            "resent; %s\n",
+                            static_cast<unsigned long long>(frame), static_cast<unsigned long long>(c.gathers),
+                            static_cast<unsigned long long>(c.stalled), c.waited_s, c.longest_ms,
+                            static_cast<unsigned long long>(c.resent), m.bus.netboard().describe().c_str());
+                std::fflush(stdout);
+            }
+        }
         if (o.ram_dump && m.index == static_cast<std::size_t>(o.ram_dump_board) && frame >= o.ram_dump_from &&
             frame < o.ram_dump_from + o.ram_dump_frames) { // --ram-dump: the frame, the logic counter (0x1000A8), the range
             static std::FILE* file = std::fopen(o.ram_dump, "wb");
@@ -3467,6 +3607,15 @@ void report(Machine& m, const Options& o) {
                 static_cast<unsigned long long>(c.decrementer_interrupts), bus.irq().enable(), bus.irq().state());
 
     std::printf("Network board: %s\n", bus.netboard().describe().c_str());
+    if (g_direct_room) { // (the run over: a goodbye, so the others end at once, not after their 10 s)
+        const auto c = g_direct_room->counters();
+        std::printf("direct: %llu exchanged, %llu stalled over 1 ms, %.2f s waited (longest %.1f ms), %llu resent\n",
+                    static_cast<unsigned long long>(c.gathers), static_cast<unsigned long long>(c.stalled), c.waited_s,
+                    c.longest_ms, static_cast<unsigned long long>(c.resent));
+        g_direct_room->leave();
+    }
+    if (g_blocking_ring && m.index < 4)
+        std::printf("Sim link: board %zu waited %.2f s for the others' packets\n", m.index, g_blocking_ring->waited()[m.index]);
     if (o.replay && m.index == 0)
         std::printf("Replay: %llu of %zu hashes matched the recording's%s\n", static_cast<unsigned long long>(m.replay_matched),
                     o.replay->hashes.size(),
@@ -3954,6 +4103,14 @@ int main(int argc_given, char** argv_given) {
         }
         else if (arg == "--clock" && i + 1 < argc) o.clock = std::strtoll(argv[++i], nullptr, 0);
         else if (arg == "--net-host" && i + 1 < argc) o.net_host = argv[++i];
+        else if (arg == "--direct-host" && i + 1 < argc) {
+            unsigned seats = 0, port = 0;
+            std::sscanf(argv[++i], "%u:%u", &seats, &port);
+            o.direct_seats = static_cast<int>(seats), o.direct_port = static_cast<uint16_t>(port);
+        }
+        else if (arg == "--direct-join" && i + 1 < argc) o.direct_join = argv[++i];
+        else if (arg == "--direct-wait" && i + 1 < argc) o.direct_wait_ms = std::atoi(argv[++i]);
+        else if (arg == "--direct-private") o.direct_private = true;
         else if (arg == "--net-join" && i + 1 < argc) o.net_join = argv[++i];
         else if (arg == "--net-spectate") o.net_spectate = true;
         else if (arg == "--pace") o.pace = true;
@@ -4368,6 +4525,107 @@ int main(int argc_given, char** argv_given) {
                              "--load-state FILE, the default slice\n");
         return 2;
     }
+    // Direct connect: the room first (the host waits for every seat and the links' measures, then starts; a joiner
+    // waits for the start), then this process's own cabinet alone, its link the room's
+    static std::unique_ptr<net::DirectRoom> direct_room;
+    if (o.direct_seats || !o.direct_join.empty()) {
+        if (networked || o.boards != 1 || o.load_state || o.net_replay) {
+            std::fprintf(stderr, "gamerun: --direct-host/--direct-join run one board from power-on, no other network play\n");
+            return 2;
+        }
+        o.real_netboard = false;
+        direct_room = std::make_unique<net::DirectRoom>(
+            tools::direct_build_id(tools::build_id(roms, functions.size(), nullptr)),
+            [](const std::string& s) { std::printf("%s%s\n", s.c_str(), net_time_said().c_str()), std::fflush(stdout); });
+        const bool hosting = o.direct_seats != 0;
+        const std::string name = hosting ? "host" : "player";
+        if (!hosting && o.direct_join == "lan") { // (--direct-join lan: the first room the LAN's beacons offer, as the window)
+            net::DirectDiscovery discovery(tools::direct_build_id(tools::build_id(roms, functions.size(), nullptr)));
+            if (!discovery.open()) {
+                std::fprintf(stderr, "gamerun: direct: can't look for rooms: %s\n", discovery.error().c_str());
+                return 1;
+            }
+            const auto since = std::chrono::steady_clock::now();
+            for (bool found = false; !found;) {
+                for (const net::DirectRoomInfo& r : discovery.poll())
+                    if (!found && !r.started && r.taken < r.seats) {
+                        std::printf("direct: found %s's room (%u of %u) at %s\n", r.name.c_str(), r.taken, r.seats, r.host.str().c_str());
+                        o.direct_join = r.host.str(), found = true;
+                    }
+                if (std::chrono::steady_clock::now() - since > std::chrono::seconds(30)) {
+                    std::fprintf(stderr, "gamerun: direct: no room found on the network in 30 s\n");
+                    return 1;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        // (internet rooms: --lobby URL with --direct-host (--direct-private: by its code only), or --direct-join code:CODE)
+        static tools::DirectLobby direct_lobby;
+        const bool by_lobby = hosting ? !o.lobby_url.empty() : o.direct_join.rfind("code:", 0) == 0;
+        const uint64_t room_build = tools::direct_build_id(tools::build_id(roms, functions.size(), nullptr));
+        std::string why;
+        if (by_lobby) {
+            const std::string url = o.lobby_url.empty() ? std::string(net::kLobbyUrl) : o.lobby_url;
+            if (hosting ? !tools::direct_lobby_host(direct_lobby, *direct_room, room_build, name, static_cast<uint8_t>(o.direct_seats),
+                                                    !o.direct_private, why, url)
+                        : !tools::direct_lobby_join(direct_lobby, *direct_room, room_build, name, o.direct_join.substr(5), why, url)) {
+                std::fprintf(stderr, "gamerun: direct: %s\n", why.c_str());
+                return 1;
+            }
+            if (hosting) std::printf("direct: the room's code: %s\n", direct_lobby.code.c_str());
+            if (direct_room->public_address()) std::printf("direct: our address on the internet found\n");
+            std::fflush(stdout);
+        } else if (hosting ? !direct_room->host(name, static_cast<uint8_t>(o.direct_seats), o.direct_port)
+                           : !direct_room->join(net::parse_address(o.direct_join).value_or(net::Address{}), name)) {
+            std::fprintf(stderr, "gamerun: direct: %s\n", direct_room->error().c_str());
+            return 1;
+        }
+        auto print_view = [](const net::DirectRoom::View& v) {
+            for (uint8_t a = 0; a < v.seats; ++a)
+                for (uint8_t b = static_cast<uint8_t>(a + 1); b < v.seats; ++b) {
+                    const auto& l = v.links[a][b];
+                    std::printf("direct: link %u-%u: %s, one way %.2f ms, spread %.2f ms\n", a + 1, b + 1,
+                                l.direct ? "direct" : "not connected", l.one_way_ms, l.spread_ms);
+                }
+            std::fflush(stdout);
+        };
+        direct_room->set_ready(true); // (tests: ready at once)
+        const auto since = std::chrono::steady_clock::now();
+        bool all_in_at = false;
+        auto all_in = std::chrono::steady_clock::now();
+        while (!direct_room->started()) {
+            const std::string why = direct_room->ended();
+            if (!why.empty()) {
+                std::fprintf(stderr, "gamerun: direct: %s\n", why.c_str());
+                return 1;
+            }
+            if (hosting && by_lobby) tools::direct_lobby_pump(direct_lobby, *direct_room);
+            if (hosting) {
+                std::string not_yet;
+                if (direct_room->can_start(&not_yet)) {
+                    if (!all_in_at) all_in_at = true, all_in = std::chrono::steady_clock::now();
+                    if (std::chrono::steady_clock::now() - all_in >= std::chrono::milliseconds(o.direct_wait_ms)) {
+                        print_view(direct_room->view());
+                        direct_room->start();
+                    }
+                } else {
+                    all_in_at = false;
+                }
+            }
+            if (std::chrono::steady_clock::now() - since > std::chrono::minutes(10)) {
+                std::fprintf(stderr, "gamerun: direct: the room didn't start in 10 minutes\n");
+                return 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!hosting) print_view(direct_room->view());
+        g_direct_room = direct_room.get();
+        const uint8_t seat = direct_room->view().my_seat;
+        Poke link_role; // (the cabinet's link setting, as the window writes it: master or slave)
+        link_role.addr = tools::kLinkSettingAddr, link_role.value = seat == 0 ? 1 : 2, link_role.frames = tools::kLinkSettingFrames;
+        o.pokes.push_back(link_role);
+        std::printf("direct: started, seat %u of %u\n", seat + 1, direct_room->view().seats);
+    }
     tools::InputTable inputs(networked ? net::kMaxSeats : o.boards);
     std::unique_ptr<tools::NetPlay> netplay;
     std::jthread spectate_end; // (a spectator: its game ended, the input table closed: stopped before netplay goes)
@@ -4653,6 +4911,8 @@ int main(int argc_given, char** argv_given) {
     if (o.boards > 1) {
         ring = std::make_unique<m3::LinkRing>(o.boards);
         g_ring = ring.get();
+        static std::unique_ptr<BlockingRing> blocking;
+        if (!o.real_netboard && o.parallel) blocking = std::make_unique<BlockingRing>(o.boards), g_blocking_ring = blocking.get();
         // (tests: ONEBOARD_SENDS=B:FROM:TO prints board B's packets taken in and sent (as the ring's exchange passes them
         // on, numbered by it) from FROM to TO, with a hash of each)
         if (const char* spec = std::getenv("ONEBOARD_SENDS")) {

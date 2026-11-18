@@ -100,6 +100,7 @@
 #include "arcade_settings.hpp"
 #include "net_frame.hpp"
 #include "netplay.hpp"
+#include "direct_link.hpp"
 #include "net/compress.hpp"
 #include "net/install.hpp"
 #include "net/update.hpp"
@@ -282,6 +283,10 @@ struct Shared {
     tools::NetPlay* netplay = nullptr;
     tools::InputTable* inputs = nullptr;
     std::size_t local = 0;
+    // Direct connect (docs/direct-connect.md): this PC's own cabinet only, its link the room's (the simulated board,
+    // tools::direct_netboard); `direct_seat` its place on the ring (0: the master). Never paused, no save states.
+    net::DirectRoom* direct = nullptr;
+    uint8_t direct_seat = 0;
     std::atomic<uint64_t> input_delay{0}; // (Auto: changed in play, read by the boards each frame)
     net::StartInfo net_start;
     // Every board's state: saved for a machine that asks (a player joining
@@ -866,7 +871,8 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                 std::printf("spikeout: can't record to %s\n", path.c_str());
         }
     }
-    if (shared.real_netboard) {
+    if (shared.direct) bus.use_netboard(tools::direct_netboard(*shared.direct)); // (direct connect: the room's link)
+    else if (shared.real_netboard) {
         m3::CommBoardOptions options;
         if (shared.old_link) options.use_old_link();
         bus.use_netboard(std::make_unique<m3::CommBoard>(ring ? ring->port(index) : nullptr, options));
@@ -874,8 +880,9 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
     else if (ring) bus.use_netboard(std::make_unique<m3::SimNetBoard>(ring->port(index)));
     bus.midi_burst = shared.midi_burst;
     bus.dma_timed = !shared.dma_instant;
-    const bool linked = ring != nullptr;
-    const uint8_t link_setting = index == 0 ? 1 : 2; // master, slave
+    const bool linked = ring != nullptr || shared.direct != nullptr;
+    const std::size_t ring_place = shared.direct ? shared.direct_seat : index;
+    const uint8_t link_setting = ring_place == 0 ? 1 : 2; // master, slave
 
     recomp::Context c(bus, functions);
     const std::vector<recomp::FunctionEntry> blocks = tools::game_blocks();
@@ -1291,7 +1298,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         // shape changed meanwhile: this frame made again for it (its 3D from
         // the Real3D's memory as it is, its 2D's sides from the layers; those
         // the tile generator draws itself come with the next frame).
-        while (shared.paused && !networked && !shared.quit) { // (network play goes on: the others play)
+        while (shared.paused && !networked && !shared.direct && !shared.quit) { // (network play goes on: the others play)
             repace = true;
             if (shared.gpu_3d && index == shown && shared.extend != built_extend) {
                 build_gpu_frame();
@@ -2279,6 +2286,76 @@ std::string player_name(const tools::Settings& settings) {
     return "PLAYER";
 }
 
+// An arcade link room's ring (docs/direct-connect.md; the owner's choices, 2026-11-17): the four cabinets always, 1P
+// at the top and on round clockwise, a line for every pair coloured by its link's grade (the menu's .rl, .rs, .rn and
+// .rt styles); seats not in this room grey, a seat in it nobody has taken "(FREE)"; seat `lit`'s links thick, with
+// their times on them, the others thin and faint.
+std::string direct_ring_rml(const net::DirectRoom::View& v, int lit) {
+    static constexpr float kAt[4][2] = {{125, 32}, {218, 125}, {125, 218}, {32, 125}}; // (each seat's middle, dp)
+    auto dp = [](float x) {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%.1fdp", x);
+        return std::string(buf);
+    };
+    std::string rml = "<div class=\"ring\">", times;
+    for (int a = 0; a < 4; ++a)
+        for (int b = a + 1; b < 4; ++b) {
+            const float ax = kAt[a][0], ay = kAt[a][1], bx = kAt[b][0], by = kAt[b][1];
+            const float len = std::hypot(bx - ax, by - ay), deg = std::atan2(by - ay, bx - ax) * 180.0f / 3.14159265f;
+            const bool in = a < v.seats && b < v.seats && v.seat[a].present && v.seat[b].present;
+            const auto& l = v.links[a][b];
+            const tools::LinkGrade g = in ? tools::grade(l) : tools::LinkGrade::none;
+            const bool on = in && (a == lit || b == lit);
+            const char* look = !in || g == tools::LinkGrade::none || g == tools::LinkGrade::measuring ? "off"
+                               : g == tools::LinkGrade::good                                          ? "g"
+                               : g == tools::LinkGrade::warn                                          ? "y"
+                                                                                                      : "r";
+            rml += "<div class=\"rl " + std::string(look) + (on ? "" : " thin") + (in && !on ? " faint" : "") + "\" style=\"left: " +
+                   dp(ax) + "; top: " + dp(ay - (on ? 2 : 1)) + "; width: " + dp(len) + "; transform: rotate(" + dp(deg).substr(0, dp(deg).size() - 2) +
+                   "deg);\"></div>";
+            if (on && l.direct && l.one_way_ms >= 0) {
+                char t[24];
+                std::snprintf(t, sizeof t, "%.1f ms", l.one_way_ms);
+                times += "<div class=\"rt\" style=\"left: " + dp((ax + bx) / 2 - 28) + "; top: " + dp((ay + by) / 2 - 9) + ";\">" + t + "</div>";
+            }
+        }
+    for (int s = 0; s < 4; ++s) {
+        const bool in = s < v.seats;
+        const std::string cls = std::string("rs") + (!in ? " out" : "") + (s == v.my_seat ? " me" : "") + (s == lit && in ? " sel" : "");
+        rml += "<div class=\"" + cls + "\" style=\"left: " + dp(kAt[s][0] - 22) + "; top: " + dp(kAt[s][1] - 22) + ";\">" +
+               std::to_string(s + 1) + "P</div>";
+        std::string name = !in ? "-" : v.seat[s].present ? v.seat[s].name : "(FREE)";
+        for (char& c : name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (name.size() > 12) name.resize(12);
+        rml += "<div class=\"rn" + std::string(in ? "" : " out") + "\" style=\"left: " + dp(kAt[s][0] - 45) + "; top: " +
+               dp(s == 0 ? kAt[s][1] - 44 : kAt[s][1] + 24) + ";\">" + name + "</div>";
+    }
+    return rml + times + "</div>";
+}
+
+// And its pings (the owner's choice, 2026-11-18: a dot from seat `lit` out to each player it is linked to and back, as
+// the room's own pings), in the ring's moving layer (MenuPage::side_fx): the same only while the lit links are.
+std::string direct_ring_fx_rml(const net::DirectRoom::View& v, int lit) {
+    static constexpr float kAt[4][2] = {{125, 32}, {218, 125}, {125, 218}, {32, 125}}; // (as direct_ring_rml's)
+    auto dp = [](float x) {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%.1f", x);
+        return std::string(buf);
+    };
+    if (lit < 0 || lit >= v.seats || !v.seat[lit].present) return {};
+    std::string rml;
+    for (int o = 0; o < v.seats; ++o) {
+        if (o == lit || !v.seat[o].present || !v.links[lit][o].direct || v.links[lit][o].one_way_ms < 0) continue;
+        const float ax = kAt[lit][0], ay = kAt[lit][1], bx = kAt[o][0], by = kAt[o][1];
+        const float whole = std::hypot(bx - ax, by - ay), deg = std::atan2(by - ay, bx - ax) * 180.0f / 3.14159265f;
+        constexpr float kEdge = 26; // (from edge to edge of the seats' circles: the dot never over a seat's name)
+        const float sx = ax + (bx - ax) / whole * kEdge, sy = ay + (by - ay) / whole * kEdge, len = whole - 2 * kEdge;
+        rml += "<div class=\"rfx\" style=\"left: " + dp(sx) + "dp; top: " + dp(sy) + "dp; width: " + dp(len) + "dp; transform: rotate(" +
+               dp(deg) + "deg);\"><div class=\"rping\"></div></div>";
+    }
+    return rml;
+}
+
 // The effects' and the music's volumes (percent), under the overall one.
 int effects_volume(const tools::Settings& s) { return s.sound_volume * s.volume / 100; }
 int music_volume(const tools::Settings& s) { return s.music_volume * s.volume / 100; }
@@ -3092,6 +3169,7 @@ int main(int argc, char** argv) {
     auto stop_games = [&] {
         shared.quit = true;
         if (shared.inputs) shared.inputs->close(); // (a board waiting for another player's inputs)
+        if (shared.direct) shared.direct->stop(); // (direct connect: a board waiting for the others' link data)
         for (tools::GameThread& g : games) g.join();
         games.clear();
     };
@@ -3244,6 +3322,25 @@ int main(int argc, char** argv) {
                     test_state_file.size() / 1024);
     }
     std::unique_ptr<NetGame> netgame;
+    // ---- Direct connect (docs/direct-connect.md): a room of friends, each computer its own cabinet only ----
+    std::unique_ptr<net::DirectRoom> direct_room;
+    std::unique_ptr<net::DirectDiscovery> direct_discovery; // (rooms on this network, while the page is open)
+    int direct_seats = 2;
+    bool direct_running = false;
+    bool direct_close_asked = false; // (the window's close asked for, the game going: Leave closes it)
+    // (internet rooms: the lobby's connection (the host's for the room's life), going to it on a thread of its own
+    // (some seconds: the lobby, our address); what went wrong there, taken by the window; the listed rooms)
+    std::unique_ptr<tools::DirectLobby> direct_lobby;
+    std::thread direct_worker;
+    std::atomic<bool> direct_busy{false};
+    std::mutex direct_failed_lock;
+    std::string direct_failed;
+    int direct_where = 0; // (hosting: 0 this network, 1 the internet listed, 2 the internet by its code only)
+    std::unique_ptr<net::LobbyClient> direct_browser;
+    std::vector<net::Json> direct_listed;
+    bool direct_list_asked = false;
+    std::chrono::steady_clock::time_point direct_list_at{};
+    const uint64_t direct_build = tools::direct_build_id(tools::build_id(roms, tools::game_functions().size(), nullptr));
     // (the network game's start, for its numbers when it ends: tools/problem_report.hpp, part 2)
     std::chrono::steady_clock::time_point net_game_began{};
     uint64_t net_game_first_frame = 0;
@@ -5083,6 +5180,330 @@ int main(int argc, char** argv) {
         };
         return p;
     };
+    // ---- Direct connect's pages (docs/direct-connect.md) ----
+    // Out of the room: the game (if it had started) back to this computer's own, the room let go.
+    auto direct_end = [&](const std::string& why) {
+        if (!direct_room) return;
+        if (direct_worker.joinable()) direct_worker.join(); // (going to the lobby: its answer first, some seconds at most)
+        direct_busy = false;
+        direct_lobby.reset(); // (the room's listing goes with the lobby's connection)
+        direct_room->leave();
+        if (direct_running)
+            reset_game([&] {
+                shared.direct = nullptr;
+                boards = own_boards;
+                shared.boards = boards;
+                focus = 0;
+                if (!test_run) save_nvram(data_folder, shared, 1); // (this computer's cabinet, as it played)
+            });
+        direct_running = false;
+        direct_room.reset();
+        if (!why.empty()) {
+            std::string upper = why;
+            for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            shared.say(upper, 8);
+        }
+        std::printf("spikeout: direct: out of the room%s%s\n", why.empty() ? "" : ": ", why.c_str());
+    };
+    std::function<ui::MenuPage()> direct_room_page;
+    // An internet room: hosted (`code` empty: listed or private, direct_where) or joined by its code, through the lobby
+    // on a thread of its own (some seconds); its room page meanwhile.
+    auto direct_internet = [&](const std::string& code) {
+        direct_room = std::make_unique<net::DirectRoom>(direct_build, [](const std::string& s) { std::printf("spikeout: %s\n", s.c_str()); });
+        direct_lobby = std::make_unique<tools::DirectLobby>();
+        {
+            std::lock_guard guard(direct_failed_lock);
+            direct_failed.clear();
+        }
+        direct_busy = true;
+        const std::string name = player_name(settings);
+        const auto seats = static_cast<uint8_t>(direct_seats);
+        const bool listed = direct_where == 1;
+        direct_worker = std::thread([&, name, seats, listed, code] {
+            std::string why;
+            const bool ok = code.empty()
+                                ? tools::direct_lobby_host(*direct_lobby, *direct_room, direct_build, name, seats, listed, why)
+                                : tools::direct_lobby_join(*direct_lobby, *direct_room, direct_build, name, code, why);
+            if (!ok) {
+                std::lock_guard guard(direct_failed_lock);
+                direct_failed = why.empty() ? "can't reach the lobby" : why;
+            }
+            direct_busy = false;
+        });
+        menu.open(make_root());
+        menu.push(direct_room_page());
+    };
+    // Leaving a game that has started ends it for everyone: asked first (the owner, 2026-11-17).
+    auto direct_leave_page = [&] {
+        ui::MenuPage p{"Leave the game?", "Leaving ends the game for everyone in the room: no cabinet can go on without its "
+                                          "player's computer.",
+                       {}};
+        p.items.push_back({"Stay", "Back to the game.", {}, {}, [&] {
+                               direct_close_asked = false;
+                               menu.pop();
+                           }});
+        p.items.push_back({"Leave", "End the game for everyone and leave the room.", {}, {}, [&] {
+                               direct_end("");
+                               menu.open(make_root());
+                               if (std::exchange(direct_close_asked, false)) { // (asked by closing the window: closed now)
+                                   SDL_Event quit{};
+                                   quit.type = SDL_EVENT_QUIT;
+                                   SDL_PushEvent(&quit);
+                               }
+                           }});
+        return p;
+    };
+    direct_room_page = [&] {
+        ui::MenuPage p{"Arcade link room", "", {}};
+        if (!direct_room) return p;
+        const net::DirectRoom::View v = direct_room->view();
+        const bool host = v.my_seat == 0;
+        p.items.push_back({"Status", "", [&] {
+                               if (!direct_room) return std::string("Left");
+                               if (direct_busy) return std::string("Going to the lobby...");
+                               const auto w = direct_room->view();
+                               if (!w.ended.empty()) return w.ended;
+                               if (w.my_seat == 0xFF) return std::string("Joining...");
+                               if (w.started) return std::string("Playing");
+                               std::string why;
+                               if (w.my_seat == 0) return direct_room->can_start(&why) ? std::string("Everyone is ready") : why;
+                               return std::string(w.seat[w.my_seat].ready ? "Ready: waiting for the host" : "Not ready");
+                           },
+                           {}, {}, true});
+        if (direct_lobby && host)
+            p.items.push_back({"Room code", "Your friends join with this code (Arcade link, Join by code).",
+                               [&] {
+                                   if (!direct_lobby || direct_busy) return std::string("...");
+                                   return direct_lobby->code.empty() ? std::string("...") : direct_lobby->code;
+                               },
+                               {}, {}, true});
+        // (each seat a row (the owner's choice, 2026-11-17: the list beside the ring): its link to this player as the
+        // glossy bar (10 ms its whole length), coloured by its grade, the time, READY or WAITING; the selected row's
+        // links lit in the ring beside, and said in words under the rows)
+        auto upper = [](std::string s) {
+            for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return s;
+        };
+        auto said = [](float ms) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.1f ms", ms);
+            return std::string(buf);
+        };
+        std::vector<int> seat_of_item(p.items.size(), -1);
+        for (uint8_t s = 0; s < v.seats; ++s) {
+            const auto& seat = v.seat[s];
+            const bool me = s == v.my_seat;
+            ui::MenuItem it{std::to_string(s + 1) + "P  " + (seat.present ? upper(seat.name) + (me ? " (YOU)" : "") : "(FREE)")};
+            // (its words: this seat's links to every other one, the slowest named)
+            std::string words, slowest;
+            float worst = -1;
+            for (uint8_t o = 0; o < v.seats; ++o)
+                if (o != s && seat.present && v.seat[o].present) {
+                    const auto& l = v.links[s][o];
+                    const std::string who = o == v.my_seat ? std::string("you") : v.seat[o].name;
+                    words += (words.empty() ? "" : ", ") + (l.direct && l.one_way_ms >= 0 ? said(l.one_way_ms) : std::string("not yet")) +
+                             " to " + who;
+                    if (l.one_way_ms > worst) worst = l.one_way_ms, slowest = who;
+                }
+            it.help = !seat.present ? "A free seat: waiting for a player."
+                      : words.empty() ? std::string("Waiting for the others.")
+                                      : (me ? std::string("Your links: ") : seat.name + ": ") + words + "." +
+                                            (worst > tools::kFarOneWayMs    ? " The link to " + slowest + " is too far for the arcade's link."
+                                             : worst > tools::kGoodOneWayMs ? " The link to " + slowest + " may slow the game now and then."
+                                                                            : "");
+            if (!me && seat.present && v.my_seat < v.seats) {
+                const auto& l = v.links[v.my_seat][s];
+                const tools::LinkGrade g = tools::grade(l);
+                if (l.direct && l.one_way_ms >= 0) { // (the glossy bar, full for a short link: tools::link_bar)
+                    it.progress = tools::link_bar(l);
+                    it.progress_look = g == tools::LinkGrade::good ? 'g' : g == tools::LinkGrade::warn ? 0 : 'r';
+                    const std::string t = g == tools::LinkGrade::too_far ? "TOO FAR" : said(l.one_way_ms);
+                    it.value = [t] { return t; };
+                } else {
+                    it.value = [g] { return std::string(g == tools::LinkGrade::none ? "NO LINK" : "..."); };
+                }
+            }
+            if (seat.present) it.badge = seat.ready ? "READY" : "WAITING", it.badge_look = seat.ready ? 'g' : 0;
+            if (me && !v.started) { // (our own row is our Ready (the owner's choice): its pill says to press it)
+                it.badge = seat.ready ? "READY" : "SET READY", it.badge_look = seat.ready ? 'g' : 'o';
+                it.help = (seat.ready ? std::string("You're ready (Enter / A or a click: not ready). ")
+                                      : std::string("Enter / A or a click: ready. The host starts the game once everyone is. ")) +
+                          it.help;
+                it.activate = [&] {
+                    if (!direct_room) return;
+                    const auto w = direct_room->view();
+                    if (w.my_seat >= w.seats) return;
+                    const bool now_ready = !w.seat[w.my_seat].ready;
+                    const tools::LinkGrade g = tools::my_grade(w);
+                    if (now_ready && (g == tools::LinkGrade::none || (g == tools::LinkGrade::too_far && !std::getenv("SPIKEOUT_TEST_ANY_DISTANCE")))) { // (tests: SPIKEOUT_TEST_ANY_DISTANCE=1, Ready however far)
+                        shared.say(g == tools::LinkGrade::none ? "NOT CONNECTED DIRECTLY TO EVERYONE YET" : "A LINK IS TOO FAR FOR THE ARCADE'S LINK", 5);
+                        return;
+                    }
+                    if (now_ready && g == tools::LinkGrade::warn) shared.say("A LINK MAY SLOW THE GAME NOW AND THEN", 5);
+                    direct_room->set_ready(now_ready);
+                    menu.replace(direct_room_page());
+                };
+            }
+            p.items.push_back(std::move(it));
+            seat_of_item.push_back(s);
+        }
+        // (beside them, the ring of every cabinet's link, four seats always (the owner's choice): those not in this room
+        // grey, the selected row's seat's links lit with their times)
+        const uint8_t my = v.my_seat < v.seats ? v.my_seat : 0;
+        p.side = [&, seat_of_item, my](int selected) {
+            if (!direct_room) return std::string();
+            const int lit = selected >= 0 && static_cast<std::size_t>(selected) < seat_of_item.size() && seat_of_item[static_cast<std::size_t>(selected)] >= 0
+                                ? seat_of_item[static_cast<std::size_t>(selected)]
+                                : my;
+            return direct_ring_rml(direct_room->view(), lit);
+        };
+        p.side_fx = [&, seat_of_item, my](int selected) {
+            if (!direct_room) return std::string();
+            const int lit = selected >= 0 && static_cast<std::size_t>(selected) < seat_of_item.size() && seat_of_item[static_cast<std::size_t>(selected)] >= 0
+                                ? seat_of_item[static_cast<std::size_t>(selected)]
+                                : my;
+            return direct_ring_fx_rml(direct_room->view(), lit);
+        };
+        if (!v.started) {
+            if (host) {
+                std::string why;
+                const bool can = direct_room->can_start(&why);
+                ui::MenuItem start_button{can ? "START" : "START  \xC2\xB7  " + upper(why),
+                                          can ? "Every cabinet from power-on together." : "Once everyone is ready, every cabinet starts from power-on together.",
+                                          {}, {}, [&, upper] {
+                                              std::string not_yet;
+                                              if (!direct_room) return;
+                                              if (!direct_room->start() && !direct_room->can_start(&not_yet)) shared.say(upper(not_yet), 5);
+                                          }};
+                start_button.button = true, start_button.dim = !can;
+                p.items.push_back(std::move(start_button));
+            } else { // (a joiner: where the host has Start, what the room is waiting for: a pill, not selectable)
+                std::string waiting_for;
+                for (uint8_t s = 0; s < v.seats; ++s)
+                    if (!v.seat[s].present) waiting_for = "PLAYERS";
+                if (waiting_for.empty())
+                    for (uint8_t s = 0; s < v.seats; ++s)
+                        if (!v.seat[s].ready) {
+                            waiting_for = (s == v.my_seat ? std::string("YOU") : upper(v.seat[s].name)) + " TO BE READY";
+                            break;
+                        }
+                if (waiting_for.empty()) waiting_for = upper(v.seat[0].name) + " TO START";
+                ui::MenuItem waiting{"WAITING FOR " + waiting_for};
+                waiting.button = true, waiting.dim = true, waiting.info = true;
+                p.items.push_back(std::move(waiting));
+            }
+            p.items.push_back({host ? "Close room" : "Leave room", host ? "Close the room." : "Leave the room.", {}, {}, [&] {
+                                   direct_end("");
+                                   menu.open(make_root());
+                               }});
+        } else {
+            p.items.push_back({"Leave game", "Leaving ends the game for everyone in the room.", {}, {},
+                               [&] { menu.push(direct_leave_page()); }});
+        }
+        return p;
+    };
+    auto direct_host_page = [&] {
+        ui::MenuPage p{"Host an arcade link room", "", {}};
+        p.items.push_back({"Players", "How many cabinets (one for each player's computer).", [&] { return std::to_string(direct_seats); },
+                           [&](int d) { direct_seats = std::clamp(direct_seats + d, 2, static_cast<int>(net::kDirectSeats)); }});
+        if (net::LobbyClient::available())
+            p.items.push_back({"Where",
+                               "This network: computers on your network find it (no internet needed). Internet (listed): in "
+                               "the lobby's Arcade link list. Internet (private): only by its code.",
+                               [&] {
+                                   return std::string(direct_where == 0 ? "This network" : direct_where == 1 ? "Internet (listed)"
+                                                                                                             : "Internet (private)");
+                               },
+                               [&](int d) { direct_where = (direct_where + d + 3) % 3; }});
+        p.items.push_back({"Start hosting", "Open the room; the others find it in Arcade link.", {}, {}, [&] {
+                               if (direct_where != 0 && net::LobbyClient::available()) return direct_internet("");
+                               direct_room = std::make_unique<net::DirectRoom>(direct_build, [](const std::string& s) {
+                                   std::printf("spikeout: %s\n", s.c_str());
+                               });
+                               if (!direct_room->host(player_name(settings), static_cast<uint8_t>(direct_seats))) {
+                                   shared.say("CAN'T HOST: " + direct_room->error(), 5);
+                                   direct_room.reset();
+                                   return;
+                               }
+                               menu.open(make_root());
+                               menu.push(direct_room_page());
+                           }});
+        p.items.push_back(back_item());
+        return p;
+    };
+    // Join by code: typed or picked (ui::CodeInput, as network play's).
+    auto direct_code_page = [&] {
+        ui::MenuPage p{"Join by code",
+                       "Type the code the host's room page shows (Ctrl+V pastes it), or pick its letters below. Backspace / Y: "
+                       "delete. Enter / Start: join.",
+                       {}};
+        p.code = std::make_shared<ui::CodeInput>();
+        p.code->alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        p.code->length = 6;
+        p.code->done = [&](const std::string& code) { direct_internet(code); };
+        return p;
+    };
+    auto direct_page = [&] {
+        ui::MenuPage p{"Arcade link",
+                       "The arcade's link: each computer runs only its own cabinet, the cabinets linked over the network as "
+                       "the cable was. For friends very close: a LAN, or a few milliseconds apart. No joining after the "
+                       "start; if the network can't keep up, the game slows down.",
+                       {}};
+        if (direct_room) {
+            p.items.push_back({"Your room", "The room you're in.", {}, {}, [&] { menu.push(direct_room_page()); }});
+            p.items.push_back(back_item());
+            return p;
+        }
+        if (!direct_discovery) {
+            direct_discovery = std::make_unique<net::DirectDiscovery>(direct_build);
+            if (!direct_discovery->open()) std::printf("spikeout: can't look for arcade link rooms: %s\n", direct_discovery->error().c_str());
+        }
+        if (!direct_browser && net::LobbyClient::available()) { // (the lobby's listed rooms: asked while this page is open)
+            direct_browser = std::make_unique<net::LobbyClient>();
+            direct_browser->connect(tools::direct_hex(direct_build), player_name(settings), net::kLobbyUrl, "direct");
+            direct_listed.clear(), direct_list_asked = false;
+        }
+        p.items.push_back({"Host a room", "Open a room for your friends, on this network or on the internet.", {}, {},
+                           [&] { menu.push(direct_host_page()); }});
+        if (net::LobbyClient::available())
+            p.items.push_back({"Join by code", "A room on the internet, by the code its host gives you.", {}, {},
+                               [&] { menu.push(direct_code_page()); }});
+        const auto rooms = direct_discovery->poll();
+        if (rooms.empty() && direct_listed.empty()) p.items.push_back({"No rooms open yet", "", {}, {}, {}, true});
+        for (const net::Json& g : direct_listed) { // (the internet's listed rooms)
+            const std::string code = g["code"].as_string();
+            const int seats = static_cast<int>(g["seats"].as_number()), taken = static_cast<int>(g["taken"].as_number());
+            const bool started = g["started"].as_bool();
+            ui::MenuItem item{g["name"].as_string() + "'s room  " + std::to_string(taken) + "/" + std::to_string(seats) +
+                                  (started ? "  PLAYING" : ""),
+                              started ? "This room's game has started." : "Join this room on the internet.", {}, {},
+                              [&, code, started, taken, seats] {
+                                  if (!started && taken < seats) direct_internet(code);
+                              }};
+            item.country = g["country"].as_string();
+            item.estimate_ms = static_cast<int>(g["ms"].as_number(-1));
+            p.items.push_back(std::move(item));
+        }
+        for (const net::DirectRoomInfo& r : rooms) {
+            const std::string label = r.name + "'s room  " + std::to_string(r.taken) + "/" + std::to_string(r.seats) +
+                                      (r.started ? "  PLAYING" : "");
+            p.items.push_back({label, r.started ? "This room's game has started." : "Join this room.", {}, {}, [&, r] {
+                                   if (r.started || r.taken >= r.seats) return;
+                                   direct_room = std::make_unique<net::DirectRoom>(direct_build, [](const std::string& s) {
+                                       std::printf("spikeout: %s\n", s.c_str());
+                                   });
+                                   if (!direct_room->join(r.host, player_name(settings))) {
+                                       shared.say("CAN'T JOIN: " + direct_room->error(), 5);
+                                       direct_room.reset();
+                                       return;
+                                   }
+                                   menu.open(make_root());
+                                   menu.push(direct_room_page());
+                               }});
+        }
+        p.items.push_back(back_item());
+        return p;
+    };
     auto network_page = [&] {
         ui::MenuPage p{"Network play",
                        "Each player on their own computer: every computer runs every cabinet, only the controls go between them.",
@@ -5098,7 +5519,13 @@ int main(int argc, char** argv) {
                                if (netgame) return to_room(); // (in a room already)
                                menu.push(host_page());
                            }});
-        if (netgame) p.items.erase(p.items.begin(), p.items.begin() + 2); // (in a room: no other until it's left)
+        if (netgame || direct_room) p.items.erase(p.items.begin(), p.items.begin() + 2); // (in a room: no other until it's left)
+        if (!netgame)
+            p.items.insert(p.items.begin() + (direct_room ? 0 : 2),
+                           ui::MenuItem{"Arcade link",
+                                        "The arcade's link, for friends very close (a LAN, or a few ms apart): each computer "
+                                        "runs only its own cabinet.",
+                                        {}, {}, [&] { menu.push(direct_page()); }});
         p.items.push_back({"Player name", "The name the other players see. Enter: change it.", [&] { return player_name(settings); },
                            {}, [&] { menu.push(name_page()); }});
         if (net::report::available())
@@ -5369,6 +5796,15 @@ int main(int argc, char** argv) {
         }
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+#ifdef SPIKEOUT_GPU
+            if (e.type == SDL_EVENT_QUIT && direct_running && menu_ready) { // (a direct game: closing ends it for everyone:
+                                                                            // asked first, as Leave game)
+                if (!menu.is_open()) menu.open(make_root());
+                if (menu.top_name() != "Leave the game?") menu.push(direct_leave_page());
+                direct_close_asked = true;
+                continue;
+            }
+#endif
             if (e.type == SDL_EVENT_QUIT) running = false;
             if (e.type == SDL_EVENT_JOYSTICK_ADDED) tools::pads::make_generic_layouts(); // (no layout: SDL then offers it as a gamepad)
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) add_pad(e.gdevice.which);
@@ -5453,7 +5889,7 @@ int main(int argc, char** argv) {
             // Not in network play; the menu takes the keys while open.
             const auto now_key = std::chrono::steady_clock::now();
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F9 && !e.key.repeat) {
-                if (shared.netplay) {
+                if (shared.netplay || shared.direct) {
                     if (shared.net_save_key) {
                         shared.net_save_request = true;
                         std::printf("spikeout: saving every cabinet at the end of a frame (spikeout-net-<frame>.state)\n");
@@ -5488,13 +5924,13 @@ int main(int argc, char** argv) {
 #ifdef SPIKEOUT_GPU
             // (F10 with the menu: the Saves page, newest first, release 6; without it (no GPU menu): the last save,
             // pressed twice, below)
-            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay &&
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay && !shared.direct &&
                 menu_ready) {
                 if (!menu.is_open()) menu.open(saves_page());
                 continue;
             }
 #endif
-            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay) {
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F10 && !e.key.repeat && boards == 1 && !shared.netplay && !shared.direct) {
                 std::string last;
                 {
                     std::lock_guard<std::mutex> guard(shared.lock);
@@ -5753,6 +6189,135 @@ int main(int argc, char** argv) {
 #endif
         }
 #ifdef SPIKEOUT_GPU
+        // Direct connect: the room started (this computer's cabinet from power-on, on the room's link), ended (back to
+        // this computer's own game, why said), a player's link data waited for over a second (said); its pages kept up
+        // to date.
+        // (tests: SPIKEOUT_TEST_DIRECT=host:N hosts a direct room of N, join joins the first on this network; ready at
+        // once, the host starting 2 s after everyone is in, as gamerun --direct-host / --direct-join)
+        static const std::string test_direct = std::getenv("SPIKEOUT_TEST_DIRECT") ? std::getenv("SPIKEOUT_TEST_DIRECT") : "";
+        static bool test_direct_done = false;
+        static auto test_direct_all_in = now;
+        static bool test_direct_counting = false;
+        if (!test_direct.empty() && !test_direct_done && menu_ready) {
+            if (!direct_room && test_direct.rfind("host:", 0) == 0) {
+                direct_seats = std::clamp(std::atoi(test_direct.c_str() + 5), 2, static_cast<int>(net::kDirectSeats));
+                if (test_direct.find(":internet") != std::string::npos) { // (host:N:internet: by its code, the lobby's)
+                    direct_where = 2;
+                    direct_internet("");
+                } else {
+                    direct_room = std::make_unique<net::DirectRoom>(direct_build, [](const std::string& s) { std::printf("spikeout: %s\n", s.c_str()); });
+                    if (!direct_room->host(player_name(settings), static_cast<uint8_t>(direct_seats))) direct_room.reset();
+                }
+            } else if (!direct_room && test_direct.rfind("code:", 0) == 0) { // (code:CODE: joined through the lobby)
+                direct_internet(test_direct.substr(5));
+            } else if (!direct_room && test_direct == "join") {
+                if (!direct_discovery) {
+                    direct_discovery = std::make_unique<net::DirectDiscovery>(direct_build);
+                    direct_discovery->open();
+                }
+                for (const net::DirectRoomInfo& r : direct_discovery->poll())
+                    if (!direct_room && !r.started && r.taken < r.seats) {
+                        direct_room = std::make_unique<net::DirectRoom>(direct_build, [](const std::string& s) { std::printf("spikeout: %s\n", s.c_str()); });
+                        if (!direct_room->join(r.host, player_name(settings))) direct_room.reset();
+                    }
+            }
+            if (direct_room && !direct_busy) {
+                static bool page_shown = false; // (SPIKEOUT_TEST_DIRECT_SHOW=1: the room's page open, for pictures of it)
+                if (!page_shown && std::getenv("SPIKEOUT_TEST_DIRECT_SHOW") && direct_room->view().my_seat != 0xFF) {
+                    page_shown = true;
+                    menu.open(make_root());
+                    menu.push(direct_room_page());
+                }
+                static bool code_said = false;
+                if (direct_lobby && !direct_lobby->code.empty() && !code_said)
+                    code_said = true, std::printf("spikeout: direct: the room's code: %s\n", direct_lobby->code.c_str()), std::fflush(stdout);
+                direct_room->set_ready(true);
+                if (direct_room->view().my_seat != 0) test_direct_done = direct_room->view().my_seat != 0xFF;
+                else if (direct_room->can_start()) {
+                    if (!test_direct_counting) test_direct_counting = true, test_direct_all_in = now;
+                    static const int hold = std::getenv("SPIKEOUT_TEST_DIRECT_HOLD") ? std::atoi(std::getenv("SPIKEOUT_TEST_DIRECT_HOLD")) : 2;
+                    if (now - test_direct_all_in > std::chrono::seconds(hold)) {
+                        const auto v = direct_room->view();
+                        for (uint8_t a = 0; a < v.seats; ++a)
+                            for (uint8_t b = static_cast<uint8_t>(a + 1); b < v.seats; ++b)
+                                std::printf("spikeout: direct: link %u-%u: %.2f ms one way, spread %.2f ms, %s\n", a + 1, b + 1,
+                                            v.links[a][b].one_way_ms, v.links[a][b].spread_ms, tools::grade_text(tools::grade(v.links[a][b])));
+                        direct_room->start(), test_direct_done = true;
+                    }
+                } else {
+                    test_direct_counting = false;
+                }
+            }
+        }
+        if (direct_room) { // (an internet room: the lobby's part failed (said, out of the room), or the host's kept up)
+            std::string failed;
+            {
+                std::lock_guard guard(direct_failed_lock);
+                failed = std::exchange(direct_failed, {});
+            }
+            if (!failed.empty()) {
+                direct_end(failed);
+                if (menu_ready && menu.is_open()) menu.open(make_root());
+            } else if (direct_lobby && !direct_busy && direct_room->view().my_seat == 0) {
+                tools::direct_lobby_pump(*direct_lobby, *direct_room);
+            }
+        }
+        if (direct_room) {
+            const net::DirectRoom::View v = direct_room->view();
+            if (!v.ended.empty()) {
+                direct_end(v.ended);
+                if (menu_ready && menu.is_open()) menu.open(make_root());
+            } else if (v.started && !direct_running) {
+                direct_running = true;
+                std::printf("spikeout: direct: the game starts, seat %u of %u\n", v.my_seat + 1, v.seats);
+                reset_game([&] {
+                    shared.direct = direct_room.get();
+                    shared.direct_seat = v.my_seat;
+                    boards = 1;
+                    shared.boards = 1;
+                    focus = 0;
+                });
+                if (menu_ready && menu.is_open()) menu.close();
+            } else if (direct_running) {
+                static auto logged = now;
+                if (now - logged > std::chrono::seconds(10)) { // (the log: how the link goes, for reports)
+                    logged = now;
+                    const auto c = direct_room->counters();
+                    std::printf("spikeout: direct: %llu exchanged, %llu stalled over 1 ms, %.2f s waited (longest %.1f ms), "
+                                "%llu resent\n",
+                                static_cast<unsigned long long>(c.gathers), static_cast<unsigned long long>(c.stalled),
+                                c.waited_s, c.longest_ms, static_cast<unsigned long long>(c.resent));
+                }
+                const auto [seat, ms] = direct_room->waiting();
+                if (seat < v.seats && ms > 1000) {
+                    std::string who = v.seat[seat].name;
+                    for (char& c : who) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    shared.say("WAITING FOR " + who, 1);
+                }
+            }
+        }
+        static auto direct_refreshed = now;
+        if (menu_ready && menu.is_open() && now - direct_refreshed >= std::chrono::milliseconds(250)) {
+            if (menu.top_name() == "Arcade link room") {
+                direct_refreshed = now;
+                menu.replace(direct_room_page()); // (its rows as they are now: the links' bars, READY, the ring; the selected row kept)
+            } else if (menu.top_name() == "Arcade link" && now - direct_refreshed >= std::chrono::seconds(1)) {
+                direct_refreshed = now;
+                if (direct_browser && direct_browser->connected()) { // (the lobby's list: asked every 5 s, its answer taken)
+                    if (auto answer = direct_browser->wait_for("games", 0); answer && (*answer)["t"].as_string() == "games") {
+                        direct_listed = (*answer)["games"].items();
+                        direct_list_asked = false;
+                    }
+                    if (!direct_list_asked && now - direct_list_at > std::chrono::seconds(5)) {
+                        direct_list_asked = true, direct_list_at = now;
+                        net::Json m = net::Json::object();
+                        m.set("t", "list");
+                        direct_browser->send(m);
+                    }
+                }
+                menu.replace(direct_page()); // (the rooms as they are now)
+            }
+        }
         // The Join list open: made again every 3 s (the nearby games as they are now; the internet's as the lobby last
         // sent them, asked again every 10 s without waiting: its answer taken on a later turn), the selected row kept.
         if (menu_ready && menu.is_open() && menu.top_name() == "Join a game" && now - join_refreshed >= std::chrono::seconds(3)) {
@@ -6227,6 +6792,72 @@ int main(int argc, char** argv) {
                 menu.set_loading("");
                 if (!netgame) join_shown = false;
             }
+            // (an arcade link game (docs/direct-connect.md; the owner's choices, 2026-11-17): the room's line, each seat
+            // with its link's time and bars, and under them the game's speed: one glossy bar, green at the arcade's
+            // speed, yellow below 98% (naming the player waited for most), red below 80%, or, a player's data not come
+            // for over a second, red and counting down to the room's end)
+            if (direct_room && direct_running) {
+                const net::DirectRoom::View v = direct_room->view();
+                net_header = "ARCADE LINK" + (direct_lobby && !direct_lobby->code.empty() ? " \xC2\xB7 " + direct_lobby->code : std::string(" \xC2\xB7 LAN"));
+                net_pills = ui::NetPills{};
+                auto upper = [](std::string s) {
+                    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    return s;
+                };
+                const auto [waiting_seat, waiting_ms] = direct_room->waiting();
+                for (uint8_t s = 0; s < v.seats; ++s) {
+                    ui::NetRow r;
+                    r.seat = std::to_string(s + 1) + "P";
+                    r.name = s == v.my_seat ? "YOU" : upper(v.seat[s].name);
+                    if (s == v.my_seat) {
+                        r.look = ui::NetRow::Look::you;
+                    } else if (waiting_seat == s && waiting_ms > 1000) {
+                        r.look = ui::NetRow::Look::dim, r.status = "WAITING";
+                    } else {
+                        const auto& l = v.links[v.my_seat][s];
+                        r.ms = l.one_way_ms >= 0 ? std::max(1, static_cast<int>(std::lround(l.one_way_ms))) : -1;
+                        r.bars = std::max(1, tools::link_bars(l)); // (as the room's rows: tools::link_bars)
+                    }
+                    net_rows.push_back(std::move(r));
+                }
+                // (the speed: frames and waits over the last 3 s)
+                static auto speed_at = now;
+                static uint64_t frames_at = 0;
+                static std::array<double, net::kDirectSeats> waited_at{};
+                static int shown_pct = 100;
+                static uint8_t slowest = 0xFF;
+                const auto c = direct_room->counters();
+                if (c.gathers < frames_at) frames_at = 0; // (another room's game)
+                if (frames_at == 0 && c.gathers > 0) // (the cabinets just linked: measured from here)
+                    speed_at = now, frames_at = c.gathers, waited_at = c.waited_by, shown_pct = 100;
+                if (c.gathers > 0 && now - speed_at >= std::chrono::seconds(3)) {
+                    const double secs = std::chrono::duration<double>(now - speed_at).count();
+                    const uint64_t frames = c.gathers - std::min(c.gathers, frames_at);
+                    shown_pct = std::clamp(static_cast<int>(std::lround(100.0 * static_cast<double>(frames) / (secs * 57.524))), 0, 100);
+                    double most = 0, all = 0;
+                    slowest = 0xFF;
+                    for (std::size_t s = 0; s < net::kDirectSeats; ++s) {
+                        const double w = c.waited_by[s] - waited_at[s];
+                        all += w;
+                        if (w > most) most = w, slowest = static_cast<uint8_t>(s);
+                    }
+                    if (most < all / 2) slowest = 0xFF; // (nobody most of it: the network as a whole)
+                    speed_at = now, frames_at = c.gathers, waited_at = c.waited_by;
+                }
+                if (c.gathers == 0 && !(waiting_seat < v.seats && waiting_ms > 1000)) {
+                    net_pills.speed_text = "LINKING THE CABINETS", net_pills.speed_look = 'y'; // (power-on: the boards' own link test)
+                } else if (waiting_seat < v.seats && waiting_ms > 1000) {
+                    const int left = std::max(0, 10 - waiting_ms / 1000);
+                    net_pills.speed_text = "WAITING FOR " + upper(v.seat[waiting_seat].name) + " \xC2\xB7 " + std::to_string(left) + " S LEFT";
+                    net_pills.speed_pct = std::clamp((10000 - waiting_ms) / 100, 0, 100), net_pills.speed_look = 'r';
+                } else if (shown_pct >= 98) {
+                    net_pills.speed_text = "ARCADE SPEED", net_pills.speed_pct = 100, net_pills.speed_look = 'g';
+                } else {
+                    net_pills.speed_text = std::to_string(shown_pct) + "% SPEED \xC2\xB7 " +
+                                           (slowest < v.seats && slowest != v.my_seat ? upper(v.seat[slowest].name) + "'S LINK" : std::string("THE NETWORK"));
+                    net_pills.speed_pct = shown_pct, net_pills.speed_look = shown_pct >= 80 ? 'y' : 'r';
+                }
+            }
             // (Network status off: the seats left out, the room's line still shown)
             menu.set_net(settings.show_net ? net_rows : std::vector<ui::NetRow>(), net_header,
                          settings.show_net ? net_pills : ui::NetPills{});
@@ -6478,6 +7109,7 @@ int main(int argc, char** argv) {
     if (!test_run && !shared.netplay) save_nvram(data_folder, shared, boards); // (a network game's boards aren't ours to keep)
     netgame.reset();
     browser.reset();
+    direct_browser.reset(); // (the arcade link rooms' list: as network play's, open until the window closes)
     sound.reset();
     for (SDL_Gamepad* pad : gamepads) SDL_CloseGamepad(pad);
 #ifdef SPIKEOUT_GPU

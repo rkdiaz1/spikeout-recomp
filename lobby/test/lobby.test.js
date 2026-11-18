@@ -335,3 +335,32 @@ test("reports: R2's operations held under a monthly cap (REPORTS_A_MONTH, 40 her
 	assert.ok(usage.r2b[0] >= 1); // (the downloads above, counted)
 	assert.match(usage.month, /^\d{4}-\d{2}$/);
 });
+
+test("direct connect's rooms: a list of their own, joined by code only from direct connect", async () => {
+	const host = await player();
+	host.send({ t: "hello", build: "d1", name: "Dee", version: "0.1.0", kind: "direct" });
+	await host.next("welcome");
+	host.send({ t: "host", name: "Dee's", seats: 2, public: true, session: "d00d", port: 47400, candidates: ["10.0.0.2:47400"] });
+	const { code } = await host.next("hosted");
+
+	const plain = await player(); // (network play, the same build string: never sees it)
+	plain.send({ t: "hello", build: "d1", name: "Pat", version: "0.1.0" });
+	await plain.next("welcome");
+	plain.send({ t: "list" });
+	const seen = await plain.next("games");
+	assert.ok(!seen.games.some((g) => g.code === code));
+	plain.send({ t: "join", code, port: 1, candidates: [] });
+	assert.match((await plain.next("error")).why, /Arcade link room/);
+
+	const friend = await player();
+	friend.send({ t: "hello", build: "d1", name: "Fay", version: "0.1.0", kind: "direct" });
+	await friend.next("welcome");
+	friend.send({ t: "list" });
+	assert.ok((await friend.next("games")).games.some((g) => g.code === code));
+	friend.send({ t: "join", code, port: 47401, candidates: ["10.0.0.3:47401"] });
+	const joining = await friend.next("joining");
+	assert.deepEqual(joining.candidates.slice(0, 1), ["10.0.0.2:47400"]);
+	const joiner = await host.next("joiner");
+	assert.equal(joiner.name, "Fay");
+	for (const p of [host, plain, friend]) p.close();
+});

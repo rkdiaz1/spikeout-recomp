@@ -531,6 +531,14 @@ bool CommBoard::host_comm_view(uint8_t* out, uint32_t bytes) {
     return true;
 }
 
+void CommBoard::bank_view(bool host_bank, uint8_t* out) const {
+    const bool other = options_.host_sees_other_bank || options_.double_buffer;
+    const bool host_second = (commbank_ & 1) != other; // (bank(true))
+    const bool second = host_bank ? host_second : !host_second;
+    const uint8_t* comm = comm_.data() + (second ? 0x10000 : 0);
+    for (uint32_t i = 0; i < 0x10000; ++i) out[i] = comm[(i ^ options_.comm_ram_xor) & 0xFFFF];
+}
+
 uint8_t CommBoard::read8(uint32_t addr) {
     host_note(addr, false, 0);
     switch (host_region(addr)) {

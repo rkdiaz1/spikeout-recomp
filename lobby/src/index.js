@@ -5,7 +5,9 @@
 //
 // One WebSocket a player, JSON text messages, {"t": type, ...}:
 //
-//   hello  {build, name, version}        -> welcome {address, country, turn} (country: Cloudflare's two letters for the
+//   (hello's kind: "direct" for direct connect's rooms (docs/direct-connect.md): listed, counted and joined apart from
+//    network play's games; none: network play's)
+//   hello  {build, name, version[, kind]} -> welcome {address, country, turn} (country: Cloudflare's two letters for the
 //                                           player, "" if none: a host shows its own with its seat)
 //   list   {from}                        -> games {games: [{code, name, seats, taken, watchers, started, session, country,
 //                                                  ms}], from, total} (LIST_PAGE from `from`: waiting first, then in
@@ -259,8 +261,10 @@ export class Lobby extends DurableObject {
 		return this.ctx.getWebSockets().map((ws) => ({ ws, a: ws.deserializeAttachment() || {} }));
 	}
 
-	findGame(code, build) {
-		for (const p of this.players()) if (p.a.game && p.a.game.code === code && (build === null || p.a.build === build)) return p; // (null: any build)
+	findGame(code, build, kind = null) {
+		for (const p of this.players())
+			if (p.a.game && p.a.game.code === code && (build === null || p.a.build === build) && (kind === null || (p.a.kind || "") === kind))
+				return p; // (null: any build, any kind)
 		return null;
 	}
 
@@ -289,6 +293,7 @@ export class Lobby extends DurableObject {
 				a.build = text(m.build, 32);
 				a.name = text(m.name, 32);
 				a.version = text(m.version, 32); // ("" from builds before 2026-11-05)
+				a.kind = m.kind === "direct" ? "direct" : ""; // (direct connect's rooms, docs/direct-connect.md: a list of their own)
 				ws.serializeAttachment(a);
 				return send({ t: "welcome", address: a.ip, country: a.country, turn: Boolean(this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN) });
 
@@ -299,9 +304,9 @@ export class Lobby extends DurableObject {
 				const open = [];
 				let others = 0; // (public games on other versions: the game tells the player there are some)
 				for (const p of this.players())
-					if (p.a.game && p.a.game.public && p.a.build === a.build) // (in progress too; full ones to watch)
-						open.push(p.a);
-					else if (p.a.game && p.a.game.public) ++others;
+					if (!p.a.game || !p.a.game.public || (p.a.kind || "") !== (a.kind || "")) continue; // (each kind its own list)
+					else if (p.a.build === a.build) open.push(p.a); // (in progress too; full ones to watch)
+					else ++others;
 				const near = (h) => { const e = estimate(a, h); return e < 0 ? 1e9 : e; }; // (nearest first; unknown last)
 				const full = (g) => Number(g.taken >= g.seats);
 				open.sort((x, y) => full(x.game) - full(y.game) || Number(x.game.started) - Number(y.game.started) || near(x) - near(y) || (y.game.created || 0) - (x.game.created || 0));
@@ -375,10 +380,12 @@ export class Lobby extends DurableObject {
 
 			case "join": {
 				const code = text(m.code, CODE_LENGTH).toUpperCase();
-				const host = this.findGame(code, a.build);
+				const host = this.findGame(code, a.build, a.kind || "");
 				if (!host) {
 					const elsewhere = this.findGame(code, null);
 					if (!elsewhere) return send({ t: "error", why: "no game with that code" });
+					if ((elsewhere.a.kind || "") !== (a.kind || "")) // (the code of the other kind's room)
+						return send({ t: "error", why: elsewhere.a.kind === "direct" ? "that code is an Arcade link room" : "that code is a Network play game, not an Arcade link room" });
 					const v = elsewhere.a.version;
 					return send({ t: "error", why: v && v !== a.version ? `that game is on version ${v} (this is ${a.version || "older"})` : "that game is on another version", version: v || "" });
 				}

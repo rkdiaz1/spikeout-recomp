@@ -141,6 +141,9 @@ public:
     void end_frame() override;
     std::string describe() const override;
     bool host_comm_view(uint8_t* out, uint32_t bytes) override;
+    // A whole comm RAM bank (64 KB) as the main board would read it: the bank it sees now, or the one it doesn't
+    // (gamerun --netboard sim, a state saved with this board handed to the simulation: SimNetBoard::take_over).
+    void bank_view(bool host_bank, uint8_t* out) const;
     void state(State& s) override; // save states (runtime/state.hpp)
 
     // The firmware's wait loops gone round at once (exact: the same state and timing, their time not spent). On by
