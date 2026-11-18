@@ -19,6 +19,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/Memory.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
@@ -35,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -165,8 +167,90 @@ const Helper kHelpers[] = {
 // getImageBase), each of them allocated here. One memory manager an object (RTDyldObjectLinkingLayer makes one each).
 extern "C" __declspec(dllimport) unsigned char __stdcall RtlAddFunctionTable(void* table, unsigned long count,
                                                                             unsigned long long base);
+extern "C" __declspec(dllimport) void* __stdcall VirtualAlloc(void* address, unsigned long long size, unsigned long type,
+                                                              unsigned long protect);
+extern "C" __declspec(dllimport) int __stdcall VirtualFree(void* address, unsigned long long size, unsigned long type);
+
+// Every section of every object from one reserved stretch of address space (issue: players' crashes in translated
+// code, reports 232 to 4944, every version since the JIT). The code is built for the small code model: an object's
+// code reaches its own constants and data with 32-bit offsets (rip-relative), so they must lie within 2 GB of it.
+// SectionMemoryManager's own mapper asks the system for code, read-only data and data separately, each wherever the
+// system puts it; RuntimeDyld's COFF linker checks the distance only with an assert, gone in a release build, so a
+// constant placed over 2 GB away was read through a wrapped offset: an unmapped address, the game closed (the two
+// minidumps: `vmovaps xmm0, [rip+0x7f6364a2]` and `[rip+0x759c7a4b]`, constants ~2 GB off). Calls to other objects
+// and to the program's helpers go through RuntimeDyld's 64-bit stubs and were never at risk. Linux and macOS link with
+// JITLink, which keeps an object's sections together.
+// The arena is reserved once (kArena of address space, nothing committed) and handed out in 64 KB steps (the system's
+// allocation granularity, as SectionMemoryManager expects), each committed as it goes out; the whole translated game
+// takes ~13 MB. Code stays for the whole run, so nothing is given back to the arena.
+// Tests: SPIKEOUT_TEST_JIT_FAR=1 puts read-only data in a second arena 3 GB above the first: the old placement at its
+// worst, to see the crash it made.
+class ArenaMapper : public llvm::SectionMemoryManager::MemoryMapper {
+public:
+    static ArenaMapper& get() { // (never destroyed: the JIT's memory managers give their blocks back at exit, after
+                                // a function's static would be gone)
+        static ArenaMapper* mapper = new ArenaMapper;
+        return *mapper;
+    }
+    llvm::sys::MemoryBlock allocateMappedMemory(llvm::SectionMemoryManager::AllocationPurpose purpose, size_t bytes,
+                                                const llvm::sys::MemoryBlock* const, unsigned flags,
+                                                std::error_code& ec) override {
+        std::lock_guard guard(lock_);
+        Arena& a = far_ && purpose == llvm::SectionMemoryManager::AllocationPurpose::ROData ? far_arena_ : arena_;
+        const uint64_t size = (bytes + kStep - 1) / kStep * kStep;
+        if (!a.base || a.used + size > kArena) {
+            ec = std::make_error_code(std::errc::not_enough_memory);
+            return {};
+        }
+        void* p = static_cast<char*>(a.base) + a.used;
+        if (!VirtualAlloc(p, size, kCommit, kReadWrite)) {
+            ec = std::make_error_code(std::errc::not_enough_memory);
+            return {};
+        }
+        a.used += size;
+        llvm::sys::MemoryBlock block(p, size);
+        if ((ec = llvm::sys::Memory::protectMappedMemory(block, flags))) return {};
+        return block;
+    }
+    std::error_code protectMappedMemory(const llvm::sys::MemoryBlock& block, unsigned flags) override {
+        return llvm::sys::Memory::protectMappedMemory(block, flags);
+    }
+    std::error_code releaseMappedMemory(llvm::sys::MemoryBlock& block) override {
+        // (its pages decommitted; the arena's space not reused: only at the end of the run)
+        if (block.base()) VirtualFree(block.base(), block.allocatedSize(), kDecommit);
+        block = llvm::sys::MemoryBlock();
+        return {};
+    }
+
+private:
+    static constexpr uint64_t kArena = 1ull << 30; // (1 GB of address space: under 2 GB, so every offset fits)
+    static constexpr uint64_t kStep = 64 * 1024;
+    static constexpr unsigned long kReserve = 0x2000, kCommit = 0x1000, kDecommit = 0x4000, kReadWrite = 0x04,
+                                   kNoAccess = 0x01;
+    struct Arena {
+        void* base = nullptr;
+        uint64_t used = 0;
+    };
+    ArenaMapper() {
+        arena_.base = VirtualAlloc(nullptr, kArena, kReserve, kNoAccess);
+        if (!arena_.base) throw std::runtime_error("jit: can't reserve the address space for the translated game");
+        const char* far = std::getenv("SPIKEOUT_TEST_JIT_FAR");
+        if (far && *far == '1') { // (a hint 3 GB up, then any address above it)
+            for (uint64_t at = reinterpret_cast<uint64_t>(arena_.base) + (3ull << 30); !far_arena_.base && at < (1ull << 46);
+                 at += 1ull << 30)
+                far_arena_.base = VirtualAlloc(reinterpret_cast<void*>(at), kArena, kReserve, kNoAccess);
+            far_ = far_arena_.base != nullptr;
+            std::printf("jit: test: read-only data %s\n", far_ ? "over 2 GB from the code" : "kept with the code (no room found)");
+        }
+    }
+    std::mutex lock_;
+    Arena arena_, far_arena_;
+    bool far_ = false;
+};
+
 class SehMemoryManager : public llvm::SectionMemoryManager {
 public:
+    SehMemoryManager() : llvm::SectionMemoryManager(&ArenaMapper::get()) {}
     uint8_t* allocateCodeSection(uintptr_t size, unsigned align, unsigned id, llvm::StringRef name) override {
         return note(llvm::SectionMemoryManager::allocateCodeSection(size, align, id, name), size);
     }
