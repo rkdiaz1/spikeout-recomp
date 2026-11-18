@@ -52,9 +52,15 @@ struct MenuItem {
     // outline (something to press: SET READY), 0 grey.
     std::string badge;
     char badge_look = 0;
-    // A button: the row drawn as a pill in the middle (an arcade link room's Ready); `on` filled green.
+    // A button: the row drawn as a pill in the middle (an arcade link room's Start); `on` filled green.
     bool button = false;
     bool button_on = false;
+    // A slider on the right, before the value (the volumes): `level()` from 0 to slider_max (0: no slider), its fill
+    // orange past slider_mark (100%: the arcade's level; -1 none). Left / Right still `change`; a click or a drag on it
+    // `set`s the level under the pointer.
+    int slider_max = 0, slider_mark = -1;
+    std::function<int()> level;
+    std::function<void(int)> set;
 };
 
 // A seat of a network game, in the list under the frame rate.

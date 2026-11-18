@@ -128,12 +128,29 @@ struct MenuListener : Rml::EventListener {
             }
             return;
         }
+        Rml::Element* slider = e; // (a slider under the pointer: pressed or dragged, the level there)
+        while (slider && !slider->IsClassSet("slider")) slider = slider->GetParentNode();
         while (e && !e->IsClassSet("row")) e = e->GetParentNode();
         if (!e || e->IsClassSet("info")) return;
         const int i = std::atoi(e->GetId().c_str() + 1);
+        const bool held = (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) != 0;
+        if (ev.GetId() == Rml::EventId::Mousemove && !(slider && held)) return; // (only a drag on a slider)
         menu->select(i);
+        const MenuItem& it = menu->stack_.back().items[static_cast<size_t>(i)];
+        if (slider && it.set && it.slider_max > 0) {
+            if (ev.GetId() == Rml::EventId::Mousedown || ev.GetId() == Rml::EventId::Mousemove) {
+                const float x0 = slider->GetAbsoluteOffset(Rml::BoxArea::Border).x;
+                const float w = std::max(1.0f, slider->GetBox().GetSize(Rml::BoxArea::Border).x);
+                const float share = std::clamp((ev.GetParameter<float>("mouse_x", x0) - x0) / w, 0.0f, 1.0f);
+                const int level = static_cast<int>(std::lround(share * static_cast<float>(it.slider_max)));
+                if (level != it.level()) {
+                    it.set(level);
+                    menu->build();
+                }
+            }
+            return; // (its click is the press above)
+        }
         if (ev.GetId() == Rml::EventId::Click) {
-            const MenuItem& it = menu->stack_.back().items[static_cast<size_t>(i)];
             const Rml::Element* t = ev.GetTargetElement();
             if (it.activate) menu->activate();
             else if (it.change) menu->click_change(t && t->IsClassSet("back") ? -1 : +1); // the "<": down
@@ -220,6 +237,8 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
     impl_->listener.menu = this;
     impl_->doc->AddEventListener(Rml::EventId::Mouseover, &impl_->listener);
     impl_->doc->AddEventListener(Rml::EventId::Click, &impl_->listener);
+    impl_->doc->AddEventListener(Rml::EventId::Mousedown, &impl_->listener); // (a slider: pressed and dragged)
+    impl_->doc->AddEventListener(Rml::EventId::Mousemove, &impl_->listener);
     // The frame rate, top right, over the game (and the menu), and a network
     // game's seats under it in the same style (each player's flag from
     // flags.rcss's sprite sheet).
@@ -239,7 +258,9 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         // and a darker bottom (RmlUi's gradients here have two colours); yellow, the seat list's green)
         ".seat .pbar { display: inline-block; width: 60dp; height: 10dp; margin: 0 0 3dp 8dp; decorator: vertical-gradient(#08090c #262a33); "
         "border: 1dp #000000; border-radius: 5dp; } .seat .pfill { display: block; height: 100%; } "
-        ".seat .pfill .gt { border-radius: 4dp 4dp 0dp 0dp; } .seat .pfill .gb { border-radius: 0dp 0dp 4dp 4dp; } "
+        // (every bar's fill: its far end flat, the owner's choice; rounded only once full)
+        ".seat .pfill .gt { border-radius: 4dp 0dp 0dp 0dp; } .seat .pfill .gb { border-radius: 0dp 0dp 0dp 4dp; } "
+        ".seat .pfill.full .gt { border-radius: 4dp 4dp 0dp 0dp; } .seat .pfill.full .gb { border-radius: 0dp 0dp 4dp 4dp; } "
         ".gt { display: block; height: 50%; decorator: vertical-gradient(#fff6c8 #ffe06a); } "
         ".gb { display: block; height: 50%; decorator: vertical-gradient(#e8a800 #ffcf3a); } "
         ".green .gt { decorator: vertical-gradient(#d8ffd8 #8fe88f); } .green .gb { decorator: vertical-gradient(#3fae3f #6fd46f); } "
@@ -249,7 +270,7 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         "font-effect: outline(2dp #000000); } .sline.g { color: #7fe07f; } .sline.y { color: #ffd34a; } .sline.r { color: #ff7a6a; } "
         ".sbar { display: block; width: 140dp; height: 10dp; decorator: vertical-gradient(#08090c #262a33); border: 1dp #000000; "
         "border-radius: 5dp; } .sbar .pfill { display: block; height: 100%; margin-left: auto; } " // (shrinking towards the right)
-        ".sbar .pfill .gt { border-radius: 4dp 4dp 0dp 0dp; } .sbar .pfill .gb { border-radius: 0dp 0dp 4dp 4dp; } "
+        ".sbar .pfill.full .gt { border-radius: 4dp 4dp 0dp 0dp; } .sbar .pfill.full .gb { border-radius: 0dp 0dp 4dp 4dp; } " // (its end flat until full, as every bar)
         ".conn { display: flex; justify-content: flex-end; align-items: flex-end; margin-left: 8dp; } "
         ".bars { display: flex; align-items: flex-end; height: 16dp; margin-bottom: 3dp; margin-left: 5dp; } "
         ".bar { width: 3dp; margin-left: 1dp; background-color: #4a4a4a; border: 1dp #000000; } "
@@ -292,7 +313,8 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         "#lbar { display: block; width: 420dp; height: 22dp; margin: 18dp auto 0 auto; decorator: vertical-gradient(#08090c #262a33); "
         "border: 2dp #000000; border-radius: 11dp; } "
         "#lfill { display: block; height: 100%; width: 0%; } "
-        "#lfill .gt { border-radius: 9dp 9dp 0dp 0dp; } #lfill .gb { border-radius: 0dp 0dp 9dp 9dp; } "
+        "#lfill .gt { border-radius: 9dp 0dp 0dp 0dp; } #lfill .gb { border-radius: 0dp 0dp 0dp 9dp; } "
+        "#lfill.full .gt { border-radius: 9dp 9dp 0dp 0dp; } #lfill.full .gb { border-radius: 0dp 0dp 9dp 9dp; } "
         "#lpct { display: block; margin-top: 8dp; font-size: 26dp; color: #ffffff; font-effect: outline(2dp #000000); } "
         "#lsub { display: block; margin-top: 4dp; font-size: 20dp; color: #8d939e; } "
         "#lsteps { display: block; margin-top: 22dp; font-size: 20dp; color: #5d636e; } "
@@ -350,8 +372,8 @@ void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, c
         if (!r.status.empty()) { // (our own row: none, its name at the right edge as the others' bars)
             rml += "<span class=\"st\">" + escape(r.status) + "</span>";
             if (r.progress >= 0)
-                rml += "<span class=\"pbar green\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(r.progress, 0, 100)) +
-                       "%;\">" + kGloss + "</span></span>";
+                rml += "<span class=\"pbar green\"><span class=\"pfill" + std::string(r.progress >= 100 ? " full" : "") +
+                       "\" style=\"width: " + std::to_string(std::clamp(r.progress, 0, 100)) + "%;\">" + kGloss + "</span></span>";
         } else if (r.bars >= 0) {
             // (the time against the bars, the gap after the name the same at any time; each digit as wide as any (the
             // font's aren't), and as many digit places as it has had until it has had fewer for 5 s: the name moves
@@ -397,7 +419,8 @@ void Menu::set_net(const std::vector<NetRow>& rows, const std::string& header, c
         rml += "<div class=\"sline " + std::string(look) + "\"><span>" + escape(pills.speed_text) + "</span></div>";
         if (pills.speed_pct >= 0) // (the glossy bar, its fill against the right end: the owner's choices, 2026-11-18)
             rml += "<div class=\"sline\"><span class=\"sbar" + std::string(pills.speed_look == 'r' ? " red" : pills.speed_look == 'y' ? "" : " green") +
-                   "\"><span class=\"pfill\" style=\"width: " + std::to_string(std::clamp(pills.speed_pct, 0, 100)) + "%;\">" + kGloss +
+                   "\"><span class=\"pfill" + std::string(pills.speed_pct >= 100 ? " full" : "") + "\" style=\"width: " +
+                   std::to_string(std::clamp(pills.speed_pct, 0, 100)) + "%;\">" + kGloss +
                    "</span></span></div>";
     }
     net_shown_ = !rows.empty() || !header.empty();
@@ -417,7 +440,10 @@ void Menu::set_loading(const std::string& title, int percent, const std::string&
         const int p = std::clamp(percent, 0, 100);
         if (Rml::Element* e = impl_->fps->GetElementById("ltitle")) e->SetInnerRML(escape(title));
         if (Rml::Element* e = impl_->fps->GetElementById("lbar")) e->SetProperty("display", percent >= 0 ? "block" : "none");
-        if (Rml::Element* e = impl_->fps->GetElementById("lfill")) e->SetProperty("width", std::to_string(p) + "%");
+        if (Rml::Element* e = impl_->fps->GetElementById("lfill")) {
+            e->SetProperty("width", std::to_string(p) + "%");
+            e->SetClass("full", p >= 100); // (its end rounded only once full)
+        }
         if (Rml::Element* e = impl_->fps->GetElementById("lpct"))
             e->SetInnerRML(percent >= 0 ? std::to_string(p) + "%" : std::string());
         if (Rml::Element* e = impl_->fps->GetElementById("ldetail")) e->SetInnerRML(escape(detail));
@@ -610,13 +636,27 @@ void Menu::build() {
                        "; width: " + impl_->px(4) + "; margin-left: " + impl_->px(2) + "; border-width: " + impl_->px(1) + ";\"></span>";
             rml += "</span><span>~" + std::to_string(ms) + " ms</span></span>"; // (its own span: loose text in a flex box isn't drawn)
         }
+        // (a bar: its fill as wide as the share done; its end flat until it's full; an arcade link room's links coloured
+        // by their grade, shorter beside a pill)
         const char* look = it.progress_look == 'g' ? " green" : it.progress_look == 'r' ? " red" : "";
-        if (it.progress >= 0) // (a bar: its fill as wide as the share done)
-            rml += "<span class=\"pbar" + std::string(it.badge.empty() ? "" : " short") + look + "\"><span class=\"pfill\" style=\"width: " +
-                   std::to_string(std::clamp(it.progress, 0, 100)) + "%;\">" + kGloss + "</span></span>";
+        const std::string shorter = it.badge.empty() ? "" : " short";
+        if (it.progress >= 0)
+            rml += "<span class=\"pbar" + shorter + look + "\"><span class=\"pfill" + std::string(it.progress >= 100 ? " full" : "") +
+                   "\" style=\"width: " + std::to_string(std::clamp(it.progress, 0, 100)) + "%;\">" + kGloss + "</span></span>";
+        const bool slider = it.slider_max > 0 && it.level;
+        if (slider) { // (the bar's look; past the mark (100%) the fill orange)
+            auto share = [&](int v) { return std::to_string(std::clamp(v * 100 / it.slider_max, 0, 100)); };
+            const int level = std::clamp(it.level(), 0, it.slider_max), mark = it.slider_mark;
+            const bool over = mark >= 0 && level > mark, full = level >= it.slider_max;
+            rml += "<span class=\"pbar slider\"><span class=\"pfill" + std::string(full && !over ? " full" : "") +
+                   "\" style=\"width: " + share(over ? mark : level) + "%;\">" + kGloss + "</span>";
+            if (over)
+                rml += "<span class=\"pfill over" + std::string(full ? " full" : "") + "\" style=\"left: " + share(mark) +
+                       "%; width: " + share(level - mark) + "%;\">" + kGloss + "</span>";
+            rml += "</span>";
+        }
         if (it.value) {
-            rml += it.progress >= 0 ? "<span class=\"value pvalue" + std::string(it.badge.empty() ? "" : " short") + "\">"
-                                    : "<span class=\"value\">"; // (beside a bar: a fixed width)
+            rml += slider ? "<span class=\"value svalue\">" : it.progress >= 0 ? "<span class=\"value pvalue" + shorter + "\">" : "<span class=\"value\">"; // (beside a bar: a fixed width)
             if (it.change) rml += "<span class=\"arrow back\">&lt;&nbsp;&nbsp;</span>";
             rml += escape(it.value());
             if (it.change) rml += "<span class=\"arrow\">&nbsp;&nbsp;&gt;</span>";
