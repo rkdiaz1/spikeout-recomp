@@ -270,7 +270,10 @@ bool Menu::init(SDL_GPUDevice* device, SDL_Window* window) {
         "font-effect: outline(2dp #000000); } .sline.g { color: #7fe07f; } .sline.y { color: #ffd34a; } .sline.r { color: #ff7a6a; } "
         ".sbar { display: block; width: 140dp; height: 10dp; decorator: vertical-gradient(#08090c #262a33); border: 1dp #000000; "
         "border-radius: 5dp; } .sbar .pfill { display: block; height: 100%; margin-left: auto; } " // (shrinking towards the right)
-        ".sbar .pfill.full .gt { border-radius: 4dp 4dp 0dp 0dp; } .sbar .pfill.full .gb { border-radius: 0dp 0dp 4dp 4dp; } " // (its end flat until full, as every bar)
+        // (its fill against the right end, so its start is the right: rounded there, its moving left end flat until full,
+        // as every bar's)
+        ".sbar .pfill .gt { border-radius: 0dp 4dp 0dp 0dp; } .sbar .pfill .gb { border-radius: 0dp 0dp 4dp 0dp; } "
+        ".sbar .pfill.full .gt { border-radius: 4dp 4dp 0dp 0dp; } .sbar .pfill.full .gb { border-radius: 0dp 0dp 4dp 4dp; } "
         ".conn { display: flex; justify-content: flex-end; align-items: flex-end; margin-left: 8dp; } "
         ".bars { display: flex; align-items: flex-end; height: 16dp; margin-bottom: 3dp; margin-left: 5dp; } "
         ".bar { width: 3dp; margin-left: 1dp; background-color: #4a4a4a; border: 1dp #000000; } "
