@@ -80,7 +80,8 @@ add_library(m3runtime
     src/runtime/cpu_time.cpp
     src/runtime/memory_free.cpp
     src/games/games.cpp
-    src/games/spikeofe.cpp)
+    src/games/spikeofe.cpp
+    src/games/spikeofe_camera.cpp)
 target_include_directories(m3runtime PUBLIC src)
 target_link_libraries(m3runtime PUBLIC ppc PRIVATE moira minimp3 spikeout_warnings)
 

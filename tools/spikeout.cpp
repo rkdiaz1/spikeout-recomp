@@ -65,7 +65,9 @@
 //
 // Smooth motion (the menu, or --smooth; the GPU 3D only): a picture each
 // refresh of the display (at most 120 a second, timed as the game's frames
-// are), its 3D placed between the last two frames (m3::interpolate) by an
+// are), its 3D placed between the last two frames (m3::interpolate_camera:
+// the game's camera blended, docs/smooth-motion.md; SPIKEOUT_SMOOTH_GUESS=1
+// the models matched between frames, m3::interpolate) by an
 // even display clock a frame behind the game's, pulled a tenth of the way to
 // it each picture (after vf3-recomp's: the pictures drawn when a pass
 // happened to run would show the motion unevenly). The 2D is the newest
@@ -84,6 +86,7 @@
 // Built only when CMake's SPIKEOUT_ROM_DIR is set (it links the recompiled
 // game).
 #include "games/games.hpp"
+#include "games/spikeofe_camera.hpp"
 #include "recomp/context.hpp"
 #include "recomp/frame_timing.hpp"
 #include "runtime/bus.hpp"
@@ -1114,6 +1117,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         built_extend = shared.extend;
         builder.set_extend(built_extend);
         builder.build(bus.real3d(), gpu_frame.scene);
+        m3::games::spikeout_camera(bus.ram(), gpu_frame.scene.game_camera); // (smooth motion's camera)
         gpu_frame.extend = builder.extend();
         gpu_frame.bottom.assign(tilegen.bottom().begin(), tilegen.bottom().end());
         gpu_frame.top.assign(tilegen.top().begin(), tilegen.top().end());
@@ -7051,8 +7055,12 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (smooth.before_number + 1 == gpu_frame.number && t < 1 && !gpu_frame.covered) {
-                        between = m3::interpolate(smooth.before, gpu_frame.scene, static_cast<float>(std::max(t, 0.0)),
-                                                  smooth.between);
+                        // (the game's camera blended, the rest as in the newer frame; SPIKEOUT_SMOOTH_GUESS=1:
+                        // the models matched between frames, the old way)
+                        static const bool guess = std::getenv("SPIKEOUT_SMOOTH_GUESS") != nullptr;
+                        const float tf = static_cast<float>(std::max(t, 0.0));
+                        between = guess ? m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between)
+                                        : m3::interpolate_camera(smooth.before, gpu_frame.scene, tf, smooth.between);
                         if (between) {
                             real3d_gpu->render(smooth.between, texture_copy, textures_version);
                             drawn_number = 0; // the frame itself drawn again when it's shown

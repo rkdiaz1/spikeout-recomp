@@ -46,6 +46,14 @@ struct Real3dScene {
         // 3D (word 0x20 low byte; 0x24 low byte the scroll attenuation; 0x25
         // bits 16-23 the fog ambient).
         float scroll_fog = 0, scroll_attenuation = 0, fog_ambient = 1;
+        // Smooth motion: the matrix of the first culling node under the
+        // viewport (its camera, on Model 3 games: the world to eye space,
+        // with the eye's axes turned), its index in the matrix table (-1:
+        // none) and that entry's 12 words as stored (translation, then the
+        // rotation's rows), to tell the game's camera by.
+        int camera_index = -1;
+        Mat4 camera;
+        std::array<uint32_t, 12> camera_words{};
     };
 
     // A vertex in eye space (z < 0 in front), with its texture position (in
@@ -120,6 +128,21 @@ struct Real3dScene {
     std::vector<Model> models;
     bool block_culled = false; // the Real3D's block culling was on: white, no scene
     bool fog_over_nothing = false; // scroll fog with no polygons too (Supermodel's; background_fog)
+
+    // Smooth motion: the game's camera after the frame the scene was built
+    // from, read from its RAM by the game's own code (games/spikeofe_camera:
+    // nothing set by the builder, cleared by it). view: the camera's matrix
+    // as the game stores it (its viewports' camera_words hold the same
+    // floats); look: the point it looks at; driver: what moves it (a change:
+    // a cut); shaking: a camera shake on (not blended).
+    struct GameCamera {
+        bool known = false;
+        std::array<uint32_t, 12> view{};
+        std::array<float, 3> eye{}, look{};
+        uint32_t driver = 0;
+        bool shaking = false;
+    };
+    GameCamera game_camera;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;

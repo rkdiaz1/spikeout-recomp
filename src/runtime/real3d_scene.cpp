@@ -150,6 +150,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
     scene.stats = {};
     scene.block_culled = mem.block_culling();
     scene.fog_over_nothing = fog_over_nothing_;
+    scene.game_camera = {};
     models_.clear();
     viewport_models_.clear();
     visits_ = 0;
@@ -306,6 +307,19 @@ void Real3dSceneBuilder::walk_viewports(uint32_t addr) {
         }
         coord_sys_.m[12] = coord_sys_.m[13] = coord_sys_.m[14] = 0;
         coord_sys_.m[15] = 1;
+
+        // Smooth motion: the first node's matrix, the viewport's camera (read
+        // only: the walk below takes it again as it goes).
+        if (const uint32_t first = node[0x02]; (first & 0xFFFFFF) != 0 && ((first >> 24) & 5) == 0)
+            if (const uint32_t* top = mem_->culling_ptr(first & 0xFFFFFF); top && (top[0] & 3) != 0 && !(top[0] & 0x10))
+                if (const uint32_t index = top[3] & 0xFFF; index != 0) {
+                    const Mat4 saved = matrix_;
+                    multiply_matrix(index);
+                    vp.camera = matrix_;
+                    matrix_ = saved;
+                    vp.camera_index = static_cast<int>(index);
+                    for (uint32_t i = 0; i < 12; ++i) vp.camera_words[i] = mem_->culling(matrix_base_ + index * 12 + i);
+                }
 
         path_ = (2166136261u ^ addr) * 16777619u; // each viewport's tree its own
         ancestors_.assign(1, path_);

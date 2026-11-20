@@ -262,4 +262,127 @@ bool interpolate(const Real3dScene& a, const Real3dScene& b, float t, Real3dScen
     return done(true);
 }
 
+namespace {
+
+// Whether a viewport's camera (its first node's matrix, as the Real3D holds
+// it: the translation, then the rotation's rows) is the game's (as the game
+// stores it: the rotation column-major, then the translation): the same
+// floats, bit for bit.
+bool is_game_camera(const Real3dScene::Viewport& vp, const Real3dScene::GameCamera& camera) {
+    if (vp.camera_index < 0 || !camera.known) return false;
+    const auto& w = vp.camera_words;
+    const auto& v = camera.view;
+    for (size_t i = 0; i < 3; ++i)
+        if (w[i] != v[9 + i]) return false;
+    for (size_t r = 0; r < 3; ++r) // (row r, column c) of the rotation: w's row-major, v's column-major
+        for (size_t c = 0; c < 3; ++c)
+            if (w[3 + r * 3 + c] != v[c * 3 + r]) return false;
+    return true;
+}
+
+// A rigid matrix's parts for blending a camera: its linear part's turn and
+// scale, and the eye's place in the world (-L^-1 t).
+struct CameraParts {
+    Parts parts;
+    Vec3 eye;
+};
+bool camera_parts(const Mat4& m, CameraParts& out) {
+    const Mat3 l = linear(m);
+    Mat3 inv{};
+    if (!decompose(l, out.parts) || !inverse(l, inv)) return false;
+    const Vec3 e = m3::apply(inv, translation(m));
+    out.eye = {-e[0], -e[1], -e[2]};
+    return true;
+}
+
+float distance(const std::array<float, 3>& a, const std::array<float, 3>& b) {
+    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+}
+
+} // namespace
+
+bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out, CameraInterpStats* stats) {
+    out = b;
+    CameraInterpStats s;
+    auto done = [&](CameraInterpStats::Cut cut) {
+        s.cut = cut;
+        if (stats) *stats = s;
+        return cut == CameraInterpStats::Cut::none;
+    };
+    const Real3dScene::GameCamera &ca = a.game_camera, &cb = b.game_camera;
+    if (!ca.known || !cb.known || a.block_culled || b.block_culled) return done(CameraInterpStats::Cut::no_camera);
+    if (ca.driver != cb.driver) return done(CameraInterpStats::Cut::driver);
+    if (ca.shaking || cb.shaking) return done(CameraInterpStats::Cut::shaking);
+    if (distance(ca.eye, cb.eye) > kCameraJump || distance(ca.look, cb.look) > kCameraJump)
+        return done(CameraInterpStats::Cut::jump);
+
+    // Each of b's viewports with the game's camera, moved from it to the
+    // camera between: by C = (between) x (b's)^-1, the camera's in a taken
+    // from a viewport of a at the same address with the game's camera, else
+    // the first with it.
+    std::vector<size_t> a_cameras;
+    for (size_t v = 0; v < a.viewports.size(); ++v)
+        if (is_game_camera(a.viewports[v], ca)) a_cameras.push_back(v);
+    if (a_cameras.empty()) return done(CameraInterpStats::Cut::no_viewport);
+    std::vector<std::pair<Mat3, Vec3>> moves(b.viewports.size()); // per viewport: C's linear part and translation
+    std::vector<bool> moved(b.viewports.size(), false);
+    for (size_t v = 0; v < b.viewports.size(); ++v) {
+        if (!is_game_camera(b.viewports[v], cb)) continue;
+        size_t from = a_cameras.front();
+        if (v < b.viewport_info.size())
+            for (size_t k : a_cameras)
+                if (k < a.viewport_info.size() && a.viewport_info[k].addr == b.viewport_info[v].addr) {
+                    from = k;
+                    break;
+                }
+        const Mat4 &va = a.viewports[from].camera, &vb = b.viewports[v].camera;
+        CameraParts pa{}, pb{};
+        Mat3 lb_inverse{};
+        if (!camera_parts(va, pa) || !camera_parts(vb, pb) || pa.parts.mirrored != pb.parts.mirrored ||
+            !inverse(linear(vb), lb_inverse))
+            continue;
+        Mat3 lt = rotation(slerp(pa.parts.q, pb.parts.q, t));
+        if (pa.parts.mirrored)
+            for (float& c : lt[0]) c = -c;
+        for (size_t c = 0; c < 3; ++c)
+            for (float& x : lt[c]) x *= pa.parts.scale[c] + (pb.parts.scale[c] - pa.parts.scale[c]) * t;
+        const Vec3 eye{pa.eye[0] + (pb.eye[0] - pa.eye[0]) * t, pa.eye[1] + (pb.eye[1] - pa.eye[1]) * t,
+                       pa.eye[2] + (pb.eye[2] - pa.eye[2]) * t};
+        const Vec3 le = m3::apply(lt, eye);
+        const Vec3 tt{-le[0], -le[1], -le[2]}; // the camera between: L_t, -L_t eye
+        const Mat3 l = times(lt, lb_inverse);
+        const Vec3 l_tb = m3::apply(l, translation(vb));
+        moves[v] = {l, {tt[0] - l_tb[0], tt[1] - l_tb[1], tt[2] - l_tb[2]}};
+        moved[v] = true;
+        ++s.viewports;
+        // The sun, given in eye space, turned with the rest.
+        Real3dScene::Viewport& vp = out.viewports[v];
+        Vec3 sun = m3::apply(l, {vp.sun[0], vp.sun[1], vp.sun[2]});
+        if (const float n = length(sun); n > 1e-12f)
+            for (float& c : sun) c *= length({vp.sun[0], vp.sun[1], vp.sun[2]}) / n;
+        vp.sun = {sun[0], sun[1], sun[2]};
+    }
+    if (s.viewports == 0) return done(CameraInterpStats::Cut::no_viewport);
+
+    for (const Real3dScene::Model& model : b.models) {
+        if (model.viewport >= moved.size() || !moved[model.viewport]) continue;
+        ++s.models;
+        const auto& [l, tr] = moves[model.viewport];
+        for (uint32_t p = model.first_polygon; p < model.first_polygon + model.polygon_count; ++p) {
+            const Real3dScene::Polygon& poly = out.polygons[p];
+            for (uint32_t k = 0; k < poly.vertex_count; ++k) {
+                Real3dScene::Vertex& vx = out.vertices[poly.first_vertex + k];
+                const Vec3 pos = m3::apply(l, {vx.x, vx.y, vx.z}), n = m3::apply(l, {vx.nx, vx.ny, vx.nz});
+                vx.x = pos[0] + tr[0];
+                vx.y = pos[1] + tr[1];
+                vx.z = pos[2] + tr[2];
+                vx.nx = n[0];
+                vx.ny = n[1];
+                vx.nz = n[2];
+            }
+        }
+    }
+    return done(CameraInterpStats::Cut::none);
+}
+
 } // namespace m3

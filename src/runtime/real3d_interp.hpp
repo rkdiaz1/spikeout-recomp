@@ -49,4 +49,28 @@ bool interpolate(const Real3dScene& a, const Real3dScene& b, float t, Real3dScen
 constexpr float kMaxMove = 0.75f;  // of the distance from the eye, in a frame
 constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 
+// Smooth motion from the game's own camera (docs/smooth-motion.md, step 1):
+// the camera between the two frames' (its eye's place straight, its turn the
+// shortest), everything else where it is in the newer frame, seen through
+// that camera. The viewports whose camera is the game's (their first node's
+// matrix the game_camera's view, in b and a) are moved; the others (the radar,
+// the HUD's 3D) are drawn as in b. No guessing which model is which.
+//
+// A cut (out is b, false): either scene without the game's camera, the camera
+// driven by something else (its driver changed), shaking (a shake changes
+// direction every frame or two: blended, it would be halved), or its eye or
+// the point it looks at moved more than kCameraJump in the frame. Measured
+// over 150,000 frames of the whole game, every camera jump (an area or stage
+// change, a scripted shot's instant command, a win pose's camera) was over
+// 2 units and every other move under 0.6.
+struct CameraInterpStats {
+    std::size_t viewports = 0; // moved by the blended camera
+    std::size_t models = 0;    // in them
+    enum class Cut : uint8_t { none, no_camera, driver, shaking, jump, no_viewport } cut = Cut::none;
+};
+bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out,
+                        CameraInterpStats* stats = nullptr);
+
+constexpr float kCameraJump = 1.0f; // world units in a frame
+
 } // namespace m3

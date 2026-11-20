@@ -196,6 +196,7 @@
 // its models are found in the frame before's (smooth motion's matching: by
 // viewport, address and culling-node path).
 #include "games/games.hpp"
+#include "games/spikeofe_camera.hpp"
 #include "ppc/disasm.hpp"
 #include "ppc/instruction.hpp"
 #include "recomp/context.hpp"
@@ -451,6 +452,7 @@ struct Options {
     bool gpu_hash_frames = false;   // --gpu-hash-frames: each GPU picture's hash, printed
     uint64_t gpu_full_frame = 0;    // --gpu-full FRAME: that frame's GPU picture written whole (FILE-<frame>-full.png)
     bool interp = false;            // --interp: smooth motion's pictures between frames, reported and drawn
+    bool interp_guess = false;      // --interp-guess: by the models matched between frames (the old way), not the camera
     bool interp_trace = false;      // --interp-trace FROM:TO: and each frame's, printed
     uint64_t interp_trace_from = 0, interp_trace_to = 0;
     bool irq5_on_e0 = true, send_waits_for_receive = m3::CommBoardOptions().send_waits_for_receive,
@@ -1969,6 +1971,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         if (o.match_models) { // each frame's models found in the frame before's (smooth motion)
             std::swap(m.match_scene[0], m.match_scene[1]);
             m.match_builder.build(m.bus.real3d(), m.match_scene[1]);
+            m3::games::spikeout_camera(m.bus.ram(), m.match_scene[1].game_camera);
             const auto& before = m.match_scene[0].models;
             const auto& now = m.match_scene[1].models;
             std::unordered_map<uint64_t, int> keys; // (viewport, address, path): how many models in the frame before
@@ -1996,9 +1999,45 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             if (!before.empty() && !now.empty()) ++m.match_frames;
             if (o.interp && !before.empty() && !now.empty()) {
                 m3::InterpStats stats;
+                m3::CameraInterpStats camera_stats;
                 const auto start = std::chrono::steady_clock::now();
-                m3::interpolate(m.match_scene[0], m.match_scene[1], 0.5f, m.interp_scene, &stats);
+                if (o.interp_guess) m3::interpolate(m.match_scene[0], m.match_scene[1], 0.5f, m.interp_scene, &stats);
+                else {
+                    m3::interpolate_camera(m.match_scene[0], m.match_scene[1], 0.5f, m.interp_scene, &camera_stats);
+                    stats.models = now.size();
+                    stats.blended = camera_stats.models;
+                    stats.cut = camera_stats.cut != m3::CameraInterpStats::Cut::none;
+                }
                 const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (o.interp_trace && !o.interp_guess && frame >= o.interp_trace_from && frame < o.interp_trace_to) {
+                    // the game's camera, and each viewport's: its matrix index and whether it's the game's
+                    static const char* const kCuts[] = {"", "no camera", "driver", "shaking", "jump", "no viewport"};
+                    const auto& s1 = m.match_scene[1];
+                    const auto& c = s1.game_camera;
+                    std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f driver %u%s; %zu viewports, %zu "
+                                "models moved%s%s\n",
+                                static_cast<unsigned long long>(frame), c.eye[0], c.eye[1], c.eye[2], c.look[0], c.look[1],
+                                c.look[2], c.driver, c.shaking ? " shaking" : "", camera_stats.viewports, camera_stats.models,
+                                camera_stats.cut != m3::CameraInterpStats::Cut::none ? "; a cut: " : "",
+                                kCuts[static_cast<int>(camera_stats.cut)]);
+                    for (size_t v = 0; v < s1.viewports.size(); ++v) {
+                        const auto& vp = s1.viewports[v];
+                        size_t count = 0;
+                        for (const auto& model : now) count += model.viewport == v;
+                        std::printf("  viewport %zu at %06x: priority %d, %zu models, camera %d", v,
+                                    v < s1.viewport_info.size() ? s1.viewport_info[v].addr : 0u, vp.priority, count,
+                                    vp.camera_index);
+                        if (vp.camera_index >= 0) {
+                            std::printf(" [");
+                            for (uint32_t w : vp.camera_words) std::printf(" %08x", w);
+                            std::printf(" ]");
+                        }
+                        std::printf("\n");
+                    }
+                    std::printf("  game's view [");
+                    for (uint32_t w : c.view) std::printf(" %08x", w);
+                    std::printf(" ]\n");
+                }
                 m.interp_seconds += took;
                 if (took > m.interp_worst) {
                     m.interp_worst = took;
@@ -4187,6 +4226,7 @@ int main(int argc_given, char** argv_given) {
         else if (arg == "--gpu-hash-frames") o.gpu_hash_frames = true;
         else if (arg == "--gpu-full" && i + 1 < argc) o.gpu_full_frame = std::strtoull(argv[++i], nullptr, 0);
         else if (arg == "--interp") o.interp = o.match_models = true;
+        else if (arg == "--interp-guess") o.interp = o.match_models = o.interp_guess = true;
         else if (arg == "--interp-trace" && i + 1 < argc) {
             const std::string range = argv[++i];
             const size_t colon = range.find(':');
