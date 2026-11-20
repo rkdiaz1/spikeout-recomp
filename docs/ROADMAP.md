@@ -100,6 +100,44 @@ See [netplay.md](netplay.md).
 - [ ] Mode A: one board per PC, cabinet link over the network (LAN first)
 - [ ] Mode B: rollback, every PC simulates all linked boards; 2–4 players plus spectators
 - [ ] Lobby / matchmaking; Steam networking as an optional backend
+- [ ] **Issue 39: the lobby on a slow mobile line** (looked into 2026-11-20; a player on a 4G/5G SIM router: their room
+  disappears after a few minutes, friends can't find it even by its code, the flag is sometimes missing, their join
+  list is empty while friends see games). What was found:
+  - **A host's room vanishes with its lobby connection, for good.** The lobby drops a room the moment the host's
+    WebSocket closes (`lobby/src/index.js`, `webSocketClose`). The game never notices: `net::LobbyClient::run`
+    (`src/net/lobby.cpp`) only sets `failed_` and stops; nobody checks it while hosting, nothing reconnects, nothing
+    is logged, and the window keeps showing a code the lobby no longer knows. Mobile lines (carrier NAT, changing
+    public addresses, seconds of delay) drop long connections far more than home broadband.
+  - **The join list shows "No games found yet" when the lobby is only slow.** The join page (`tools/spikeout.cpp`,
+    `join_page`) opens a new lobby connection and waits 3 s for the list; about 5 round trips (TCP, TLS, upgrade,
+    hello, list) come first. On a line with ~1 s or more of delay the answer is late, and the page shows neither the
+    games, nor "N games on another version" (same answer), nor an error ("No internet lobby" only once it failed).
+  - **The flag** is Cloudflare's lookup of the address the connection comes from (`request.cf.country`), never the
+    game's: a carrier's pool of shared addresses is sometimes unplaced, so the flag is blank now and then.
+  - **No direct connection**: a mobile carrier's shared router (CGNAT) often gives a new port for each destination,
+    so hole punching fails and only the relay (TURN) gets through. That player's reports: one game through the relay
+    at ~7 s there and back (the host heard almost nothing back in 30 s, the joiner left), another at ~6.3 s; one game
+    with someone on the same home network at 47 ms. Note the lobby connection itself never goes through the relay
+    (it is HTTPS/WebSocket straight to Cloudflare); the relay carries only the game's datagrams between players.
+  - Versions: the lobby lists only games of the same build; the player switched between preview6 and preview7 on
+    the same evening, so friends on another version can't see their room either.
+  - Not explained: "found by others only when friends joined or watched early (before Diesel Town)".
+  - The player's own problem bundles were downloaded and unlocked locally (not in the repo): 5 bundles, 18-19 Nov.
+  To do (the lobby and menu only; the game's sync is not touched; needs a release for players to get it):
+  1. Log the lobby connection: lost (why), reconnecting, reconnected; so reports show it.
+  2. Notice a dead connection (no pong within ~10 s of a ping; the ping is every 30 s already), reconnect with a
+     growing wait, and a host lists its room again under the SAME code. The lobby keeps every hosted room's code
+     for a short while (today `remember` keeps only started rooms, for `takeover`), so the re-offer gets it back.
+     The window shows "Reconnecting to the lobby..." meanwhile.
+  3. Join page: "Asking the lobby..." while waiting, the list filled in when the answer comes however late, and a
+     plain message when the lobby can't be reached.
+  4. Log the router type: ask two STUN servers and compare the ports (different: direct play can't work, relay only).
+  5. Later, bigger: IPv6 candidates (UK mobile carriers give each router its own IPv6 address, no shared router in
+     the way), in the game's networking and the lobby (it keeps IPv4 only today); and a relay that copes with a
+     slow line.
+  6. Reply to issue 39 (only when the owner says): same version for everyone (preview7), a Report a problem zip right
+     after the room disappears, a bufferbloat test (delay under load), the router's position or QoS/SQM.
+  Before committing: the whole network test set (docs/handoff.md rule 7); a lobby deploy only on the owner's word.
 - [ ] **One board a PC, open problems** (found 2026-11-14; rare: 9 of 1,251 network problem reports were on one board; details in [netplay.md](netplay.md), "Joining a long game"):
   - A player joining an empty seat in play never gets the game: nobody runs an empty cabinet whole, so the host asks the joiner itself for it. Cure: the host (the authority) runs empty cabinets whole and answers for them.
   - A player leaving on a very slow upload (under ~0.5 MB/s): its final state (~5.4 MB) isn't through in the 10 s it waits, so the others never have its cabinet whole and a later joiner of that seat can't get in. Cure: the others fall back on its last backup (every 120 frames) and run it on with its inputs, as for a player gone without a goodbye; exact, at worst a short hitch (to measure).
