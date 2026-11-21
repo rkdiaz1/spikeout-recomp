@@ -1,6 +1,7 @@
 #include "games/spikeofe_models.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -39,6 +40,8 @@ void SpikeoutModels::load(const RomSet& roms) {
     // of 300, 500 or 700 after an underscore) are one model drawn at several
     // sizes, not an animation.
     std::unordered_map<std::string, std::vector<uint32_t>> stems;
+    const char* like = std::getenv("SPIKEOUT_MODELS_NAMED");
+    named_like_.clear();
     for (uint32_t k = 0; k < count; ++k) {
         const uint32_t at = roms.read_program32(kNames + 4 + 4 * k);
         if (at < 0xFF800000u) continue;
@@ -50,6 +53,7 @@ void SpikeoutModels::load(const RomSet& roms) {
         }
         if (name.empty()) continue;
         ++named_;
+        if (like && name.compare(0, std::strlen(like), like) == 0) named_like_.push_back(numbers[k]);
         std::size_t digits = name.size();
         while (digits > 0 && name[digits - 1] >= '0' && name[digits - 1] <= '9') --digits;
         if (digits == name.size() || digits == 0) continue;

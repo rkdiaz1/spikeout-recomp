@@ -392,6 +392,17 @@ the clear changes the 16:9 pictures from the ranking on only, the fade the
 ranking's only, the 4:3 pictures none; the linking screen's pictures the
 same as before, both cabinets'.
 
+### Open: the parked van's wheels change texture (owner, 2026-11-21)
+
+Stage 1: after the gate is broken, on the way to the docks, looking back
+at the car park, the parked van's wheels change their texture as the
+camera moves. Seen with smooth motion off too, so it's the renderer or
+the game, not smooth motion. Not looked into yet. To try: the same view
+in Supermodel (a real Model 3 would settle it); our level of detail
+choice for the wheels (Real3dSceneBuilder: the four-level table, the
+cross-fade, Supermodel 77d28ee's bit 29 rule) and their texture page and
+offset (node word 2) as the distance changes; a state saved there.
+
 ## Sound board
 
 `m3::SoundBoard` and `m3::Scsp` are adapted from Supermodel's SCSP (ElSemi's,

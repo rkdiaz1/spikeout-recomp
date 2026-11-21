@@ -350,11 +350,9 @@ bool same_linear_bits(const Mat4& a, const Mat4& b) {
 // Which body and bone a model is drawn on: the bone (of the bodies the scene
 // was drawn with, read the frame before, or failing that this frame's) with
 // its turn (within kBoneTurn, the game's layout: column by column) nearest
-// its place (within kBoneReach); a shadow (one polygon, untied) by the body
-// whose feet it's under, with its own model's address. kNoKey: none.
+// its place (within kBoneReach). kNoKey: none.
 constexpr uint64_t kNoKey = ~0ull;
-constexpr uint64_t kShadowBone = 0xFF;
-uint64_t body_key(const Real3dScene& scene, const Real3dScene::Model& model, const Affine& place) {
+uint64_t body_key(const Real3dScene& scene, const Affine& place) {
     if (scene.bodies.empty() && scene.bodies_before.empty()) return kNoKey;
     Parts parts{};
     if (!decompose(place.l, parts) || parts.mirrored) return kNoKey;
@@ -376,18 +374,52 @@ uint64_t body_key(const Real3dScene& scene, const Real3dScene::Model& model, con
             }
         if (key != kNoKey) return key;
     }
-    if (model.polygon_count != 1) return kNoKey;
-    for (const auto* bodies : {&scene.bodies_before, &scene.bodies})
-        for (const Real3dScene::GameBody& body : *bodies) {
-            const auto& root = body.bones[0];
-            const float dx = place.t[0] - root[9], dz = place.t[2] - root[11];
-            if (dx * dx + dz * dz < kShadowReach * kShadowReach)
-                return uint64_t{body.slot} << 40 | kShadowBone << 32 | (model.address & 0xFFFFFF);
-        }
     return kNoKey;
 }
 
+// A shadow: flat on the ground (its up axis straight up) near a body's bone
+// across the ground. Its move: that bone's across the ground from a to b (the
+// same body and bone), the height its own. False: not one, or the body isn't
+// in a.
+bool shadow_move(const Real3dScene& a, const Real3dScene& b, const Affine& place, Vec3& move) {
+    Vec3 up = place.l[1];
+    if (const float n = length(up); n > 1e-12f)
+        for (float& c : up) c /= n;
+    if (std::fabs(up[1]) < kShadowFlat) return false;
+    const Real3dScene::GameBody* body = nullptr;
+    size_t bone = 0;
+    float nearest = kShadowReach;
+    for (const Real3dScene::GameBody& candidate : b.bodies_before)
+        for (size_t k = 0; k < candidate.bones.size(); ++k) {
+            const auto& m = candidate.bones[k];
+            if (const float across = std::hypot(place.t[0] - m[9], place.t[2] - m[11]); across < nearest) {
+                nearest = across;
+                body = &candidate;
+                bone = k;
+            }
+        }
+    if (!body) return false;
+    for (const Real3dScene::GameBody& before : a.bodies_before)
+        if (before.slot == body->slot) {
+            const auto &was = before.bones[bone], &is = body->bones[bone];
+            move = {was[9] - is[9], 0, was[11] - is[11]};
+            return true;
+        }
+    return false;
+}
+
 } // namespace
+
+// The bones' chain, by the RAM's bone order (the root, then the drawn ones:
+// chest, head, left armpit, shoulder, arm, hand, the right's, waist, right
+// thigh, knee, ankle, toe, the left's): each one's parent, -1 the root.
+// Every parent comes before its children.
+constexpr std::array<int, Real3dScene::kGameBones> kBoneParent = {-1, 0, 1, 1, 3, 4, 5, 1, 7, 8, 9, 0, 11, 12, 13, 14, 11, 16, 17, 18};
+
+// A bone's matrix (the game's layout: the turn column by column, then the place) as an affine.
+Affine bone_affine(const std::array<float, 12>& m) {
+    return {Mat3{Vec3{m[0], m[1], m[2]}, Vec3{m[3], m[4], m[5]}, Vec3{m[6], m[7], m[8]}}, Vec3{m[9], m[10], m[11]}};
+}
 
 struct CameraBlend::Data {
     const Real3dScene* a = nullptr;
@@ -405,10 +437,26 @@ struct CameraBlend::Data {
     std::vector<View> views; // by b's viewport
     // Each of b's models: through the camera only, its place blended, or as
     // another model (a skin with its limb).
-    enum class Kind : uint8_t { camera, blend, follow };
+    // A body in both frames: its bones blended through the chain (each turn
+    // relative to its parent, then placed from the parent's blended frame), so
+    // its joints stay joined however far a limb swings in a frame.
+    struct Skeleton {
+        std::array<Affine, Real3dScene::kGameBones> b_inverse{}; // b's bones, undone
+        std::array<Parts, Real3dScene::kGameBones> pa{}, pb{};   // each bone's turn relative to its parent, a and b
+        std::array<Vec3, Real3dScene::kGameBones> ta{}, tb{};    // and its place in the parent's frame
+        bool ok = false;
+    };
+    std::vector<Skeleton> skeletons;
+    std::unordered_map<uint8_t, size_t> skeleton_of; // by body slot
+    enum class Kind : uint8_t { camera, blend, follow, shift, bone };
     struct Plan {
         Kind kind = Kind::camera;
         uint32_t follow = 0;
+        uint32_t skeleton = 0, bone = 0; // Kind::bone: drawn on that body's bone
+        Vec3 shift{}; // a shadow: its move in the world from b to a (its bone's across the ground)
+        // A skin: each vertex's way (in b's eye space) to where a's skin had it, in the skin's own frame (its shape
+        // in a); empty: not paired.
+        std::vector<Vec3> shape;
         Parts pa{}, pb{};
         Vec3 ta{}, tb{};
         Affine place_inverse{};
@@ -531,17 +579,66 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
         return false;
     };
 
-    // The characters: each model drawn on a body's bone keyed by (slot, bone),
-    // a shadow (one polygon at a body's feet) by (slot, kShadowBone); those
-    // in b are found in a by that key, no guessing (identical enemies side by
-    // side included).
+    // The characters: each model drawn on a body's bone keyed by (slot, bone)
+    // and its own address; those in b are found in a by that key, no
+    // guessing (identical enemies side by side included). A bone can carry
+    // more than one model, so the address is part of the key; one whose model
+    // changed (a head's or hand's swap) is found by its bone alone when a had
+    // just one model on it.
     // (a model drawn twice in one place, as two detail levels cross-fade, is one key: the first kept)
     std::unordered_map<uint64_t, Affine> a_keyed;
+    // by (slot, the model's address): the place and how many (a straight joint can give two bones the same turn,
+    // so a model's bone can differ between the frames: then it's found by its body and model, if it's there once)
+    std::unordered_map<uint64_t, std::pair<Affine, int>> a_body_models;
+    constexpr uint64_t kSlotOnly = 0xFFull << 40;
     for (const Real3dScene::Model& model : a.models)
         if (model.viewport < a_known.size() && a_known[model.viewport] && !built_each_frame(model)) {
             const Affine place = a_unview[model.viewport] * affine(model.matrix);
-            if (const uint64_t key = body_key(a, model, place); key != kNoKey) a_keyed.emplace(key, place);
+            const uint64_t key = body_key(a, place);
+            if (key == kNoKey) continue;
+            a_keyed.emplace(key | (model.address & 0xFFFFFF), place);
+            const auto [it, added] = a_body_models.emplace((key & kSlotOnly) | (model.address & 0xFFFFFF), std::pair{place, 1});
+            if (!added) ++it->second.second;
         }
+
+    // The skeletons: each body drawn in both frames, its bones relative to their parents.
+    d.skeletons.clear();
+    d.skeleton_of.clear();
+    for (const Real3dScene::GameBody& body_b : b.bodies_before)
+        for (const Real3dScene::GameBody& body_a : a.bodies_before) {
+            if (body_a.slot != body_b.slot) continue;
+            Data::Skeleton sk;
+            sk.ok = true;
+            std::array<Affine, Real3dScene::kGameBones> inverse_a{};
+            for (size_t k = 0; k < body_b.bones.size() && sk.ok; ++k) {
+                const Affine bone_a = bone_affine(body_a.bones[k]), bone_b = bone_affine(body_b.bones[k]);
+                if (!inverse(bone_b, sk.b_inverse[k]) || !inverse(bone_a, inverse_a[k])) {
+                    sk.ok = false;
+                    break;
+                }
+                const int parent = kBoneParent[k];
+                const Affine local_a = parent < 0 ? bone_a : inverse_a[static_cast<size_t>(parent)] * bone_a;
+                const Affine local_b = parent < 0 ? bone_b : sk.b_inverse[static_cast<size_t>(parent)] * bone_b;
+                sk.ok = decompose(local_a.l, sk.pa[k]) && decompose(local_b.l, sk.pb[k]) && sk.pa[k].mirrored == sk.pb[k].mirrored;
+                sk.ta[k] = local_a.t;
+                sk.tb[k] = local_b.t;
+            }
+            if (sk.ok) {
+                d.skeleton_of[body_b.slot] = d.skeletons.size();
+                d.skeletons.push_back(sk);
+            }
+            break;
+        }
+    // A tied model (or skin) drawn on a body's bone moves as the bone does, through the chain.
+    auto on_bone = [&](Data::Plan& plan, uint64_t key) {
+        if (key == kNoKey) return false;
+        const auto it = d.skeleton_of.find(static_cast<uint8_t>(key >> 40));
+        if (it == d.skeleton_of.end()) return false;
+        plan.kind = Data::Kind::bone;
+        plan.skeleton = static_cast<uint32_t>(it->second);
+        plan.bone = static_cast<uint32_t>(key >> 32 & 0xFF);
+        return true;
+    };
 
     // The limbs (anything drawn with a matrix a skin may share), by viewport and matrix.
     std::vector<size_t> skins;
@@ -558,13 +655,18 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
         float d1 = 0, d2 = 0;
         const Affine* nearest = nullptr;
         bool flipbook = false, tied = false;
-        if (const uint64_t key = body_key(b, model, place); key != kNoKey)
-            if (const auto it = a_keyed.find(key); it != a_keyed.end()) { // a body's limb or shadow: the same one
-                nearest = &it->second;
+        const uint64_t key = body_key(b, place);
+        if (key != kNoKey) { // a body's limb: the same one
+            if (const auto it = a_keyed.find(key | (model.address & 0xFFFFFF)); it != a_keyed.end()) nearest = &it->second;
+            else if (const auto same = a_body_models.find((key & kSlotOnly) | (model.address & 0xFFFFFF));
+                     same != a_body_models.end() && same->second.second == 1)
+                nearest = &same->second.first;
+            if (nearest) {
                 d1 = distance(nearest->t, place.t);
                 d2 = 1e30f;
                 tied = true;
             }
+        }
         if (!tied) nearest = nearest_of(find(before, model.address), place, d1, d2);
         if (!tied && (!nearest || d1 > kModelMatch) && model.animation) {
             // Another model of its animation (a flipbook's next frame) where it was: the place blended, this
@@ -573,8 +675,17 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
             flipbook = true;
         }
         Data::Plan& plan = d.plans[i];
-        if (!nearest || d1 > kModelMatch) ++s.newer; // appeared, moved too far, not part of an animation
-        else if (d2 < 2 * d1 + kModelSame) ++s.ambiguous; // copies alike: which is which can't be told
+        const bool missing = !nearest || d1 > kModelMatch, alike = !missing && d2 < 2 * d1 + kModelSame;
+        Vec3 shift{};
+        if (tied && !placed_near(place.t) && !placed_near(nearest->t) && on_bone(plan, key)) {
+            ++s.blended; // a body's limb: through its skeleton
+            ++s.tied;
+        } else if ((missing || alike) && !tied && !placed_near(place.t) && shadow_move(a, b, place, shift)) {
+            plan.kind = Data::Kind::shift; // a shadow (many alike under a body): with its bone across the ground
+            plan.shift = shift;
+            ++s.shadows;
+        } else if (missing) ++s.newer; // appeared, moved too far, not part of an animation
+        else if (alike) ++s.ambiguous; // copies alike: which is which can't be told
         else if (d1 <= kModelSame && same_linear(nearest->l, place.l)) ++s.still;
         else if (placed_near(place.t) || placed_near(nearest->t)) ++s.placed; // put down in one jump
         else if (decompose(nearest->l, plan.pa) && decompose(place.l, plan.pb) && plan.pa.mirrored == plan.pb.mirrored &&
@@ -586,39 +697,89 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
             s.tied += tied;
         } else ++s.newer;
     }
-    // A skin moves as the limb on its bone: drawn with the same turn (bit for
-    // bit), the nearest (it sits a little off the limb's own point; any point
-    // fixed to the bone moves as the limb does). None: as in the newer frame.
+    // a's skins by the body and bone they're drawn on (their matrix the
+    // bone's), in drawing order, to pair with b's: the k-th on a bone with the
+    // k-th, when their polygons are laid out alike (the game rebuilds each
+    // skin every frame in the same layout, only its vertices moved).
+    std::unordered_map<uint64_t, std::vector<size_t>> a_skins;
+    for (size_t k = 0; k < a.models.size(); ++k) {
+        const Real3dScene::Model& model = a.models[k];
+        if (model.viewport >= a_known.size() || !a_known[model.viewport] || !built_each_frame(model)) continue;
+        if (const uint64_t key = body_key(a, a_unview[model.viewport] * affine(model.matrix)); key != kNoKey)
+            a_skins[key].push_back(k);
+    }
+    std::unordered_map<uint64_t, size_t> b_skin_count;
+    auto same_layout = [&](const Real3dScene::Model& x, const Real3dScene::Model& y) {
+        if (x.polygon_count != y.polygon_count) return false;
+        for (uint32_t p = 0; p < x.polygon_count; ++p)
+            if (a.polygons[x.first_polygon + p].vertex_count != b.polygons[y.first_polygon + p].vertex_count) return false;
+        return true;
+    };
+
+    // A skin moves with its bone: drawn with its bone's turn, keyed by body and
+    // bone, it goes through the skeleton as the limbs do. Not keyed (or its body
+    // put down in one jump): as the limb drawn with the same turn (bit for bit),
+    // the nearest (it sits a little off the limb's own point; any point fixed to
+    // the bone moves as the limb does); none (its bone's own model left out at
+    // a lower detail), the nearest model; none, as in the newer frame.
+    // Its shape is blended too: paired with a's, each vertex goes part of the
+    // way back to where a's had it in the skin's own frame (a skirt between
+    // the waist and both thighs bends with the legs).
     for (size_t i : skins) {
         const Real3dScene::Model& skin = b.models[i];
-        size_t limb = b.models.size();
-        float nearest = kSkinReach;
-        const Vec3 at = translation(skin.matrix);
-        // (no limb drawn with its turn, as when its bone's own model is left out at a lower detail: the nearest
-        // model, nearly always of the same body)
-        for (const bool same_turn : {true, false}) {
-            for (size_t k = 0; k < b.models.size(); ++k) {
-                const Real3dScene::Model& other = b.models[k];
-                if (other.viewport != skin.viewport || built_each_frame(other) ||
-                    (same_turn && !same_linear_bits(other.matrix, skin.matrix)))
-                    continue;
-                if (const float dk = distance(translation(other.matrix), at); dk < nearest) {
-                    nearest = dk;
-                    limb = k;
+        const Affine skin_place = d.views[skin.viewport].unview * affine(skin.matrix);
+        const uint64_t key = body_key(b, skin_place);
+        if (!placed_near(skin_place.t) && on_bone(d.plans[i], key)) ++s.skins;
+        else {
+            size_t limb = b.models.size();
+            float nearest = kSkinReach;
+            const Vec3 at = translation(skin.matrix);
+            for (const bool same_turn : {true, false}) {
+                for (size_t k = 0; k < b.models.size(); ++k) {
+                    const Real3dScene::Model& other = b.models[k];
+                    if (other.viewport != skin.viewport || built_each_frame(other) ||
+                        (same_turn && !same_linear_bits(other.matrix, skin.matrix)))
+                        continue;
+                    if (const float dk = distance(translation(other.matrix), at); dk < nearest) {
+                        nearest = dk;
+                        limb = k;
+                    }
+                }
+                if (limb != b.models.size()) {
+                    if (!same_turn) ++s.skins_near;
+                    break;
                 }
             }
-            if (limb != b.models.size()) {
-                if (!same_turn) ++s.skins_near;
-                break;
+            if (limb == b.models.size()) {
+                ++s.skins_alone;
+                continue;
+            }
+            d.plans[i].kind = Data::Kind::follow;
+            d.plans[i].follow = static_cast<uint32_t>(limb);
+            ++s.skins;
+        }
+        // its shape in a
+        if (key == kNoKey) continue;
+        const size_t order = b_skin_count[key]++;
+        const auto pair = a_skins.find(key);
+        if (pair == a_skins.end() || order >= pair->second.size()) continue;
+        const Real3dScene::Model& before_skin = a.models[pair->second[order]];
+        Mat3 la_inverse{};
+        if (!same_layout(before_skin, skin) || !inverse(linear(before_skin.matrix), la_inverse)) continue;
+        const Mat3 lb = linear(skin.matrix);
+        const Vec3 ta = translation(before_skin.matrix), tb = translation(skin.matrix);
+        std::vector<Vec3>& shape = d.plans[i].shape;
+        for (uint32_t p = 0; p < skin.polygon_count; ++p) {
+            const Real3dScene::Polygon &pa = a.polygons[before_skin.first_polygon + p], &pb = b.polygons[skin.first_polygon + p];
+            for (uint32_t k = 0; k < pb.vertex_count; ++k) {
+                const Real3dScene::Vertex &va = a.vertices[pa.first_vertex + k], &vb = b.vertices[pb.first_vertex + k];
+                // a's vertex in the skin's own frame, put in b's skin frame
+                const Vec3 local = m3::apply(la_inverse, {va.x - ta[0], va.y - ta[1], va.z - ta[2]});
+                const Vec3 at_b = m3::apply(lb, local);
+                shape.push_back({at_b[0] + tb[0] - vb.x, at_b[1] + tb[1] - vb.y, at_b[2] + tb[2] - vb.z});
             }
         }
-        if (limb == b.models.size()) {
-            ++s.skins_alone;
-            continue;
-        }
-        d.plans[i].kind = Data::Kind::follow;
-        d.plans[i].follow = static_cast<uint32_t>(limb);
-        ++s.skins;
+        ++s.skins_shaped;
     }
     return true;
 }
@@ -654,6 +815,21 @@ void CameraBlend::draw(float t, Real3dScene& out) const {
             for (float& c : sun) c *= length({vp.sun[0], vp.sun[1], vp.sun[2]}) / n;
         vp.sun = {sun[0], sun[1], sun[2]};
     }
+    // The skeletons between: each bone's turn and place relative to its
+    // parent blended, then the chain built from the root.
+    std::vector<std::array<Affine, Real3dScene::kGameBones>> bones_t(d.skeletons.size());
+    for (size_t sk = 0; sk < d.skeletons.size(); ++sk) {
+        const Data::Skeleton& skeleton = d.skeletons[sk];
+        for (size_t k = 0; k < bones_t[sk].size(); ++k) {
+            const Parts &pa = skeleton.pa[k], &pb = skeleton.pb[k];
+            Vec3 scale;
+            for (size_t c = 0; c < 3; ++c) scale[c] = pa.scale[c] + (pb.scale[c] - pa.scale[c]) * t;
+            Affine local{linear_from(slerp(pa.q, pb.q, t), scale, pa.mirrored), {}};
+            for (size_t c = 0; c < 3; ++c) local.t[c] = skeleton.ta[k][c] + (skeleton.tb[k][c] - skeleton.ta[k][c]) * t;
+            const int parent = kBoneParent[k];
+            bones_t[sk][k] = parent < 0 ? local : bones_t[sk][static_cast<size_t>(parent)] * local;
+        }
+    }
     // Each model's move: the camera's, after its own place blended.
     std::vector<Affine> model_moves(b.models.size());
     for (size_t i = 0; i < b.models.size(); ++i) {
@@ -662,6 +838,19 @@ void CameraBlend::draw(float t, Real3dScene& out) const {
         const Data::View& view = d.views[model.viewport];
         const Data::Plan& plan = d.plans[i];
         model_moves[i] = moves[model.viewport];
+        if (plan.kind == Data::Kind::bone) { // eye b -> world b -> its bone's own frame (b's) -> the bone between -> picture
+            const Data::Skeleton& skeleton = d.skeletons[plan.skeleton];
+            model_moves[i] = model_moves[i] * view.view * bones_t[plan.skeleton][plan.bone] *
+                             skeleton.b_inverse[plan.bone] * view.unview;
+            continue;
+        }
+        if (plan.kind == Data::Kind::shift) { // eye b -> world b -> moved back part of the way -> eye b -> picture
+            const float back = 1 - t;
+            const Affine shift{Mat3{Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}},
+                               {plan.shift[0] * back, plan.shift[1] * back, plan.shift[2] * back}};
+            model_moves[i] = model_moves[i] * view.view * shift * view.unview;
+            continue;
+        }
         if (plan.kind != Data::Kind::blend) continue;
         Vec3 scale;
         for (size_t c = 0; c < 3; ++c) scale[c] = plan.pa.scale[c] + (plan.pb.scale[c] - plan.pa.scale[c]) * t;
@@ -677,10 +866,18 @@ void CameraBlend::draw(float t, Real3dScene& out) const {
         const Affine& move = model_moves[plan.kind == Data::Kind::follow ? plan.follow : i];
         const Mat3& l = move.l;
         const Vec3& tr = move.t;
+        const float back = 1 - t; // a skin's shape: part of the way back to a's
+        size_t shaped = 0;
         for (uint32_t p = model.first_polygon; p < model.first_polygon + model.polygon_count; ++p) {
             const Real3dScene::Polygon& poly = out.polygons[p];
             for (uint32_t k = 0; k < poly.vertex_count; ++k) {
                 Real3dScene::Vertex& vx = out.vertices[poly.first_vertex + k];
+                if (shaped < plan.shape.size()) {
+                    const Vec3& to_a = plan.shape[shaped++];
+                    vx.x += to_a[0] * back;
+                    vx.y += to_a[1] * back;
+                    vx.z += to_a[2] * back;
+                }
                 const Vec3 pos = m3::apply(l, {vx.x, vx.y, vx.z});
                 Vec3 n = m3::apply(l, {vx.nx, vx.ny, vx.nz});
                 // normals kept their length (the move turns them; any scale isn't theirs)

@@ -82,9 +82,15 @@ constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 // body the game put down in one jump (Real3dScene::placed: made, respawned).
 // The characters (step 3): a model drawn on a body's bone (Real3dScene::
 // bodies_before: the bones the scene was drawn with; its turn the bone's, its
-// place near the bone's) is keyed by (body, bone), a shadow (one polygon
-// under a body's root) by (body, its model), and found in a by that key, no
-// guessing: identical enemies side by side can't be mixed up.
+// place near the bone's) is keyed by (body, bone, its address; failing that,
+// by (body, address) when a had that model on the body once) and found in a
+// by that key, no guessing: identical enemies side by side can't be mixed up.
+// Found, it moves with its bone through the body's skeleton: each bone's turn
+// and place relative to its parent blended, the chain rebuilt from the root,
+// so joints stay joined however fast a limb swings. A shadow (the game draws
+// many alike under each body: a model flat on the ground, not found or alike,
+// near a body's bone) moves with the nearest bone across the ground, its
+// height its own.
 // A skin (a model in polygon RAM: the game builds a joint's skin each frame,
 // its address packed by whoever draws) isn't matched: it moves as the limb on
 // its bone (drawn with the same turn, bit for bit, within kSkinReach); none
@@ -94,14 +100,16 @@ struct CameraInterpStats {
     std::size_t viewports = 0; // moved by the blended camera
     std::size_t models = 0;    // in them
     std::size_t blended = 0;   // of those, found and their place blended
-    std::size_t tied = 0;      // of those, a body's limb or shadow found by its body and bone
+    std::size_t tied = 0;      // of those, a body's limb found by its body and bone
     std::size_t still = 0;     // found, in the same place
     std::size_t flipbook = 0;  // another model of its animation found where it was: its place blended
     std::size_t newer = 0;     // not found: as in the newer scene
     std::size_t ambiguous = 0; // copies alike: as in the newer scene
+    std::size_t shadows = 0;   // flat under a body: moved with their bone across the ground
     std::size_t placed = 0;    // near a body put down in one jump: as in the newer scene
     std::size_t skins = 0;     // moved with their limb
     std::size_t skins_near = 0; // of those, no limb with their turn: with the nearest model
+    std::size_t skins_shaped = 0; // of those, paired with a's on the same body and bone: their shape blended
     std::size_t skins_alone = 0; // no limb with their matrix: as in the newer scene
     float eye_move = 0;        // world units, without the shake
     float turn = 0;            // degrees, the first viewport's
@@ -138,6 +146,7 @@ constexpr float kPlacedRadius = 2.5f;    // world units round a body put down in
 constexpr float kSkinReach = 1.0f;       // a skin's limb: the nearest with its turn, this near (seen 0.01-0.2)
 constexpr float kBoneTurn = 1e-3f;       // a model on a body's bone: its turn the bone's, this near (each entry)
 constexpr float kBoneReach = 1.0f;       // and its place within this of the bone's
-constexpr float kShadowReach = 0.5f;     // a shadow: under its body's root, this near across the ground
+constexpr float kShadowReach = 1.5f;     // a shadow: a body's bone this near across the ground (seen to 1.4)
+constexpr float kShadowFlat = 0.99f;     // and its up axis this near straight up
 
 } // namespace m3

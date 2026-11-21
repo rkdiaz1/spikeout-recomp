@@ -29,8 +29,12 @@ public:
 
     std::size_t models_named() const { return named_; }
     std::size_t animations() const { return animations_; }
+    // Tests: the model numbers whose names start with the text in the
+    // environment variable SPIKEOUT_MODELS_NAMED (nothing kept otherwise).
+    const std::vector<uint32_t>& named_like() const { return named_like_; }
 
 private:
+    std::vector<uint32_t> named_like_;
     std::vector<uint32_t> animation_; // by model number: 0 none, else the animation's number
     std::vector<uint8_t> table_;      // the RAM table as last read
     std::unordered_map<uint32_t, uint32_t> nodes_;

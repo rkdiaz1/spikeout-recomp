@@ -3933,6 +3933,16 @@ int main(int argc, char** argv) {
                                changed();
                                set_up_3d();
                            }});
+        p.items.push_back({"Smooth motion",
+                           "A picture each refresh of your screen, the 3D placed between the game's frames, so motion "
+                           "looks smooth on a fast screen (100 Hz and more). The game still runs at the arcade's 57.5 "
+                           "frames a second. Adds up to one frame (17 ms) of delay. GPU renderer only. Off: the "
+                           "arcade's own pictures.",
+                           [&] { return on_off(settings.smooth_motion); },
+                           [&](int) {
+                               settings.smooth_motion = !settings.smooth_motion;
+                               changed();
+                           }});
         p.items.push_back({"3D renderer",
                            "Which part of your computer draws the 3D: the graphics card (GPU), or the processor "
                            "(CPU, the reference the GPU is checked against).",

@@ -1,7 +1,8 @@
 # Smooth motion: the plan
 
-Status (2026-11-20): step 1 (the camera) built, the rest planned. Smooth motion is off by default and only on
-with `--smooth`; the old guessing version, `m3::interpolate` (src/runtime/real3d_interp.cpp), is kept for comparison. This page is the design that replaces it,
+Status (2026-11-21): steps 1-3 built, step 4 but the VRR multiple and present times. Smooth motion is off by default:
+the menu's Display > Smooth motion (or `--smooth`); the old guessing version, `m3::interpolate`
+(src/runtime/real3d_interp.cpp), is kept for comparison (SPIKEOUT_SMOOTH_GUESS=1). This page is the design that replaces it,
 agreed with the owner. Anything that comes from the game's code is read at runtime from the player's own ROM.
 Nothing made from it ships, and the private decompile notes that point the way are never committed.
 
@@ -204,6 +205,10 @@ rate on such screens only).
    for all four: the runs count frames differently); stage 1's gate area, a fight halfway: whole, between; smooth off
    hashes as main; the window on Phoenix's deck: every picture blended at 100 and at 144, the 3D 0.8-1.7 ms.
    Still to do in step 2: the gates, machines, curtain and traffic seen moving in a replay.
+   STAGE 4 ("DEPART", reached by the bot's seg4 replay at 103,056-152,340): four stretches of ~290 frames blended
+   with no cut but the first frame after loading a state; 0.1-4.6 models a frame as in the newer frame; the record
+   shop (128197: the TV screens and neon signs on screen) whole halfway. The merry-go-round isn't on screen anywhere
+   in the bot's run of the stage (every sixth state looked at): not checked.
 3. The characters' bones.
    BUILT (2026-11-21), without a hook in the recompiled code: games/spikeofe_camera reads the live bodies' bone
    matrices each frame (the 20 records, +860: the root then the 19 drawn, 48 bytes each, the game's layout: the turn
@@ -214,15 +219,52 @@ rate on such screens only).
    current one, as the decompile said). Tied a frame: the deck ~104, the helicopter ~140, the gate ~60, seg3's crowd
    ~148. Halfway: four fighters close together (seg3 63651) each between its own two poses. The "copies alike"
    left (~15 a frame in seg3) are effects lying on the ground at the fighters' feet (one model, many copies; they
-   never move, so the newer frame is exact). A shadow (a one-polygon model under a body's root) would be keyed by
-   (body, its model); whether the game's shadows are one polygon isn't checked. Smooth off hashes as main; the
-   window: 99-100 of 100 pictures blended.
+   never move, so the newer frame is exact). Smooth off hashes as main; the window: 99-100 of 100 pictures blended.
+   FIXED THE SAME DAY (the owner saw it in the halfway picture of seg3 63651): White's head showed its face side,
+   his back's lettering was turned and a shin was missing, and some enemies were broken the same way. A bone can
+   carry more than one model, and the key was (body, bone) only: the second model was blended from the first one's
+   place. The key is now (body, bone, the model's address); a model swapped on its bone (a head's or hand's) is
+   found by the bone alone only when the frame before had one model there. Halfway pictures of seg3's crowd, the
+   deck and the helicopter fights: every fighter whole.
+   SHADOWS (corrects the line above: those "copies alike" at the fighters' feet were the shadows): the game draws
+   each body's shadow as many 5-polygon models, flat on the ground, in a ring up to ~1.4 units round its feet. A
+   flat model (its up axis within 0.99 of straight up) not found or alike, within 1.5 units of a body's bone across
+   the ground, moves with that bone across the ground from the frame before (the same body and bone), its height
+   its own. A still floor model (a manhole) is found as still first, so never moved. Seg3: "alike" 14.8 a frame ->
+   2.2, shadows 13.2 a frame moved with their bones; halfway, each body's shadow under it.
+   AFTER THE OWNER'S FIRST WINDOW TEST (2026-11-21; screenshots of frames 31880-32539, a state at 20745):
+   - Characters still broke now and then. Two causes: (1) a straight joint gives two bones the same turn, so a
+     limb's bone could differ between the frames, and the fallback "the bone alone" paired it with another part's
+     model; the fallback is now (body, the model's address), used only when that model is on the body once. (2) Each
+     limb was blended on its own, turning the shortest way about its own point and its place in a straight line: a
+     limb swinging 60-90 degrees in a frame (a punch: seg3 has such turns nearly every frame) came apart from its
+     neighbours at the joints. Now THE SKELETON is blended: each body drawn in both frames has its 20 bones' turns
+     and places taken relative to their parents (the chain from the RAM's bone order: the root; chest from the root,
+     head, armpits, shoulders, arms, hands from the chest; waist from the root, thighs, knees, ankles, toes from the
+     waist), blended there, and the chain rebuilt from the root; each limb and skin moves with its bone
+     (Kind::bone). Joints stay joined however fast a limb swings. The parent table is a reading of the draw order;
+     a wrong parent would only change the path between the two frames, never the ends.
+   - Skins' shapes: paired with the frame before's skin on the same body and bone (in drawing order, the same
+     polygon layout), each vertex goes part of the way back to where the older skin had it, in the skin's own
+     frame (the decompile's "simple" way): a skirt between the waist and both thighs bends with the legs (a
+     camo-jacketed enemy's flared trousers were torn in the owner's screenshots). 10 of 10 skins shaped on the
+     deck and stage 1.
+   - The owner's state (20745, a fight by the fence) replayed: halfway pictures whole, the character knocked
+     into the air between its two poses with no gaps; the window from it: 99-100 of 100 pictures blended, the 3D
+     2.5-2.8 ms a picture, the game at 57.52 with no stutters.
+   - The van's wheels changing texture as the camera moves (stage 1's car park, seen from the docks side): the
+     owner saw it with smooth motion off too; docs/fidelity.md "Open: the parked van's wheels".
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
    FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N
    forces N for tests). Measured on the 99.95 Hz screen: 100 a second, each 0.576 of a frame on (spread 0.02); forced
    to 144: 144 a second, 0.400 on (spread 0.02), the 3D 1.6-2.0 ms a picture, the game at 57.52 with no stutters.
    Left: the VRR multiple (SDL doesn't say whether a screen is running VRR; needs a VRR screen to try), and the
-   weights from present times.
+   weights from present times (SDL's GPU API doesn't say when a picture reached the screen; the even clock keeps the
+   steps within 0.02 of a frame meanwhile). A 240 Hz screen to check the 4.2 ms a picture: none here.
+   THE MENU (2026-11-21): Display > Smooth motion, off by default, kept in settings.ini (smooth_motion); its
+   description says it adds up to one frame (17 ms) of delay and needs the GPU renderer. spikeout --smooth still
+   turns it on (and, as --quads, it's saved if the settings are). Checked: a portable copy with smooth_motion = 1
+   in its settings.ini, started without --smooth: 100 pictures a second, blended.
 5. Maybe: true in-between poses.
 
 Each step: smooth off proved unchanged by hashes; replays of the ghost scenes (the coast road's car park, the docks

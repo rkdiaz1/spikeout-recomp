@@ -2028,15 +2028,42 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                         std::printf("models named %zu, animations %zu\n", m.match_names.models_named(),
                                     m.match_names.animations());
                     const auto& s1 = m.match_scene[1];
+                    if (const auto& like = m.match_names.named_like(); !like.empty()) {
+                        // (SPIKEOUT_MODELS_NAMED: those models' polygons and their distance from the nearest body's
+                        // root across the ground, through their viewport's camera)
+                        for (const auto& model : s1.models) {
+                            if (std::find(like.begin(), like.end(), model.number) == like.end()) continue;
+                            if (model.viewport >= s1.viewports.size()) continue;
+                            // the world point: solve camera (linear part) x p = eye point - camera's translation
+                            const auto& c = s1.viewports[model.viewport].camera.m;
+                            const double e[3] = {model.matrix.m[12] - c[12], model.matrix.m[13] - c[13], model.matrix.m[14] - c[14]};
+                            auto at = [&](int row, int col) { return static_cast<double>(c[static_cast<size_t>(col * 4 + row)]); };
+                            const double det = at(0, 0) * (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1)) -
+                                               at(0, 1) * (at(1, 0) * at(2, 2) - at(1, 2) * at(2, 0)) +
+                                               at(0, 2) * (at(1, 0) * at(2, 1) - at(1, 1) * at(2, 0));
+                            double p[3];
+                            for (int k = 0; k < 3; ++k) { // Cramer's rule
+                                auto col = [&](int row, int cc) { return cc == k ? e[row] : at(row, cc); };
+                                p[k] = (col(0, 0) * (col(1, 1) * col(2, 2) - col(1, 2) * col(2, 1)) -
+                                        col(0, 1) * (col(1, 0) * col(2, 2) - col(1, 2) * col(2, 0)) +
+                                        col(0, 2) * (col(1, 0) * col(2, 1) - col(1, 1) * col(2, 0))) / det;
+                            }
+                            double across = 1e30;
+                            for (const auto& body : s1.bodies_before)
+                                across = std::min(across, std::hypot(p[0] - body.bones[0][9], p[2] - body.bones[0][11]));
+                            std::printf("  named model %u: %u polygons at %.2f %.2f %.2f, %.2f from a body's root\n", model.number,
+                                        model.polygon_count, p[0], p[1], p[2], across);
+                        }
+                    }
                     const auto& c = s1.game_camera;
                     std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f shake %.3f driver %u shot %u/%u; "
                                 "moved %.3f turned %.3f%s; %zu viewports, %zu models (%zu blended (%zu tied), %zu flipbook, %zu still, %zu newer, "
-                                "%zu alike, %zu placed, %zu skins (%zu near), %zu skins alone; %zu bodies placed)%s%s\n",
+                                "%zu alike, %zu shadows, %zu placed, %zu skins (%zu near, %zu shaped), %zu skins alone; %zu bodies placed)%s%s\n",
                                 static_cast<unsigned long long>(frame), c.eye[0], c.eye[1], c.eye[2], c.look[0], c.look[1],
                                 c.look[2], c.shake, c.driver, c.shot_timer, c.shot, camera_stats.eye_move, camera_stats.turn,
                                 camera_stats.lagged ? " (drawn a frame behind)" : "", camera_stats.viewports, camera_stats.models,
-                                camera_stats.blended, camera_stats.tied, camera_stats.flipbook, camera_stats.still, camera_stats.newer, camera_stats.ambiguous,
-                                camera_stats.placed, camera_stats.skins, camera_stats.skins_near, camera_stats.skins_alone, s1.placed.size(),
+                                camera_stats.blended, camera_stats.tied, camera_stats.flipbook, camera_stats.still, camera_stats.newer, camera_stats.ambiguous, camera_stats.shadows,
+                                camera_stats.placed, camera_stats.skins, camera_stats.skins_near, camera_stats.skins_shaped, camera_stats.skins_alone, s1.placed.size(),
                                 camera_stats.cut != m3::CameraInterpStats::Cut::none ? "; a cut: " : "",
                                 kCuts[static_cast<int>(camera_stats.cut)]);
                     for (size_t v = 0; v < s1.viewports.size(); ++v) {
