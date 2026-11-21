@@ -41,8 +41,7 @@ Read docs/smooth-motion.md first: the plan, every step's state, measurements and
   103303-152340 (stage 4). The owner's state with a fight: Z:\Emu\tmp\smooth\owner\o-20745.state.
 - PRIVATE (never commit): the decompile's answers Z:\Emu\spikeout-private\asm\SMOOTH-MOTION-ANSWERS.md (questions
   in SMOOTH-MOTION-ASKS.md, rounds 1-3; the decompile session answers there).
-- OPEN: the owner's window test of this latest build (characters through the skeleton, skin shapes); the parked
-  van's wheels changing texture (not smooth motion: docs/fidelity.md "Open: the parked van's wheels"); the
+- OPEN: the owner's window test of this latest build (characters through the skeleton, skin shapes); the
   merry-go-round never on screen in the bot's run; VRR pacing (115/230 a second) and present-time weights need a
   VRR screen and a present timer SDL doesn't give; no 240 Hz screen here; step 5 (true in-between poses from the
   motion curves) not started. DON'T merge with the speed work (another session's, unfinished): the owner says

@@ -253,7 +253,8 @@ rate on such screens only).
      into the air between its two poses with no gaps; the window from it: 99-100 of 100 pictures blended, the 3D
      2.5-2.8 ms a picture, the game at 57.52 with no stutters.
    - The van's wheels changing texture as the camera moves (stage 1's car park, seen from the docks side): the
-     owner saw it with smooth motion off too; docs/fidelity.md "Open: the parked van's wheels".
+     owner saw it with smooth motion off too. Checked: Supermodel shows the same, the game's own look
+     (docs/fidelity.md "Checked: the parked van's wheels").
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
    FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N
    forces N for tests). Measured on the 99.95 Hz screen: 100 a second, each 0.576 of a frame on (spread 0.02); forced
