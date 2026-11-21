@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -334,31 +336,63 @@ bool same_linear(const Mat3& a, const Mat3& b) {
     return true;
 }
 
-// A model's place in the world (the camera undone), blended from a to b:
-// position straight, scale straight, turn the shortest way. False if it
-// can't be (a mirror on one side only, a flat matrix, or turned more than
-// kMaxModelTurn: which way round can't be told).
-bool blend_place(const Affine& a, const Affine& b, float t, Affine& out) {
-    Parts pa{}, pb{};
-    if (!decompose(a.l, pa) || !decompose(b.l, pb) || pa.mirrored != pb.mirrored) return false;
-    if (turn_degrees(pa.q, pb.q) > kMaxModelTurn) return false;
-    Vec3 scale;
-    for (size_t c = 0; c < 3; ++c) scale[c] = pa.scale[c] + (pb.scale[c] - pa.scale[c]) * t;
-    out.l = linear_from(slerp(pa.q, pb.q, t), scale, pa.mirrored);
-    for (size_t k = 0; k < 3; ++k) out.t[k] = a.t[k] + (b.t[k] - a.t[k]) * t;
+// A model in polygon RAM: built by the game each frame (a joint's skin),
+// its address packed by whoever draws that frame.
+bool built_each_frame(const Real3dScene::Model& model) { return (model.address & 0xFFFFFF) < 0x100000; }
+
+// The same turn (and scale), bit for bit: drawn on the same bone.
+bool same_linear_bits(const Mat4& a, const Mat4& b) {
+    for (int c = 0; c < 3; ++c)
+        if (std::memcmp(&a.m[static_cast<size_t>(c * 4)], &b.m[static_cast<size_t>(c * 4)], 3 * sizeof(float)) != 0) return false;
     return true;
 }
 
 } // namespace
 
-bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out, CameraInterpStats* stats,
-                        bool models) {
-    out = b;
-    CameraInterpStats s;
+struct CameraBlend::Data {
+    const Real3dScene* a = nullptr;
+    const Real3dScene* b = nullptr;
+    bool blend = false; // false: a cut, out is b
+    CameraInterpStats stats;
+    struct View {
+        bool moved = false;
+        CameraParts pa{}, pb{};
+        float shake_a = 0, shake_b = 0;
+        Mat3 lb_inverse{};
+        Vec3 tb{};
+        Affine view{}, unview{}; // b's camera, and undone
+    };
+    std::vector<View> views; // by b's viewport
+    // Each of b's models: through the camera only, its place blended, or as
+    // another model (a skin with its limb).
+    enum class Kind : uint8_t { camera, blend, follow };
+    struct Plan {
+        Kind kind = Kind::camera;
+        uint32_t follow = 0;
+        Parts pa{}, pb{};
+        Vec3 ta{}, tb{};
+        Affine place_inverse{};
+    };
+    std::vector<Plan> plans;
+};
+
+CameraBlend::CameraBlend() : d_(std::make_unique<Data>()) {}
+CameraBlend::~CameraBlend() = default;
+const CameraInterpStats& CameraBlend::stats() const { return d_->stats; }
+
+bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool models) {
+    Data& d = *d_;
+    d.a = &a;
+    d.b = &b;
+    d.blend = false;
+    d.views.assign(b.viewports.size(), {});
+    d.plans.assign(b.models.size(), {});
+    CameraInterpStats& s = d.stats;
+    s = {};
     auto done = [&](CameraInterpStats::Cut cut) {
         s.cut = cut;
-        if (stats) *stats = s;
-        return cut == CameraInterpStats::Cut::none;
+        d.blend = cut == CameraInterpStats::Cut::none;
+        return d.blend;
     };
     // The camera each scene's 3D was made with: its frame's or the frame before's.
     auto drawn_with = [](const Real3dScene& scene) -> const Real3dScene::GameCamera* {
@@ -379,16 +413,13 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
         return done(CameraInterpStats::Cut::shot);
     if (s.eye_move > kCameraJump) return done(CameraInterpStats::Cut::jump);
 
-    // Each of b's viewports with the game's camera, moved from it to the
-    // camera between: by C = (between) x (b's)^-1, the camera's in a taken
-    // from a viewport of a at the same address with the game's camera, else
-    // the first with it.
+    // Each of b's viewports with the game's camera, with the camera's in a:
+    // a viewport of a at the same address with the game's camera, else the
+    // first with it.
     std::vector<size_t> a_cameras;
     for (size_t v = 0; v < a.viewports.size(); ++v)
         if (is_game_camera(a.viewports[v], ca)) a_cameras.push_back(v);
     if (a_cameras.empty()) return done(CameraInterpStats::Cut::no_viewport);
-    std::vector<std::pair<Mat3, Vec3>> moves(b.viewports.size()); // per viewport: C's linear part and translation
-    std::vector<bool> moved(b.viewports.size(), false);
     for (size_t v = 0; v < b.viewports.size(); ++v) {
         if (!is_game_camera(b.viewports[v], cb)) continue;
         size_t from = a_cameras.front();
@@ -398,75 +429,55 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
                     from = k;
                     break;
                 }
+        Data::View& view = d.views[v];
         const Mat4 &va = a.viewports[from].camera, &vb = b.viewports[v].camera;
-        CameraParts pa{}, pb{};
-        Mat3 lb_inverse{};
-        if (!camera_parts(va, pa) || !camera_parts(vb, pb) || pa.parts.mirrored != pb.parts.mirrored ||
-            !inverse(linear(vb), lb_inverse))
+        if (!camera_parts(va, view.pa) || !camera_parts(vb, view.pb) || view.pa.parts.mirrored != view.pb.parts.mirrored ||
+            !inverse(linear(vb), view.lb_inverse) || !inverse(affine(vb), view.unview))
             continue;
-        const auto& qa = pa.parts.q;
-        const auto& qb = pb.parts.q;
-        const float dot = std::fabs(qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]);
-        const float turn = 2.0f * std::acos(std::min(dot, 1.0f)) * 57.29578f;
+        const float turn = turn_degrees(view.pa.parts.q, view.pb.parts.q);
         if (s.viewports == 0) s.turn = turn;
         if (turn > kCameraTurnJump) return done(CameraInterpStats::Cut::turn);
-        Mat3 lt = rotation(slerp(qa, qb, t));
-        if (pa.parts.mirrored)
-            for (float& c : lt[0]) c = -c;
-        for (size_t c = 0; c < 3; ++c)
-            for (float& x : lt[c]) x *= pa.parts.scale[c] + (pb.parts.scale[c] - pa.parts.scale[c]) * t;
-        // The eye blended without the shake (it only lifts the eye), then the
-        // newer frame's shake put back: blended, a shake that changes
-        // direction every frame or two would be halved.
-        const float ya = pa.eye[1] - ca.shake, yb = pb.eye[1] - cb.shake;
-        const Vec3 eye{pa.eye[0] + (pb.eye[0] - pa.eye[0]) * t, ya + (yb - ya) * t + cb.shake,
-                       pa.eye[2] + (pb.eye[2] - pa.eye[2]) * t};
-        const Vec3 le = m3::apply(lt, eye);
-        const Vec3 tt{-le[0], -le[1], -le[2]}; // the camera between: L_t, -L_t eye
-        const Mat3 l = times(lt, lb_inverse);
-        const Vec3 l_tb = m3::apply(l, translation(vb));
-        moves[v] = {l, {tt[0] - l_tb[0], tt[1] - l_tb[1], tt[2] - l_tb[2]}};
-        moved[v] = true;
+        view.shake_a = ca.shake;
+        view.shake_b = cb.shake;
+        view.tb = translation(vb);
+        view.view = affine(vb);
+        view.moved = true;
         ++s.viewports;
-        // The sun, given in eye space, turned with the rest.
-        Real3dScene::Viewport& vp = out.viewports[v];
-        Vec3 sun = m3::apply(l, {vp.sun[0], vp.sun[1], vp.sun[2]});
-        if (const float n = length(sun); n > 1e-12f)
-            for (float& c : sun) c *= length({vp.sun[0], vp.sun[1], vp.sun[2]}) / n;
-        vp.sun = {sun[0], sun[1], sun[2]};
     }
     if (s.viewports == 0) return done(CameraInterpStats::Cut::no_viewport);
+    done(CameraInterpStats::Cut::none);
+    if (!models) {
+        for (const Real3dScene::Model& model : b.models) s.models += model.viewport < d.views.size() && d.views[model.viewport].moved;
+        return true;
+    }
 
     // Each model's place in the world: its viewport's camera undone. The
     // older scene's, by polygon address, from every viewport with the game's
     // camera (the stage's tree is drawn under one viewport one frame and its
-    // twin the next).
-    std::vector<Affine> a_unview(a.viewports.size()), b_unview(b.viewports.size());
-    std::vector<bool> a_known(a.viewports.size(), false), b_known(b.viewports.size(), false);
+    // twin the next). Skins aren't matched (their addresses say nothing).
+    std::vector<Affine> a_unview(a.viewports.size());
+    std::vector<bool> a_known(a.viewports.size(), false);
     for (size_t v : a_cameras) a_known[v] = inverse(affine(a.viewports[v].camera), a_unview[v]);
-    for (size_t v = 0; v < b.viewports.size(); ++v)
-        if (moved[v]) b_known[v] = inverse(affine(b.viewports[v].camera), b_unview[v]);
     std::unordered_map<uint32_t, std::vector<Affine>> before; // by address: each copy's place
     std::unordered_map<uint32_t, std::vector<Affine>> before_animation; // by animation: its models' places
-    if (models)
-        for (const Real3dScene::Model& model : a.models)
-            if (model.viewport < a_known.size() && a_known[model.viewport]) {
-                const Affine place = a_unview[model.viewport] * affine(model.matrix);
-                before[model.address].push_back(place);
-                if (model.animation) before_animation[model.animation].push_back(place);
-            }
+    for (const Real3dScene::Model& model : a.models)
+        if (model.viewport < a_known.size() && a_known[model.viewport] && !built_each_frame(model)) {
+            const Affine place = a_unview[model.viewport] * affine(model.matrix);
+            before[model.address].push_back(place);
+            if (model.animation) before_animation[model.animation].push_back(place);
+        }
     // The nearest of `places` to `place`, and the second nearest's distance.
     auto nearest_of = [](const std::vector<Affine>* places, const Affine& place, float& d1, float& d2) {
         const Affine* nearest = nullptr;
         d1 = d2 = 1e30f;
         if (places)
             for (const Affine& p : *places) {
-                const float d = distance(p.t, place.t);
-                if (d < d1) {
+                const float dp = distance(p.t, place.t);
+                if (dp < d1) {
                     d2 = d1;
-                    d1 = d;
+                    d1 = dp;
                     nearest = &p;
-                } else if (d < d2) d2 = d;
+                } else if (dp < d2) d2 = dp;
             }
         return nearest;
     };
@@ -474,35 +485,135 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
         const auto it = map.find(key);
         return it == map.end() ? nullptr : &it->second;
     };
+    auto placed_near = [&](const Vec3& p) {
+        for (const auto& body : b.placed)
+            if (distance(body, p) < kPlacedRadius) return true;
+        return false;
+    };
 
-    for (const Real3dScene::Model& model : b.models) {
-        if (model.viewport >= moved.size() || !moved[model.viewport]) continue;
+    // The limbs (anything drawn with a matrix a skin may share), by viewport and matrix.
+    std::vector<size_t> skins;
+    for (size_t i = 0; i < b.models.size(); ++i) {
+        const Real3dScene::Model& model = b.models[i];
+        if (model.viewport >= d.views.size() || !d.views[model.viewport].moved) continue;
         ++s.models;
-        const auto& [cl, ct] = moves[model.viewport];
-        Affine move{cl, ct}; // b's eye space to the picture's: the camera's move, then the model's
-        if (models && b_known[model.viewport]) {
-            const Affine place = b_unview[model.viewport] * affine(model.matrix);
-            float d1 = 0, d2 = 0;
-            const Affine* nearest = nearest_of(find(before, model.address), place, d1, d2);
-            bool flipbook = false;
-            if ((!nearest || d1 > kModelMatch) && model.animation) {
-                // Another model of its animation (a flipbook's next frame) where it was: the place blended, this
-                // frame's model drawn.
-                nearest = nearest_of(find(before_animation, model.animation), place, d1, d2);
-                flipbook = true;
-            }
-            Affine between{};
-            Affine place_inverse{};
-            if (!nearest || d1 > kModelMatch) ++s.newer; // appeared, moved too far, not part of an animation
-            else if (d2 < 2 * d1 + kModelSame) ++s.ambiguous; // copies alike: which is which can't be told
-            else if (d1 <= kModelSame && same_linear(nearest->l, place.l)) ++s.still;
-            else if (blend_place(*nearest, place, t, between) && inverse(place, place_inverse)) {
-                // eye b -> world b (undo the camera) -> the model's own -> its place between -> eye b -> picture
-                const Affine view_b = affine(b.viewports[model.viewport].camera);
-                move = move * view_b * between * place_inverse * b_unview[model.viewport];
-                ++(flipbook ? s.flipbook : s.blended);
-            } else ++s.newer;
+        if (built_each_frame(model)) {
+            skins.push_back(i);
+            continue;
         }
+        const Data::View& view = d.views[model.viewport];
+        const Affine place = view.unview * affine(model.matrix);
+        float d1 = 0, d2 = 0;
+        const Affine* nearest = nearest_of(find(before, model.address), place, d1, d2);
+        bool flipbook = false;
+        if ((!nearest || d1 > kModelMatch) && model.animation) {
+            // Another model of its animation (a flipbook's next frame) where it was: the place blended, this
+            // frame's model drawn.
+            nearest = nearest_of(find(before_animation, model.animation), place, d1, d2);
+            flipbook = true;
+        }
+        Data::Plan& plan = d.plans[i];
+        if (!nearest || d1 > kModelMatch) ++s.newer; // appeared, moved too far, not part of an animation
+        else if (d2 < 2 * d1 + kModelSame) ++s.ambiguous; // copies alike: which is which can't be told
+        else if (d1 <= kModelSame && same_linear(nearest->l, place.l)) ++s.still;
+        else if (placed_near(place.t) || placed_near(nearest->t)) ++s.placed; // put down in one jump
+        else if (decompose(nearest->l, plan.pa) && decompose(place.l, plan.pb) && plan.pa.mirrored == plan.pb.mirrored &&
+                 turn_degrees(plan.pa.q, plan.pb.q) <= kMaxModelTurn && inverse(place, plan.place_inverse)) {
+            plan.kind = Data::Kind::blend;
+            plan.ta = nearest->t;
+            plan.tb = place.t;
+            ++(flipbook ? s.flipbook : s.blended);
+        } else ++s.newer;
+    }
+    // A skin moves as the limb on its bone: drawn with the same turn (bit for
+    // bit), the nearest (it sits a little off the limb's own point; any point
+    // fixed to the bone moves as the limb does). None: as in the newer frame.
+    for (size_t i : skins) {
+        const Real3dScene::Model& skin = b.models[i];
+        size_t limb = b.models.size();
+        float nearest = kSkinReach;
+        const Vec3 at = translation(skin.matrix);
+        // (no limb drawn with its turn, as when its bone's own model is left out at a lower detail: the nearest
+        // model, nearly always of the same body)
+        for (const bool same_turn : {true, false}) {
+            for (size_t k = 0; k < b.models.size(); ++k) {
+                const Real3dScene::Model& other = b.models[k];
+                if (other.viewport != skin.viewport || built_each_frame(other) ||
+                    (same_turn && !same_linear_bits(other.matrix, skin.matrix)))
+                    continue;
+                if (const float dk = distance(translation(other.matrix), at); dk < nearest) {
+                    nearest = dk;
+                    limb = k;
+                }
+            }
+            if (limb != b.models.size()) {
+                if (!same_turn) ++s.skins_near;
+                break;
+            }
+        }
+        if (limb == b.models.size()) {
+            ++s.skins_alone;
+            continue;
+        }
+        d.plans[i].kind = Data::Kind::follow;
+        d.plans[i].follow = static_cast<uint32_t>(limb);
+        ++s.skins;
+    }
+    return true;
+}
+
+void CameraBlend::draw(float t, Real3dScene& out) const {
+    const Data& d = *d_;
+    out = *d.b;
+    if (!d.blend || d.plans.size() != d.b->models.size()) return;
+    const Real3dScene& b = *d.b;
+    // The camera between, per viewport, and the move from b's eye space to it.
+    std::vector<Affine> moves(b.viewports.size());
+    for (size_t v = 0; v < b.viewports.size(); ++v) {
+        const Data::View& view = d.views[v];
+        if (!view.moved) continue;
+        const CameraParts &pa = view.pa, &pb = view.pb;
+        Vec3 scale;
+        for (size_t c = 0; c < 3; ++c) scale[c] = pa.parts.scale[c] + (pb.parts.scale[c] - pa.parts.scale[c]) * t;
+        const Mat3 lt = linear_from(slerp(pa.parts.q, pb.parts.q, t), scale, pa.parts.mirrored);
+        // The eye blended without the shake (it only lifts the eye), then the
+        // newer frame's shake put back: blended, a shake that changes
+        // direction every frame or two would be halved.
+        const float ya = pa.eye[1] - view.shake_a, yb = pb.eye[1] - view.shake_b;
+        const Vec3 eye{pa.eye[0] + (pb.eye[0] - pa.eye[0]) * t, ya + (yb - ya) * t + view.shake_b,
+                       pa.eye[2] + (pb.eye[2] - pa.eye[2]) * t};
+        const Vec3 le = m3::apply(lt, eye);
+        const Mat3 l = times(lt, view.lb_inverse);
+        const Vec3 l_tb = m3::apply(l, view.tb);
+        moves[v] = {l, {-le[0] - l_tb[0], -le[1] - l_tb[1], -le[2] - l_tb[2]}};
+        // The sun, given in eye space, turned with the rest.
+        Real3dScene::Viewport& vp = out.viewports[v];
+        Vec3 sun = m3::apply(l, {vp.sun[0], vp.sun[1], vp.sun[2]});
+        if (const float n = length(sun); n > 1e-12f)
+            for (float& c : sun) c *= length({vp.sun[0], vp.sun[1], vp.sun[2]}) / n;
+        vp.sun = {sun[0], sun[1], sun[2]};
+    }
+    // Each model's move: the camera's, after its own place blended.
+    std::vector<Affine> model_moves(b.models.size());
+    for (size_t i = 0; i < b.models.size(); ++i) {
+        const Real3dScene::Model& model = b.models[i];
+        if (model.viewport >= d.views.size() || !d.views[model.viewport].moved) continue;
+        const Data::View& view = d.views[model.viewport];
+        const Data::Plan& plan = d.plans[i];
+        model_moves[i] = moves[model.viewport];
+        if (plan.kind != Data::Kind::blend) continue;
+        Vec3 scale;
+        for (size_t c = 0; c < 3; ++c) scale[c] = plan.pa.scale[c] + (plan.pb.scale[c] - plan.pa.scale[c]) * t;
+        Affine between{linear_from(slerp(plan.pa.q, plan.pb.q, t), scale, plan.pa.mirrored), {}};
+        for (size_t k = 0; k < 3; ++k) between.t[k] = plan.ta[k] + (plan.tb[k] - plan.ta[k]) * t;
+        // eye b -> world b (undo the camera) -> the model's own -> its place between -> eye b -> picture
+        model_moves[i] = model_moves[i] * view.view * between * plan.place_inverse * view.unview;
+    }
+    for (size_t i = 0; i < b.models.size(); ++i) {
+        const Real3dScene::Model& model = b.models[i];
+        if (model.viewport >= d.views.size() || !d.views[model.viewport].moved) continue;
+        const Data::Plan& plan = d.plans[i];
+        const Affine& move = model_moves[plan.kind == Data::Kind::follow ? plan.follow : i];
         const Mat3& l = move.l;
         const Vec3& tr = move.t;
         for (uint32_t p = model.first_polygon; p < model.first_polygon + model.polygon_count; ++p) {
@@ -524,7 +635,15 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
             }
         }
     }
-    return done(CameraInterpStats::Cut::none);
+}
+
+bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out, CameraInterpStats* stats,
+                        bool models) {
+    CameraBlend blend;
+    const bool ok = blend.prepare(a, b, models);
+    blend.draw(t, out);
+    if (stats) *stats = blend.stats();
+    return ok;
 }
 
 } // namespace m3

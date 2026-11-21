@@ -3021,6 +3021,11 @@ int main(int argc, char** argv) {
         double clock = 0;
         double picture_seconds = 1.0 / 60; // the display's refresh
         double picture_average = 1.0 / 60; // the pictures' time apart, averaged: the clock's step
+        // The two frames matched once (m3::CameraBlend), for the pictures between them: which pair it was
+        // (the frames' numbers and the newer's version), and whether it blends (false: a cut).
+        m3::CameraBlend blend;
+        uint64_t blend_before = ~0ull, blend_number = ~0ull, blend_version = ~0ull;
+        bool blend_on = false;
     } smooth;
     // Texture RAM as the game thread's rows have brought it (`textures`: some
     // came); a renderer made afresh takes it whole (its version differs), then
@@ -7076,9 +7081,18 @@ int main(int argc, char** argv) {
                         static const bool guess = std::getenv("SPIKEOUT_SMOOTH_GUESS") != nullptr;
                         static const bool camera_only = std::getenv("SPIKEOUT_SMOOTH_CAMERA_ONLY") != nullptr;
                         const float tf = static_cast<float>(std::max(t, 0.0));
-                        between = guess ? m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between)
-                                        : m3::interpolate_camera(smooth.before, gpu_frame.scene, tf, smooth.between,
-                                                                 nullptr, !camera_only);
+                        if (guess) between = m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between);
+                        else {
+                            if (smooth.blend_before != smooth.before_number || smooth.blend_number != gpu_frame.number ||
+                                smooth.blend_version != gpu_frame.version) { // a new pair: matched once
+                                smooth.blend_on = smooth.blend.prepare(smooth.before, gpu_frame.scene, !camera_only);
+                                smooth.blend_before = smooth.before_number;
+                                smooth.blend_number = gpu_frame.number;
+                                smooth.blend_version = gpu_frame.version;
+                            }
+                            between = smooth.blend_on;
+                            if (between) smooth.blend.draw(tf, smooth.between);
+                        }
                         if (between) {
                             real3d_gpu->render(smooth.between, texture_copy, textures_version);
                             drawn_number = 0; // the frame itself drawn again when it's shown

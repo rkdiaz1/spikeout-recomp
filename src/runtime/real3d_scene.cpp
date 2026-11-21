@@ -152,6 +152,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
     scene.fog_over_nothing = fog_over_nothing_;
     scene.game_camera = {};
     scene.game_camera_before = {};
+    scene.placed.clear();
     models_.clear();
     viewport_models_.clear();
     visits_ = 0;

@@ -160,6 +160,10 @@ struct Real3dScene {
     // some places (seen after an area change) with the frame before's: both
     // are kept, and smooth motion takes the one the viewports hold.
     GameCamera game_camera, game_camera_before;
+    // Smooth motion: where the game put a body down in one jump since the
+    // frame before (made, lifted, respawned, snapped back), in the world, as
+    // its code reads them (games/spikeofe_camera); cleared by the builder.
+    std::vector<std::array<float, 3>> placed;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;

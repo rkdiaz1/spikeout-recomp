@@ -26,6 +26,7 @@
 #include "runtime/real3d_scene.hpp"
 
 #include <cstddef>
+#include <memory>
 
 namespace m3 {
 
@@ -77,7 +78,13 @@ constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 // beats) is found as the nearest of that animation's models the same way: its
 // place blended, its own (the newer) model drawn. Still not found (it
 // appeared, moved too far) or copies alike (rain, splashes: which is which
-// can't be told): drawn where it is in the newer scene.
+// can't be told): drawn where it is in the newer scene. So is a model near a
+// body the game put down in one jump (Real3dScene::placed: made, respawned).
+// A skin (a model in polygon RAM: the game builds a joint's skin each frame,
+// its address packed by whoever draws) isn't matched: it moves as the limb on
+// its bone (drawn with the same turn, bit for bit, within kSkinReach); none
+// (the bone's own model left out), as the nearest model within kSkinReach;
+// none, as in b.
 struct CameraInterpStats {
     std::size_t viewports = 0; // moved by the blended camera
     std::size_t models = 0;    // in them
@@ -86,6 +93,10 @@ struct CameraInterpStats {
     std::size_t flipbook = 0;  // another model of its animation found where it was: its place blended
     std::size_t newer = 0;     // not found: as in the newer scene
     std::size_t ambiguous = 0; // copies alike: as in the newer scene
+    std::size_t placed = 0;    // near a body put down in one jump: as in the newer scene
+    std::size_t skins = 0;     // moved with their limb
+    std::size_t skins_near = 0; // of those, no limb with their turn: with the nearest model
+    std::size_t skins_alone = 0; // no limb with their matrix: as in the newer scene
     float eye_move = 0;        // world units, without the shake
     float turn = 0;            // degrees, the first viewport's
     bool lagged = false;       // the newer scene drawn with the frame before's camera
@@ -94,10 +105,30 @@ struct CameraInterpStats {
 bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out,
                         CameraInterpStats* stats = nullptr, bool models = true);
 
+// The same, the matching done once for a pair of frames and each picture
+// between them only blended. a and b must stay as they are until the next
+// prepare.
+class CameraBlend {
+public:
+    CameraBlend();
+    ~CameraBlend();
+    CameraBlend(const CameraBlend&) = delete;
+    CameraBlend& operator=(const CameraBlend&) = delete;
+    bool prepare(const Real3dScene& a, const Real3dScene& b, bool models = true); // false: a cut
+    void draw(float t, Real3dScene& out) const;                                  // after a cut: b
+    const CameraInterpStats& stats() const;
+
+private:
+    struct Data;
+    std::unique_ptr<Data> d_;
+};
+
 constexpr float kCameraJump = 1.0f;      // world units in a frame
 constexpr float kCameraTurnJump = 20.0f; // degrees in a frame
 constexpr float kModelMatch = 3.0f;      // world units in a frame (the docks' birds fly 1.6)
 constexpr float kModelSame = 0.01f;      // world units: the same place
 constexpr float kMaxModelTurn = 120.0f;  // degrees in a frame (a helicopter's rotor turns 48)
+constexpr float kPlacedRadius = 2.5f;    // world units round a body put down in one jump: its limbs, its shadow
+constexpr float kSkinReach = 1.0f;       // a skin's limb: the nearest with its turn, this near (seen 0.01-0.2)
 
 } // namespace m3

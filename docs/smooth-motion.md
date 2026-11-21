@@ -185,8 +185,25 @@ rate on such screens only).
    between their angles. Nothing made from the names is kept or shipped; no name is written in our code. Rain and
    splashes stay with "copies alike" (naming them would put the ROM's names in the code). Smooth off: the docks'
    and stage 1's hashes the same as main; the window at the helicopter: every picture blended, no stutters.
-   Still to do in step 2: the shadows tied to their characters (step 3), and the matching done once a frame rather
-   than for each picture.
+   THIRD PART (2026-11-21, from the decompile's joint-skin and respawn findings):
+   - Skins: the game builds each joint's skin in polygon RAM every frame, its address packed by whoever draws that
+     frame, so a skin matched by address could be blended from another character's joint. Skins aren't matched now:
+     each moves as the limb on its bone (drawn with the same turn, bit for bit: the skin sits 0.01-0.2 units off the
+     limb's point, and any point fixed to the bone moves as the limb does); no such limb (its bone's own model left
+     out at a lower detail), as the nearest model within 1 unit. Stage 1 3500-9000: every skin placed so, 2 a frame
+     by the nearest in ~40 frames.
+   - Bodies put down in one jump (made, the lift 2 units the frame after, put back on the ground, snapped back):
+     games/spikeofe_camera reads the 20 bodies' records each frame (Real3dScene::placed: those of this frame and the
+     one before, as the 3D draws bodies a frame late); a model within 2.5 units of one is drawn as in the newer frame.
+     A body is placed when its record was empty, its respawn byte jumps to 216, or it moved more than 1.5 units
+     (the decompile's fastest move 0.95). Word 0's bit 0x40000000 isn't used: it stays set on live enemies in a
+     fight. Seg3 replayed with its inputs: the enemy made at 63581 and lifted at 63582 found (the decompile's list).
+   - The matching done once for each pair of frames (m3::CameraBlend: prepare, then draw for each picture); the
+     window keeps the pair and its version. Gamerun's interpolate_camera is the two in one.
+   Checked: seg4's ending (189691-190000): the four shots cut (two frames after the decompile's numbers, the same
+   for all four: the runs count frames differently); stage 1's gate area, a fight halfway: whole, between; smooth off
+   hashes as main; the window on Phoenix's deck: every picture blended at 100 and at 144, the 3D 0.8-1.7 ms.
+   Still to do in step 2: the gates, machines, curtain and traffic seen moving in a replay.
 3. The characters' bones.
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
    FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N

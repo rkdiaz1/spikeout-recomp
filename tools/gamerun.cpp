@@ -2031,11 +2031,12 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                     const auto& c = s1.game_camera;
                     std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f shake %.3f driver %u shot %u/%u; "
                                 "moved %.3f turned %.3f%s; %zu viewports, %zu models (%zu blended, %zu flipbook, %zu still, %zu newer, "
-                                "%zu alike)%s%s\n",
+                                "%zu alike, %zu placed, %zu skins (%zu near), %zu skins alone; %zu bodies placed)%s%s\n",
                                 static_cast<unsigned long long>(frame), c.eye[0], c.eye[1], c.eye[2], c.look[0], c.look[1],
                                 c.look[2], c.shake, c.driver, c.shot_timer, c.shot, camera_stats.eye_move, camera_stats.turn,
                                 camera_stats.lagged ? " (drawn a frame behind)" : "", camera_stats.viewports, camera_stats.models,
                                 camera_stats.blended, camera_stats.flipbook, camera_stats.still, camera_stats.newer, camera_stats.ambiguous,
+                                camera_stats.placed, camera_stats.skins, camera_stats.skins_near, camera_stats.skins_alone, s1.placed.size(),
                                 camera_stats.cut != m3::CameraInterpStats::Cut::none ? "; a cut: " : "",
                                 kCuts[static_cast<int>(camera_stats.cut)]);
                     for (size_t v = 0; v < s1.viewports.size(); ++v) {

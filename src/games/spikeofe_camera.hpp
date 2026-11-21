@@ -7,8 +7,10 @@
 
 #include "runtime/real3d_scene.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace m3::games {
 
@@ -25,24 +27,34 @@ constexpr uint32_t kCameraShot = 275;      // the shot's index (a byte)
 // `ram`: the board's main RAM. Fills `out` (known = true).
 void spikeout_camera(std::span<const uint8_t> ram, Real3dScene::GameCamera& out);
 
+// The bodies (players and enemies): their records in RAM.
+constexpr uint32_t kPlayers = 0x1A0000, kEnemies = 0x1B0000, kBodyStride = 0x4000;
+constexpr uint32_t kPlayerSlots = 4, kEnemySlots = 16;
+constexpr uint32_t kBodyPlace = 896;      // its place in the world (3 floats)
+constexpr uint32_t kBodyRespawn = 16162;  // a byte set to kRespawned when it's put back on the ground, then counting down
+constexpr uint8_t kRespawned = 216;
+constexpr float kBodyJump = 1.5f;         // world units in a frame: more is a placement (fastest move seen 0.95)
+
 // Reads the camera after each frame and keeps the one before: a scene's
-// game_camera and game_camera_before. Read again with nothing changed (a
-// paused frame made again), the one before stays.
+// game_camera and game_camera_before; and the bodies put down in one jump
+// (Real3dScene::placed: those of this read and the one before, as the 3D
+// draws the bodies a frame late). Read again with nothing changed (a paused
+// frame made again), the one before stays.
 class SpikeoutCamera {
 public:
-    void read(std::span<const uint8_t> ram, Real3dScene& scene) {
-        Real3dScene::GameCamera now;
-        spikeout_camera(ram, now);
-        if (now != last_) {
-            before_ = last_;
-            last_ = now;
-        }
-        scene.game_camera = last_;
-        scene.game_camera_before = before_;
-    }
+    void read(std::span<const uint8_t> ram, Real3dScene& scene);
 
 private:
+    struct Body {
+        uint32_t word0 = 0;
+        std::array<float, 3> place{};
+        uint8_t respawn = 0;
+        bool operator==(const Body&) const = default;
+    };
     Real3dScene::GameCamera last_, before_;
+    std::array<Body, kPlayerSlots + kEnemySlots> bodies_{};
+    bool bodies_read_ = false;
+    std::vector<std::array<float, 3>> placed_now_, placed_before_;
 };
 
 } // namespace m3::games
