@@ -259,7 +259,12 @@ rate on such screens only).
    FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N
    forces N for tests). Measured on the 99.95 Hz screen: 100 a second, each 0.576 of a frame on (spread 0.02); forced
    to 144: 144 a second, 0.400 on (spread 0.02), the 3D 1.6-2.0 ms a picture, the game at 57.52 with no stutters.
-   Left: the VRR multiple (SDL doesn't say whether a screen is running VRR; needs a VRR screen to try), and the
+   Left: the VRR multiple (SDL doesn't say whether a screen is running VRR; needs a VRR screen to try. WAITS FOR A
+   TESTER, the owner's decision 2026-11-21: on the README's roadmap with a call for VRR owners. Then: a "VRR screen"
+   setting; smooth off, each frame presented as it's finished (the screen at 57.524); smooth on, the highest multiple
+   of 57.524 the screen allows (115, 230; half rate halves it to a multiple too); whether drivers apply VRR to a
+   borderless window with mailbox presenting or only with plain vsync (FIFO gave 33 a second on the owner's PC: not
+   for everyone); the tester's window log (pictures a second, the clock's spread) to check it), and the
    weights from present times (SDL's GPU API doesn't say when a picture reached the screen; the even clock keeps the
    steps within 0.02 of a frame meanwhile). A 240 Hz screen to check the 4.2 ms a picture: none here.
    240 A SECOND, MEASURED (2026-11-21, forced with SPIKEOUT_SMOOTH_HZ=240 on the 99.95 Hz screen, Phoenix's deck
