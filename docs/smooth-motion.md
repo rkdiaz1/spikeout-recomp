@@ -37,9 +37,15 @@ guessed. Measured over 150,000 frames of the whole game, every jump was one of:
 - a scripted shot starting a new instant command (a set position, a path's first key, the ending's shots);
 - a win pose's camera taking over, and each of its shots starting.
 
-Nothing else moved the camera more than 0.6 units a frame. The camera shake (a vertical bob that changes direction
-every frame or two) is taken out before blending and added back unblended; blended, it would be halved. The field of
-view is fixed apart from a few modes, so it's taken from the newer frame.
+Nothing else moved the camera more than 0.6 units a frame. A scripted command can move the look-at point along its
+line (2 units at once) without changing the view, so only the eye and the view's turn are tested. The camera shake
+(a vertical bob that changes direction every frame or two) is taken out before blending and added back unblended;
+blended, it would be halved. The game keeps the unshaken eye beside the shaken one, and the shake only lifts the eye,
+so it's exact. The field of view is fixed apart from a few modes, so it's taken from the newer frame.
+
+The 3D drawn usually holds the camera of the frame it was made in, but in some places (seen after an area change,
+for the rest of that area) the frame before's. The camera is kept for both frames and the blend takes the one the
+viewports hold.
 
 **2. The characters, bone by bone.** Each character's bone matrices are in RAM every frame, in world space. Match
 them by character slot and bone number, no guessing; the Real3D's matrix numbers for them are handed out in draw order
@@ -138,7 +144,7 @@ rate on such screens only).
 
 ## Steps
 
-1. The camera: blended from the viewports' camera matrix, with the game's cuts and the shake taken out. Everything
+1. DONE. The camera: blended from the viewports' camera matrix, with the game's cuts and the shake taken out. Everything
    else drawn in world space at the newer frame. Check the ghost scenes with replays.
    BUILT (2026-11-20, branch claude/smooth-camera): m3::interpolate_camera (src/runtime/real3d_interp.cpp), the
    game's camera read by games/spikeofe_camera.cpp after each frame, the default in the window (SPIKEOUT_SMOOTH_GUESS=1:
@@ -146,8 +152,14 @@ rate on such screens only).
    the game's view matrix bit for bit in the same frame (rotation transposed); the radar's and the HUD's viewports
    have their own (identity) and are left as they are; the docks, Phoenix's deck, the coast road and the helicopter
    drawn halfway as expected (gamerun --interp --renderer gpu --gpu-scale 1 --screenshot X --shot-every 1; the
-   halfway writer needs scale 1). Not yet: the shake taken out and added back. While the camera shakes (10-75
-   frames at a hit), nothing is blended; over 3,400 frames of stage 1 those were the only cuts, no false ones.
+   halfway writer needs scale 1). Then the same day: the shake taken out and added back (the camera's unshaken eye,
+   kept by the game), cuts on the eye (over 1 unit), the view's turn (over 20 degrees) and a win pose's new shot; the
+   look-at no longer tested; the camera of the frame before used when the viewports hold that. Checked: stage 1's
+   3,400 frames, two shakes included, blended throughout with no cut (the eye moved at most 0.15 a frame, the view
+   turned at most 2 degrees); the bot's seg3 replayed with its inputs (4,080 frames): every jump in the decompile's
+   list cut (an area change, two win-pose shots, the stage's end and the next start; each jump's angles change a
+   frame later, cut by the turn, 70-180 degrees), the frames after the area change drawn a frame behind blended.
+   Smooth off: the docks' 1,000 frames and stage 1's 600 hash the same as main.
 2. The other models by the one rule (moved, spinning, flipbook, appeared, radar).
 3. The characters' bones.
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
@@ -158,8 +170,14 @@ with the sea, birds and lighthouse, Phoenix's deck, a helicopter, stage 1's gate
 
 ## What we still need to know
 
-The decompile answered the camera, the characters, every animated model and the timing (2026-11-20). Left:
-A second round (the same day) placed every routine that draws a model, stage 1's gate included. Left:
+The decompile answered the camera, the characters, every animated model and the timing (2026-11-20). A second
+round (the same day) placed every routine that draws a model, stage 1's gate included. A third gave the shake, the
+scripted shots, how the renderer can name each model from the ROM at run time, and how to tie a character's scene
+nodes to its bones (a read-only hook on the game's bone drawing: it changes no game state, but it is part of the
+recompiled code and changes its fingerprint; what that means for save states and network play between versions is
+to check before it's added). Found with it: before its bones, a character is
+drawn with a few models the game builds in polygon RAM each frame (likely the joints' skin): step 3 must pair their
+vertices. Left:
 - a new player linking in, confirmed with a two-board run (expected: a slot created, like any other);
 - the moving traffic seen in play (only checked through the developer menu's stage test);
 - the gates, machines and the opera's curtain seen moving in a frame pair (read from the code; the pairs taken

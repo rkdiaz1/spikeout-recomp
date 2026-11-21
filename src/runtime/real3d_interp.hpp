@@ -56,21 +56,27 @@ constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 // matrix the game_camera's view, in b and a) are moved; the others (the radar,
 // the HUD's 3D) are drawn as in b. No guessing which model is which.
 //
-// A cut (out is b, false): either scene without the game's camera, the camera
-// driven by something else (its driver changed), shaking (a shake changes
-// direction every frame or two: blended, it would be halved), or its eye or
-// the point it looks at moved more than kCameraJump in the frame. Measured
-// over 150,000 frames of the whole game, every camera jump (an area or stage
-// change, a scripted shot's instant command, a win pose's camera) was over
-// 2 units and every other move under 0.6.
+// The camera shake (it lifts the eye) is taken out before blending and the
+// newer frame's put back. A cut (out is b, false): either scene without the
+// game's camera, the camera driven by something else (its driver changed), a
+// win pose's shot starting, its eye (unshaken) moved more than kCameraJump or
+// its view turned more than kCameraTurnJump in the frame. Measured over
+// 150,000 frames of the whole game, every camera jump (an area or stage
+// change, a scripted shot's instant command, a win pose's shot: 1.1 units and
+// more) was over 1 unit and every other move under 0.6. The point it looks at
+// isn't tested: a scripted command can move it along its line (the view stays).
 struct CameraInterpStats {
     std::size_t viewports = 0; // moved by the blended camera
     std::size_t models = 0;    // in them
-    enum class Cut : uint8_t { none, no_camera, driver, shaking, jump, no_viewport } cut = Cut::none;
+    float eye_move = 0;        // world units, without the shake
+    float turn = 0;            // degrees, the first viewport's
+    bool lagged = false;       // the newer scene drawn with the frame before's camera
+    enum class Cut : uint8_t { none, no_camera, driver, shot, jump, turn, no_viewport } cut = Cut::none;
 };
 bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out,
                         CameraInterpStats* stats = nullptr);
 
-constexpr float kCameraJump = 1.0f; // world units in a frame
+constexpr float kCameraJump = 1.0f;      // world units in a frame
+constexpr float kCameraTurnJump = 20.0f; // degrees in a frame
 
 } // namespace m3

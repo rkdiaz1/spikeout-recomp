@@ -133,16 +133,25 @@ struct Real3dScene {
     // from, read from its RAM by the game's own code (games/spikeofe_camera:
     // nothing set by the builder, cleared by it). view: the camera's matrix
     // as the game stores it (its viewports' camera_words hold the same
-    // floats); look: the point it looks at; driver: what moves it (a change:
-    // a cut); shaking: a camera shake on (not blended).
+    // floats); eye, look: where it is and the point it looks at, without the
+    // shake; shake: how far the shake lifted the eye for the view; driver:
+    // what moves it (a change: a cut); shot_timer, shot: a win pose's shots
+    // (a new one: a cut).
     struct GameCamera {
         bool known = false;
         std::array<uint32_t, 12> view{};
-        std::array<float, 3> eye{}, look{};
+        std::array<float, 3> eye{}, look{}; // without the shake
+        float shake = 0;                    // the shake added to the eye's height (and the look-at's) for the view
         uint32_t driver = 0;
-        bool shaking = false;
+        uint16_t shot_timer = 0; // a win pose's shots: kShotOn while one runs
+        uint8_t shot = 0;        // and its index
+        static constexpr uint16_t kShotOn = 640;
+        bool operator==(const GameCamera&) const = default;
     };
-    GameCamera game_camera;
+    // The 3D drawn is usually made with the camera of the same frame, but in
+    // some places (seen after an area change) with the frame before's: both
+    // are kept, and smooth motion takes the one the viewports hold.
+    GameCamera game_camera, game_camera_before;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;

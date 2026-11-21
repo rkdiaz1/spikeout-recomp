@@ -1107,6 +1107,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         }
     };
     m3::Real3dSceneBuilder builder;
+    m3::games::SpikeoutCamera game_camera;
     builder.set_fog_over_nothing(shared.fog_over_nothing);
     m3::WideLayer wide_bottom, wide_top;
     Shared::GpuFrame gpu_frame;
@@ -1117,7 +1118,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         built_extend = shared.extend;
         builder.set_extend(built_extend);
         builder.build(bus.real3d(), gpu_frame.scene);
-        m3::games::spikeout_camera(bus.ram(), gpu_frame.scene.game_camera); // (smooth motion's camera)
+        game_camera.read(bus.ram(), gpu_frame.scene); // (smooth motion's camera)
         gpu_frame.extend = builder.extend();
         gpu_frame.bottom.assign(tilegen.bottom().begin(), tilegen.bottom().end());
         gpu_frame.top.assign(tilegen.top().begin(), tilegen.top().end());

@@ -309,12 +309,24 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
         if (stats) *stats = s;
         return cut == CameraInterpStats::Cut::none;
     };
-    const Real3dScene::GameCamera &ca = a.game_camera, &cb = b.game_camera;
-    if (!ca.known || !cb.known || a.block_culled || b.block_culled) return done(CameraInterpStats::Cut::no_camera);
+    // The camera each scene's 3D was made with: its frame's or the frame before's.
+    auto drawn_with = [](const Real3dScene& scene) -> const Real3dScene::GameCamera* {
+        for (const Real3dScene::GameCamera* c : {&scene.game_camera, &scene.game_camera_before})
+            for (const Real3dScene::Viewport& vp : scene.viewports)
+                if (is_game_camera(vp, *c)) return c;
+        return nullptr;
+    };
+    if (!a.game_camera.known || !b.game_camera.known || a.block_culled || b.block_culled)
+        return done(CameraInterpStats::Cut::no_camera);
+    const Real3dScene::GameCamera *pca = drawn_with(a), *pcb = drawn_with(b);
+    if (!pca || !pcb) return done(CameraInterpStats::Cut::no_viewport);
+    s.lagged = pcb == &b.game_camera_before;
+    const Real3dScene::GameCamera &ca = *pca, &cb = *pcb;
+    s.eye_move = distance(ca.eye, cb.eye);
     if (ca.driver != cb.driver) return done(CameraInterpStats::Cut::driver);
-    if (ca.shaking || cb.shaking) return done(CameraInterpStats::Cut::shaking);
-    if (distance(ca.eye, cb.eye) > kCameraJump || distance(ca.look, cb.look) > kCameraJump)
-        return done(CameraInterpStats::Cut::jump);
+    if (cb.shot_timer == Real3dScene::GameCamera::kShotOn && (ca.shot_timer != cb.shot_timer || ca.shot != cb.shot))
+        return done(CameraInterpStats::Cut::shot);
+    if (s.eye_move > kCameraJump) return done(CameraInterpStats::Cut::jump);
 
     // Each of b's viewports with the game's camera, moved from it to the
     // camera between: by C = (between) x (b's)^-1, the camera's in a taken
@@ -341,12 +353,22 @@ bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Rea
         if (!camera_parts(va, pa) || !camera_parts(vb, pb) || pa.parts.mirrored != pb.parts.mirrored ||
             !inverse(linear(vb), lb_inverse))
             continue;
-        Mat3 lt = rotation(slerp(pa.parts.q, pb.parts.q, t));
+        const auto& qa = pa.parts.q;
+        const auto& qb = pb.parts.q;
+        const float dot = std::fabs(qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]);
+        const float turn = 2.0f * std::acos(std::min(dot, 1.0f)) * 57.29578f;
+        if (s.viewports == 0) s.turn = turn;
+        if (turn > kCameraTurnJump) return done(CameraInterpStats::Cut::turn);
+        Mat3 lt = rotation(slerp(qa, qb, t));
         if (pa.parts.mirrored)
             for (float& c : lt[0]) c = -c;
         for (size_t c = 0; c < 3; ++c)
             for (float& x : lt[c]) x *= pa.parts.scale[c] + (pb.parts.scale[c] - pa.parts.scale[c]) * t;
-        const Vec3 eye{pa.eye[0] + (pb.eye[0] - pa.eye[0]) * t, pa.eye[1] + (pb.eye[1] - pa.eye[1]) * t,
+        // The eye blended without the shake (it only lifts the eye), then the
+        // newer frame's shake put back: blended, a shake that changes
+        // direction every frame or two would be halved.
+        const float ya = pa.eye[1] - ca.shake, yb = pb.eye[1] - cb.shake;
+        const Vec3 eye{pa.eye[0] + (pb.eye[0] - pa.eye[0]) * t, ya + (yb - ya) * t + cb.shake,
                        pa.eye[2] + (pb.eye[2] - pa.eye[2]) * t};
         const Vec3 le = m3::apply(lt, eye);
         const Vec3 tt{-le[0], -le[1], -le[2]}; // the camera between: L_t, -L_t eye

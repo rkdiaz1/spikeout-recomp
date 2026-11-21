@@ -702,6 +702,7 @@ struct Machine {
     double energy = 0, sound_seconds = 0, render_seconds = 0, setup_ms = 0, raster_ms = 0;
     // --match-models: each frame's scene, and its models found in the frame before's
     m3::Real3dSceneBuilder match_builder;
+    m3::games::SpikeoutCamera match_camera; // the game's camera for each scene (smooth motion)
     m3::Real3dScene match_scene[2];
     uint64_t match_models = 0, match_one = 0, match_several = 0, match_unmatched = 0, match_frames = 0;
     uint64_t match_unmatched_ram = 0, match_unmatched_path = 0;
@@ -1971,7 +1972,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         if (o.match_models) { // each frame's models found in the frame before's (smooth motion)
             std::swap(m.match_scene[0], m.match_scene[1]);
             m.match_builder.build(m.bus.real3d(), m.match_scene[1]);
-            m3::games::spikeout_camera(m.bus.ram(), m.match_scene[1].game_camera);
+            m.match_camera.read(m.bus.ram(), m.match_scene[1]);
             const auto& before = m.match_scene[0].models;
             const auto& now = m.match_scene[1].models;
             std::unordered_map<uint64_t, int> keys; // (viewport, address, path): how many models in the frame before
@@ -2011,13 +2012,14 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                 const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
                 if (o.interp_trace && !o.interp_guess && frame >= o.interp_trace_from && frame < o.interp_trace_to) {
                     // the game's camera, and each viewport's: its matrix index and whether it's the game's
-                    static const char* const kCuts[] = {"", "no camera", "driver", "shaking", "jump", "no viewport"};
+                    static const char* const kCuts[] = {"", "no camera", "driver", "shot", "jump", "turn", "no viewport"};
                     const auto& s1 = m.match_scene[1];
                     const auto& c = s1.game_camera;
-                    std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f driver %u%s; %zu viewports, %zu "
-                                "models moved%s%s\n",
+                    std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f shake %.3f driver %u shot %u/%u; "
+                                "moved %.3f turned %.3f%s; %zu viewports, %zu models moved%s%s\n",
                                 static_cast<unsigned long long>(frame), c.eye[0], c.eye[1], c.eye[2], c.look[0], c.look[1],
-                                c.look[2], c.driver, c.shaking ? " shaking" : "", camera_stats.viewports, camera_stats.models,
+                                c.look[2], c.shake, c.driver, c.shot_timer, c.shot, camera_stats.eye_move, camera_stats.turn,
+                                camera_stats.lagged ? " (drawn a frame behind)" : "", camera_stats.viewports, camera_stats.models,
                                 camera_stats.cut != m3::CameraInterpStats::Cut::none ? "; a cut: " : "",
                                 kCuts[static_cast<int>(camera_stats.cut)]);
                     for (size_t v = 0; v < s1.viewports.size(); ++v) {
