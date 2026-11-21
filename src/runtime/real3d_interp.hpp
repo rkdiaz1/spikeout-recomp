@@ -65,18 +65,39 @@ constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 // change, a scripted shot's instant command, a win pose's shot: 1.1 units and
 // more) was over 1 unit and every other move under 0.6. The point it looks at
 // isn't tested: a scripted command can move it along its line (the view stays).
+//
+// `models` (step 2): each model in those viewports is also found in the older
+// scene, by its polygon data's address and its place in the world (the
+// camera undone), in any of a's viewports with the game's camera (the stage's
+// tree is drawn under one viewport one frame and its twin the next): the
+// nearest within kModelMatch, with no other copy nearly as near (within
+// twice its distance). Found, its place is blended (position straight, the
+// turn the shortest: a spin keeps its size). Not found, a model of an
+// animation (Real3dScene::Model::animation: a flipbook, like a gull's wing
+// beats) is found as the nearest of that animation's models the same way: its
+// place blended, its own (the newer) model drawn. Still not found (it
+// appeared, moved too far) or copies alike (rain, splashes: which is which
+// can't be told): drawn where it is in the newer scene.
 struct CameraInterpStats {
     std::size_t viewports = 0; // moved by the blended camera
     std::size_t models = 0;    // in them
+    std::size_t blended = 0;   // of those, found and their place blended
+    std::size_t still = 0;     // found, in the same place
+    std::size_t flipbook = 0;  // another model of its animation found where it was: its place blended
+    std::size_t newer = 0;     // not found: as in the newer scene
+    std::size_t ambiguous = 0; // copies alike: as in the newer scene
     float eye_move = 0;        // world units, without the shake
     float turn = 0;            // degrees, the first viewport's
     bool lagged = false;       // the newer scene drawn with the frame before's camera
     enum class Cut : uint8_t { none, no_camera, driver, shot, jump, turn, no_viewport } cut = Cut::none;
 };
 bool interpolate_camera(const Real3dScene& a, const Real3dScene& b, float t, Real3dScene& out,
-                        CameraInterpStats* stats = nullptr);
+                        CameraInterpStats* stats = nullptr, bool models = true);
 
 constexpr float kCameraJump = 1.0f;      // world units in a frame
 constexpr float kCameraTurnJump = 20.0f; // degrees in a frame
+constexpr float kModelMatch = 3.0f;      // world units in a frame (the docks' birds fly 1.6)
+constexpr float kModelSame = 0.01f;      // world units: the same place
+constexpr float kMaxModelTurn = 120.0f;  // degrees in a frame (a helicopter's rotor turns 48)
 
 } // namespace m3

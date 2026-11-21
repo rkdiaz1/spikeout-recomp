@@ -155,6 +155,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
     models_.clear();
     viewport_models_.clear();
     visits_ = 0;
+    model_number_ = Real3dScene::kNoModel;
     if (scene.block_culled) return; // no 3D: Supermodel clears to white, over the layers below
     walk_viewports(0x800000);
     // The polygons, priority by priority.
@@ -170,6 +171,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
                     model.matrix = ref.matrix;
                     model.ancestors = ref.ancestors;
                     model.depth = ref.depth;
+                    model.number = ref.number;
                     model.first_polygon = static_cast<uint32_t>(scene.polygons.size());
                     decode_model(v, ref);
                     model.polygon_count = static_cast<uint32_t>(scene.polygons.size()) - model.first_polygon;
@@ -396,6 +398,9 @@ void Real3dSceneBuilder::draw_node(uint32_t addr, const uint32_t* node, int dept
     const Attribs saved_attribs = attribs_;
     const Mat4 saved_matrix = matrix_;
     const uint32_t saved_path = path_;
+    const uint32_t saved_number = model_number_;
+    if (model_nodes_)
+        if (const auto it = model_nodes_->find(addr & 0xFFFFFF); it != model_nodes_->end()) model_number_ = it->second;
     path_ = (path_ ^ addr) * 16777619u;
     ancestors_.push_back(path_);
     if (node[2] & 0x8000) {
@@ -477,6 +482,7 @@ void Real3dSceneBuilder::draw_node(uint32_t addr, const uint32_t* node, int dept
     matrix_ = saved_matrix;
     attribs_ = saved_attribs;
     path_ = saved_path;
+    model_number_ = saved_number;
     ancestors_.pop_back();
 }
 
@@ -488,6 +494,7 @@ void Real3dSceneBuilder::add_model(uint32_t addr) {
     ModelRef m;
     m.matrix = matrix_;
     m.addr = addr;
+    m.number = model_number_;
     m.path = path_;
     m.depth = static_cast<uint8_t>(std::min<size_t>(ancestors_.size(), Real3dScene::kAncestors));
     std::copy_n(ancestors_.begin(), m.depth, m.ancestors.begin());

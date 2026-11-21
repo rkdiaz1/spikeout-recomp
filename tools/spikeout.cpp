@@ -64,7 +64,7 @@
 // --load-state FILE runs on from it); F10 doesn't load those.
 //
 // Smooth motion (the menu, or --smooth; the GPU 3D only): a picture each
-// refresh of the display (at most 120 a second, timed as the game's frames
+// refresh of the display (whatever its rate, timed as the game's frames
 // are), its 3D placed between the last two frames (m3::interpolate_camera:
 // the game's camera blended, docs/smooth-motion.md; SPIKEOUT_SMOOTH_GUESS=1
 // the models matched between frames, m3::interpolate) by an
@@ -87,6 +87,7 @@
 // game).
 #include "games/games.hpp"
 #include "games/spikeofe_camera.hpp"
+#include "games/spikeofe_models.hpp"
 #include "recomp/context.hpp"
 #include "recomp/frame_timing.hpp"
 #include "runtime/bus.hpp"
@@ -1108,6 +1109,9 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
     };
     m3::Real3dSceneBuilder builder;
     m3::games::SpikeoutCamera game_camera;
+    m3::games::SpikeoutModels model_names; // which models make one animation (smooth motion)
+    model_names.load(roms);
+    builder.set_model_nodes(model_names.nodes());
     builder.set_fog_over_nothing(shared.fog_over_nothing);
     m3::WideLayer wide_bottom, wide_top;
     Shared::GpuFrame gpu_frame;
@@ -1117,7 +1121,9 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
     auto build_gpu_frame = [&] {
         built_extend = shared.extend;
         builder.set_extend(built_extend);
+        model_names.refresh(bus.ram());
         builder.build(bus.real3d(), gpu_frame.scene);
+        model_names.tag(gpu_frame.scene);
         game_camera.read(bus.ram(), gpu_frame.scene); // (smooth motion's camera)
         gpu_frame.extend = builder.extend();
         gpu_frame.bottom.assign(tilegen.bottom().begin(), tilegen.bottom().end());
@@ -3013,7 +3019,7 @@ int main(int argc, char** argv) {
         int move_x = 0, move_y = 0;
         std::chrono::steady_clock::time_point arrived{}, last_picture{}, due{};
         double clock = 0;
-        double picture_seconds = 1.0 / 60; // the display's refresh, at most 120 a second
+        double picture_seconds = 1.0 / 60; // the display's refresh
         double picture_average = 1.0 / 60; // the pictures' time apart, averaged: the clock's step
     } smooth;
     // Texture RAM as the game thread's rows have brought it (`textures`: some
@@ -6998,10 +7004,18 @@ int main(int argc, char** argv) {
                 menu.set_fps(shown_rate);
             }
             // The display's refresh (it may have moved to another): smooth
-            // motion's pictures, at most 120 a second.
-            if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)))
-                smooth.picture_seconds = 1.0 / std::clamp(mode->refresh_rate > 0 ? static_cast<double>(mode->refresh_rate) : 60.0,
-                                                          30.0, 120.0);
+            // motion's pictures, one a refresh, whatever the rate (no cap of
+            // our own: a cap that isn't a whole part of the rate shows some
+            // pictures twice; docs/smooth-motion.md "No frame limit setting").
+            // Tests: SPIKEOUT_SMOOTH_HZ=N draws N a second.
+            static const double forced_hz = [] {
+                const char* v = std::getenv("SPIKEOUT_SMOOTH_HZ");
+                return v ? std::atof(v) : 0.0;
+            }();
+            if (forced_hz > 0) smooth.picture_seconds = 1.0 / std::clamp(forced_hz, 30.0, 1000.0);
+            else if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)))
+                smooth.picture_seconds =
+                    1.0 / std::max(mode->refresh_rate > 0 ? static_cast<double>(mode->refresh_rate) : 60.0, 30.0);
 #endif
             if (smooth_log && smoothing && smooth_log_n > 1) {
                 const double mean = smooth_log_sum / static_cast<double>(smooth_log_n);
@@ -7058,10 +7072,13 @@ int main(int argc, char** argv) {
                     if (smooth.before_number + 1 == gpu_frame.number && t < 1 && !gpu_frame.covered) {
                         // (the game's camera blended, the rest as in the newer frame; SPIKEOUT_SMOOTH_GUESS=1:
                         // the models matched between frames, the old way)
+                        // SPIKEOUT_SMOOTH_CAMERA_ONLY=1: the camera only, every model where it is in the newer frame)
                         static const bool guess = std::getenv("SPIKEOUT_SMOOTH_GUESS") != nullptr;
+                        static const bool camera_only = std::getenv("SPIKEOUT_SMOOTH_CAMERA_ONLY") != nullptr;
                         const float tf = static_cast<float>(std::max(t, 0.0));
                         between = guess ? m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between)
-                                        : m3::interpolate_camera(smooth.before, gpu_frame.scene, tf, smooth.between);
+                                        : m3::interpolate_camera(smooth.before, gpu_frame.scene, tf, smooth.between,
+                                                                 nullptr, !camera_only);
                         if (between) {
                             real3d_gpu->render(smooth.between, texture_copy, textures_version);
                             drawn_number = 0; // the frame itself drawn again when it's shown

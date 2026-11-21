@@ -118,7 +118,8 @@ between the two game frames.
 Without smooth motion on a fixed 60 Hz screen, one picture shows twice about every 0.4 s. VRR, or a custom 57.5 Hz
 mode set by the player (NVIDIA/AMD control panel, CRU), removes that; the game can't.
 
-Today's pacer (tools/spikeout.cpp) already runs an even clock a frame behind the game, capped at 120 pictures a second.
+The pacer (tools/spikeout.cpp) runs an even clock a frame behind the game, a picture each refresh of the screen (it
+was capped at 120 a second until 2026-11-21).
 Its even pacing stays: the display clock moves one refresh a picture, pulled a tenth of the way to the real clock each
 time (a jump to it after a hitch of more than two refreshes), so the in-between steps are the same size even when a
 picture starts a little early or late. To change: the cap (the setting below), picking the VRR multiple, and the
@@ -161,8 +162,38 @@ rate on such screens only).
    frame later, cut by the turn, 70-180 degrees), the frames after the area change drawn a frame behind blended.
    Smooth off: the docks' 1,000 frames and stage 1's 600 hash the same as main.
 2. The other models by the one rule (moved, spinning, flipbook, appeared, radar).
+   FIRST PART BUILT (2026-11-21): interpolate_camera's `models` (the default; gamerun --interp-camera-only and the
+   window's SPIKEOUT_SMOOTH_CAMERA_ONLY=1 leave it out). Each model's place in the world (its viewport's camera
+   undone) is found in the frame before by its polygon address, in any viewport with the game's camera: the nearest
+   within 3 units, with no other copy within twice its distance; found, the place is blended (position straight,
+   the shortest turn: spins keep their size; more than 120 degrees: not blended). Characters' parts are models too,
+   so until step 3 each limb is blended by its own place, which is what the bones would give. Not found (appeared,
+   a flipbook's next model, moved too far) or copies alike: as in the newer frame. Measured on the ghost scenes
+   (frame pairs): the docks ~105 still, ~67 blended, 2-4 newer; Phoenix's deck ~75 still, ~170 blended, 7-14
+   newer, 6 alike; the coast road ~335 still, ~150 blended; the helicopter ~100 still, ~245 blended, 10-16 newer,
+   5-11 alike. Halfway pictures: the characters fighting whole, limbs between, no seams at the joints. The blend
+   costs 0.64 ms a picture on average (0.33 for the camera only), at most ~1.9 either way; the window's 100
+   pictures a second all blended, the game at 57.52, stutters seen as often with the camera only (this PC).
+   SECOND PART BUILT (2026-11-21): the moving flipbooks. games/spikeofe_models reads every model's name from the
+   player's program ROM at start (8,789 names) and groups the models of one animation (a name but for its trailing
+   number; the detail levels _300/_500/_700 left out: 173 animations); each frame it reads the RAM table of where
+   each model starts (rebuilt only when it changes, at loads), the scene builder gives each model the number of
+   the nearest such node above it (Real3dSceneBuilder::set_model_nodes, Real3dScene::Model::number), and the game
+   code its animation. A model not found by its address is found as the nearest of its animation's models (same
+   rules): its place blended, its own model drawn. Measured: Phoenix's deck 4-6 a frame (the water round it), the
+   helicopter 12-14 (the gulls in the sky); halfway, each gull once, between its two places, the rotor blades
+   between their angles. Nothing made from the names is kept or shipped; no name is written in our code. Rain and
+   splashes stay with "copies alike" (naming them would put the ROM's names in the code). Smooth off: the docks'
+   and stage 1's hashes the same as main; the window at the helicopter: every picture blended, no stutters.
+   Still to do in step 2: the shadows tied to their characters (step 3), and the matching done once a frame rather
+   than for each picture.
 3. The characters' bones.
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
+   FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N
+   forces N for tests). Measured on the 99.95 Hz screen: 100 a second, each 0.576 of a frame on (spread 0.02); forced
+   to 144: 144 a second, 0.400 on (spread 0.02), the 3D 1.6-2.0 ms a picture, the game at 57.52 with no stutters.
+   Left: the VRR multiple (SDL doesn't say whether a screen is running VRR; needs a VRR screen to try), and the
+   weights from present times.
 5. Maybe: true in-between poses.
 
 Each step: smooth off proved unchanged by hashes; replays of the ghost scenes (the coast road's car park, the docks

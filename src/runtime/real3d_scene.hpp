@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace m3 {
@@ -116,7 +117,12 @@ struct Real3dScene {
     // viewport's first), as far as kAncestors deep; a model not found in the
     // other frame moves with the one found nearest it in the tree (a wheel
     // with its car).
+    // number: the game's own number for the model, when the game says which
+    // culling node each model of its starts at (set_model_nodes: the nearest
+    // such node above it), else kNoModel; animation: filled by the game's
+    // code (0: none), the same for the models of one animation (a flipbook).
     static constexpr int kAncestors = 24;
+    static constexpr uint32_t kNoModel = 0xFFFFFFFFu;
     struct Model {
         uint32_t address = 0, path = 0;
         uint16_t viewport = 0;
@@ -124,6 +130,8 @@ struct Real3dScene {
         uint32_t first_polygon = 0, polygon_count = 0;
         std::array<uint32_t, kAncestors> ancestors{};
         uint8_t depth = 0; // ancestors in use
+        uint32_t number = kNoModel;
+        uint32_t animation = 0;
     };
     std::vector<Model> models;
     bool block_culled = false; // the Real3D's block culling was on: white, no scene
@@ -218,11 +226,16 @@ public:
     // Scroll fog drawn when the frame has no polygons too, as Supermodel
     // (Real3dScene::background_fog; --fog-over-nothing).
     void set_fog_over_nothing(bool on) { fog_over_nothing_ = on; }
+    // The culling nodes (24-bit addresses) where the game's models start, and
+    // each one's number (Real3dScene::Model::number); null: none. Must outlive
+    // the builds that use it.
+    void set_model_nodes(const std::unordered_map<uint32_t, uint32_t>* nodes) { model_nodes_ = nodes; }
 
 private:
     struct ModelRef {
         Mat4 matrix;
         uint32_t addr = 0;
+        uint32_t number = Real3dScene::kNoModel;
         uint32_t path = 0; // the culling nodes above it, hashed (Real3dScene::Model)
         std::array<uint32_t, Real3dScene::kAncestors> ancestors{};
         uint8_t depth = 0;
@@ -262,6 +275,8 @@ private:
     std::vector<uint32_t> ancestors_; // path_ at each of them, the viewport's first
     int extend_ = 0; // set_extend
     bool fog_over_nothing_ = false; // set_fog_over_nothing
+    const std::unordered_map<uint32_t, uint32_t>* model_nodes_ = nullptr; // set_model_nodes
+    uint32_t model_number_ = Real3dScene::kNoModel;                       // the nearest above, walking down
     // The viewport's frustum planes (words 0x0C-0x13): left u, v; top u, w;
     // right u, v; bottom u, w.
     std::array<float, 8> planes_{};
