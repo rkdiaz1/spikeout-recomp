@@ -281,7 +281,15 @@ recompiled code and changes its fingerprint; what that means for save states and
 to check before it's added). Found with it: before its bones, a character is
 drawn with a few models the game builds in polygon RAM each frame (likely the joints' skin): step 3 must pair their
 vertices. Left:
-- a new player linking in, confirmed with a two-board run (expected: a slot created, like any other);
+- DONE (2026-11-21): a new player linking in, two boards (gamerun --boards 2 --parallel, the linking screen's
+  repro in CLAUDE.md, a state saved at 4500): play resumes at 4540 with player 2 beside player 1 on board 0, and
+  every halfway picture has each fighter between his own two poses, nothing doubled or missing; the linking screen
+  (2D) unchanged. Seen in the frames themselves, smooth motion off as on: the new player drawn dark in some frames
+  (4541, 4546-4547, 4550-4551), likely his flashing after the join; Supermodel draws the same from our dump of 4541;
+- the gates: stage 1's first gate replayed (fullrec/bot-6818 with stage1/inputs.bin, 6819-7030): the camera's
+  shakes as White hits it blend cleanly, but the gate itself doesn't move as it breaks (the area just clears). The
+  owner checked a gate moving in the window with smooth motion on: fine (2026-11-21);
+- LEFT AS IS (the owner's choice, 2026-11-21: expected to work, not worth a dedicated check): the items below.
 - the moving traffic seen in play (only checked through the developer menu's stage test);
 - the gates, machines and the opera's curtain seen moving in a frame pair (read from the code; the pairs taken
   caught them still);
