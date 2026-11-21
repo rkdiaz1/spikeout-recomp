@@ -269,6 +269,24 @@ rate on such screens only).
    0.5-0.6. Within the 4.2 ms on average, but the picture where a new frame arrives (the matching, ~1.7 ms, falls in
    it) runs late, so some refreshes get none. To hold 240: the matching done off the window's thread (on the game's,
    or a worker, as each frame finishes), and the 3D's build made cheaper.
+   DONE THE SAME DAY: THE MATCHING ON ITS OWN THREAD (tools/spikeout.cpp SmoothMatcher; the owner chose a thread of
+   its own over the game's, so the game's thread and network play stay untouched). The window hands each new frame's
+   3D scene over (one copy, as it kept the frame before itself); the thread keeps the frame before, matches the pair
+   and publishes both frames with their match; a picture blends from the newest pair that is its two frames. Its
+   match not ready yet (just after a new frame): the frame before, which the last pair holds (the picture's place is
+   near it then), not a jump to the newer. Measured as above: forced 240, 237-241 a second through the fight (was
+   197-224); a picture's 3D 0.7-1.6 ms (was 2.0-2.4); the matching 0.5-1.8 ms a frame on its thread; 0-8 pictures a
+   second the frame before. At the screen's 100: 100 a second, 0-1 the frame before. Smooth off: the window
+   unchanged (57.5 shown a second, nothing of smooth motion run); gamerun not touched.
+   AND HALF RATE WHEN IT CAN'T KEEP UP (the owner's choice over a frame limit setting or vf3-recomp's 60): a picture
+   more than 1.5 refreshes after the last is a refresh missed; over 5% of them two seconds running, on a display of
+   119 Hz or more, the pictures go at half the rate (each shown two refreshes: even), full again after 10 s, the wait
+   doubled (to 160 s) each time it halves again within a minute of trying. The window's log says each change.
+   Checked with forced 240: halved, full again after 10 s, ran 240 with no misses for 30 s, halved again with a 20 s
+   wait. Not checkable here: whether a real 240 Hz screen misses refreshes. Forcing a rate past this 100 Hz screen's
+   holds some presents up (misses 7 a second at 120, ~16 at 144, ~28 at 200, 57 at 240, whatever the load; 0-2 at
+   its own 100), so forced runs halve at once; SPIKEOUT_SMOOTH_FULL=1 (tests) never halves. Waits on a player with
+   such a screen.
    PRESENT-TIME WEIGHTS, TRIED AND SET ASIDE (2026-11-21): the window's own clock is free-running, not tied to the
    display's refreshes; with mailbox presenting a picture near a refresh boundary can make one refresh get two (one
    never seen) and the next none. Measured by when each present returned, against the vblank times Windows' desktop
