@@ -262,6 +262,24 @@ rate on such screens only).
    Left: the VRR multiple (SDL doesn't say whether a screen is running VRR; needs a VRR screen to try), and the
    weights from present times (SDL's GPU API doesn't say when a picture reached the screen; the even clock keeps the
    steps within 0.02 of a frame meanwhile). A 240 Hz screen to check the 4.2 ms a picture: none here.
+   240 A SECOND, MEASURED (2026-11-21, forced with SPIKEOUT_SMOOTH_HZ=240 on the 99.95 Hz screen, Phoenix's deck
+   fight from bot-22700, SPIKEOUT_SMOOTH_LOG): before the fight 240 a second; in it 197-224 (144 holds exactly).
+   Not the GPU: render scale 4, 2 and 1 alike. The CPU per picture: the 3D 2.0-2.4 ms (of it, matching a new pair
+   0.4 on average, blending 0.5: the log now splits them; the rest building the 3D for the GPU, ~1.1), presenting
+   0.5-0.6. Within the 4.2 ms on average, but the picture where a new frame arrives (the matching, ~1.7 ms, falls in
+   it) runs late, so some refreshes get none. To hold 240: the matching done off the window's thread (on the game's,
+   or a worker, as each frame finishes), and the 3D's build made cheaper.
+   PRESENT-TIME WEIGHTS, TRIED AND SET ASIDE (2026-11-21): the window's own clock is free-running, not tied to the
+   display's refreshes; with mailbox presenting a picture near a refresh boundary can make one refresh get two (one
+   never seen) and the next none. Measured by when each present returned, against the vblank times Windows' desktop
+   compositor gives (DwmGetCompositionTimingInfo, no SDL change; its refresh count cRefresh doesn't move each refresh,
+   the vblank time does): 0-13 refreshes a second in the fight. Tried: each picture timed to just before the
+   display's next refresh, weighted for that refresh's time. Worse, and not measurable: SDL's present can itself wait
+   for the display (acquiring a swapchain image), so when the present call returns says nothing about when the
+   picture reached the screen; 9-35 pictures a second looked late, and one run fell to 63 a second. Doing it
+   properly needs the real present times: Vulkan's present-wait or DXGI's frame statistics, both below SDL's GPU API
+   (its swapchain isn't reachable), or checking the screen itself (Desktop Duplication: each composed picture, to
+   count repeats). Reverted; the free clock stays.
    THE MENU (2026-11-21): Display > Smooth motion, off by default, kept in settings.ini (smooth_motion); its
    description says it adds up to one frame (17 ms) of delay and needs the GPU renderer. spikeout --smooth still
    turns it on (and, as --quads, it's saved if the settings are). Checked: a portable copy with smooth_motion = 1

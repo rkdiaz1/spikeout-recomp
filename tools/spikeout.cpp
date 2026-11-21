@@ -3298,6 +3298,7 @@ int main(int argc, char** argv) {
     const bool smooth_log = cli_smooth_log || std::getenv("SPIKEOUT_SMOOTH_LOG") != nullptr;
     double smooth_log_clock = 0, smooth_log_sum = 0, smooth_log_sq = 0, smooth_log_draw = 0, smooth_log_present = 0,
            smooth_log_longest = 0;
+    double smooth_log_match = 0, smooth_log_blend = 0; // (of the 3D's time: matching a new pair, blending)
     uint64_t smooth_log_n = 0, smooth_log_between = 0;
     // The arcade's test and service buttons, held for a moment from the menu.
     auto test_until = std::chrono::steady_clock::time_point{}, service_until = test_until;
@@ -7037,15 +7038,17 @@ int main(int argc, char** argv) {
                 const double spread = std::sqrt(std::max(0.0, smooth_log_sq / static_cast<double>(smooth_log_n) - mean * mean));
                 const double pictures = static_cast<double>(std::max<uint64_t>(pictures_shown, 1));
                 std::fprintf(smooth_log_file, "smooth motion: %llu pictures (%llu between frames) a second; the clock %.3f frames a picture, "
-                            "spread %.3f; a picture %.2f ms drawing the 3D, %.2f presenting, %.1f apart at most; the display "
-                            "%.1f Hz; frames %llu; %zu polygons, render scale %d\n",
+                            "spread %.3f; a picture %.2f ms drawing the 3D (%.2f matching, %.2f blending), %.2f presenting, "
+                            "%.1f apart at most; the display %.1f Hz; frames %llu; %zu polygons, render scale %d\n",
                             static_cast<unsigned long long>(pictures_shown), static_cast<unsigned long long>(smooth_log_between),
-                            mean, spread, 1000.0 * smooth_log_draw / pictures, 1000.0 * smooth_log_present / pictures,
+                            mean, spread, 1000.0 * smooth_log_draw / pictures, 1000.0 * smooth_log_match / pictures,
+                            1000.0 * smooth_log_blend / pictures, 1000.0 * smooth_log_present / pictures,
                             1000.0 * smooth_log_longest, 1.0 / smooth.picture_seconds,
                             static_cast<unsigned long long>(fps_frames), gpu_frame.scene.polygons.size(), draw_scale);
                 std::fflush(smooth_log_file);
             }
             smooth_log_sum = smooth_log_sq = smooth_log_draw = smooth_log_present = smooth_log_longest = 0;
+            smooth_log_match = smooth_log_blend = 0;
             smooth_log_n = smooth_log_between = 0;
             fps_start = now;
             fps_frames = 0;
@@ -7093,6 +7096,7 @@ int main(int argc, char** argv) {
                         const float tf = static_cast<float>(std::max(t, 0.0));
                         if (guess) between = m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between);
                         else {
+                            const auto match_at = std::chrono::steady_clock::now();
                             if (smooth.blend_before != smooth.before_number || smooth.blend_number != gpu_frame.number ||
                                 smooth.blend_version != gpu_frame.version) { // a new pair: matched once
                                 smooth.blend_on = smooth.blend.prepare(smooth.before, gpu_frame.scene, !camera_only);
@@ -7100,8 +7104,13 @@ int main(int argc, char** argv) {
                                 smooth.blend_number = gpu_frame.number;
                                 smooth.blend_version = gpu_frame.version;
                             }
+                            const auto blend_at = std::chrono::steady_clock::now();
                             between = smooth.blend_on;
                             if (between) smooth.blend.draw(tf, smooth.between);
+                            if (smooth_log) {
+                                smooth_log_match += std::chrono::duration<double>(blend_at - match_at).count();
+                                smooth_log_blend += std::chrono::duration<double>(std::chrono::steady_clock::now() - blend_at).count();
+                            }
                         }
                         if (between) {
                             real3d_gpu->render(smooth.between, texture_copy, textures_version);
