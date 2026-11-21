@@ -205,6 +205,18 @@ rate on such screens only).
    hashes as main; the window on Phoenix's deck: every picture blended at 100 and at 144, the 3D 0.8-1.7 ms.
    Still to do in step 2: the gates, machines, curtain and traffic seen moving in a replay.
 3. The characters' bones.
+   BUILT (2026-11-21), without a hook in the recompiled code: games/spikeofe_camera reads the live bodies' bone
+   matrices each frame (the 20 records, +860: the root then the 19 drawn, 48 bytes each, the game's layout: the turn
+   column by column, then the place); a scene keeps both the last read and the one before (Real3dScene::bodies,
+   bodies_before). A model whose turn is a bone's (each entry within 0.001) and whose place is within 1 unit of it
+   is keyed by (body, bone) and found in the frame before by that key, no address or nearest guessing. Measured: the
+   3D draws the bones of the read before (103 of 103 limbs on Phoenix's deck match that read, almost none the
+   current one, as the decompile said). Tied a frame: the deck ~104, the helicopter ~140, the gate ~60, seg3's crowd
+   ~148. Halfway: four fighters close together (seg3 63651) each between its own two poses. The "copies alike"
+   left (~15 a frame in seg3) are effects lying on the ground at the fighters' feet (one model, many copies; they
+   never move, so the newer frame is exact). A shadow (a one-polygon model under a body's root) would be keyed by
+   (body, its model); whether the game's shadows are one polygon isn't checked. Smooth off hashes as main; the
+   window: 99-100 of 100 pictures blended.
 4. The pacer: a picture each refresh, the VRR multiple, the weights from present times.
    FIRST PART DONE (2026-11-21): a picture each refresh, whatever the rate (the 120 cap gone; SPIKEOUT_SMOOTH_HZ=N
    forces N for tests). Measured on the 99.95 Hz screen: 100 a second, each 0.576 of a frame on (spread 0.02); forced

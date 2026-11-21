@@ -347,6 +347,46 @@ bool same_linear_bits(const Mat4& a, const Mat4& b) {
     return true;
 }
 
+// Which body and bone a model is drawn on: the bone (of the bodies the scene
+// was drawn with, read the frame before, or failing that this frame's) with
+// its turn (within kBoneTurn, the game's layout: column by column) nearest
+// its place (within kBoneReach); a shadow (one polygon, untied) by the body
+// whose feet it's under, with its own model's address. kNoKey: none.
+constexpr uint64_t kNoKey = ~0ull;
+constexpr uint64_t kShadowBone = 0xFF;
+uint64_t body_key(const Real3dScene& scene, const Real3dScene::Model& model, const Affine& place) {
+    if (scene.bodies.empty() && scene.bodies_before.empty()) return kNoKey;
+    Parts parts{};
+    if (!decompose(place.l, parts) || parts.mirrored) return kNoKey;
+    const Mat3 r = rotation(parts.q);
+    for (const auto* bodies : {&scene.bodies_before, &scene.bodies}) {
+        uint64_t key = kNoKey;
+        float nearest = kBoneReach;
+        for (const Real3dScene::GameBody& body : *bodies)
+            for (size_t bone = 0; bone < body.bones.size(); ++bone) {
+                const auto& m = body.bones[bone];
+                const float dt = distance(place.t, {m[9], m[10], m[11]});
+                if (dt >= nearest) continue;
+                bool same = true;
+                for (size_t c = 0; c < 3 && same; ++c)
+                    for (size_t row = 0; row < 3 && same; ++row) same = std::fabs(r[c][row] - m[c * 3 + row]) < kBoneTurn;
+                if (!same) continue;
+                nearest = dt;
+                key = uint64_t{body.slot} << 40 | uint64_t{bone} << 32;
+            }
+        if (key != kNoKey) return key;
+    }
+    if (model.polygon_count != 1) return kNoKey;
+    for (const auto* bodies : {&scene.bodies_before, &scene.bodies})
+        for (const Real3dScene::GameBody& body : *bodies) {
+            const auto& root = body.bones[0];
+            const float dx = place.t[0] - root[9], dz = place.t[2] - root[11];
+            if (dx * dx + dz * dz < kShadowReach * kShadowReach)
+                return uint64_t{body.slot} << 40 | kShadowBone << 32 | (model.address & 0xFFFFFF);
+        }
+    return kNoKey;
+}
+
 } // namespace
 
 struct CameraBlend::Data {
@@ -491,6 +531,18 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
         return false;
     };
 
+    // The characters: each model drawn on a body's bone keyed by (slot, bone),
+    // a shadow (one polygon at a body's feet) by (slot, kShadowBone); those
+    // in b are found in a by that key, no guessing (identical enemies side by
+    // side included).
+    // (a model drawn twice in one place, as two detail levels cross-fade, is one key: the first kept)
+    std::unordered_map<uint64_t, Affine> a_keyed;
+    for (const Real3dScene::Model& model : a.models)
+        if (model.viewport < a_known.size() && a_known[model.viewport] && !built_each_frame(model)) {
+            const Affine place = a_unview[model.viewport] * affine(model.matrix);
+            if (const uint64_t key = body_key(a, model, place); key != kNoKey) a_keyed.emplace(key, place);
+        }
+
     // The limbs (anything drawn with a matrix a skin may share), by viewport and matrix.
     std::vector<size_t> skins;
     for (size_t i = 0; i < b.models.size(); ++i) {
@@ -504,9 +556,17 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
         const Data::View& view = d.views[model.viewport];
         const Affine place = view.unview * affine(model.matrix);
         float d1 = 0, d2 = 0;
-        const Affine* nearest = nearest_of(find(before, model.address), place, d1, d2);
-        bool flipbook = false;
-        if ((!nearest || d1 > kModelMatch) && model.animation) {
+        const Affine* nearest = nullptr;
+        bool flipbook = false, tied = false;
+        if (const uint64_t key = body_key(b, model, place); key != kNoKey)
+            if (const auto it = a_keyed.find(key); it != a_keyed.end()) { // a body's limb or shadow: the same one
+                nearest = &it->second;
+                d1 = distance(nearest->t, place.t);
+                d2 = 1e30f;
+                tied = true;
+            }
+        if (!tied) nearest = nearest_of(find(before, model.address), place, d1, d2);
+        if (!tied && (!nearest || d1 > kModelMatch) && model.animation) {
             // Another model of its animation (a flipbook's next frame) where it was: the place blended, this
             // frame's model drawn.
             nearest = nearest_of(find(before_animation, model.animation), place, d1, d2);
@@ -523,6 +583,7 @@ bool CameraBlend::prepare(const Real3dScene& a, const Real3dScene& b, bool model
             plan.ta = nearest->t;
             plan.tb = place.t;
             ++(flipbook ? s.flipbook : s.blended);
+            s.tied += tied;
         } else ++s.newer;
     }
     // A skin moves as the limb on its bone: drawn with the same turn (bit for

@@ -75,6 +75,24 @@ void SpikeoutCamera::read(std::span<const uint8_t> ram, Real3dScene& scene) {
     }
     scene.placed = placed_now_;
     scene.placed.insert(scene.placed.end(), placed_before_.begin(), placed_before_.end());
+
+    // The live bodies' bones.
+    std::vector<Real3dScene::GameBody> skeletons;
+    for (uint32_t s = 0; s < bodies.size(); ++s) {
+        if (bodies[s].word0 == 0) continue;
+        const uint32_t base = s < kPlayerSlots ? kPlayers + kBodyStride * s : kEnemies + kBodyStride * (s - kPlayerSlots);
+        Real3dScene::GameBody& body = skeletons.emplace_back();
+        body.slot = static_cast<uint8_t>(s);
+        for (uint32_t b = 0; b < Real3dScene::kGameBones; ++b)
+            for (uint32_t k = 0; k < 12; ++k)
+                body.bones[b][k] = std::bit_cast<float>(word(ram, base + kBodyBones + 48 * b + 4 * k));
+    }
+    if (skeletons != skeletons_) {
+        skeletons_before_ = std::move(skeletons_);
+        skeletons_ = std::move(skeletons);
+    }
+    scene.bodies = skeletons_;
+    scene.bodies_before = skeletons_before_;
 }
 
 } // namespace m3::games

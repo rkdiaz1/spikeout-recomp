@@ -31,6 +31,7 @@ void spikeout_camera(std::span<const uint8_t> ram, Real3dScene::GameCamera& out)
 constexpr uint32_t kPlayers = 0x1A0000, kEnemies = 0x1B0000, kBodyStride = 0x4000;
 constexpr uint32_t kPlayerSlots = 4, kEnemySlots = 16;
 constexpr uint32_t kBodyPlace = 896;      // its place in the world (3 floats)
+constexpr uint32_t kBodyBones = 860;      // its bones' matrices in the world, 48 bytes each: the root, then the 19 drawn
 constexpr uint32_t kBodyRespawn = 16162;  // a byte set to kRespawned when it's put back on the ground, then counting down
 constexpr uint8_t kRespawned = 216;
 constexpr float kBodyJump = 1.5f;         // world units in a frame: more is a placement (fastest move seen 0.95)
@@ -55,6 +56,7 @@ private:
     std::array<Body, kPlayerSlots + kEnemySlots> bodies_{};
     bool bodies_read_ = false;
     std::vector<std::array<float, 3>> placed_now_, placed_before_;
+    std::vector<Real3dScene::GameBody> skeletons_, skeletons_before_;
 };
 
 } // namespace m3::games

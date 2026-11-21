@@ -80,6 +80,11 @@ constexpr float kMaxTurn = 90.0f;  // degrees in a frame
 // appeared, moved too far) or copies alike (rain, splashes: which is which
 // can't be told): drawn where it is in the newer scene. So is a model near a
 // body the game put down in one jump (Real3dScene::placed: made, respawned).
+// The characters (step 3): a model drawn on a body's bone (Real3dScene::
+// bodies_before: the bones the scene was drawn with; its turn the bone's, its
+// place near the bone's) is keyed by (body, bone), a shadow (one polygon
+// under a body's root) by (body, its model), and found in a by that key, no
+// guessing: identical enemies side by side can't be mixed up.
 // A skin (a model in polygon RAM: the game builds a joint's skin each frame,
 // its address packed by whoever draws) isn't matched: it moves as the limb on
 // its bone (drawn with the same turn, bit for bit, within kSkinReach); none
@@ -89,6 +94,7 @@ struct CameraInterpStats {
     std::size_t viewports = 0; // moved by the blended camera
     std::size_t models = 0;    // in them
     std::size_t blended = 0;   // of those, found and their place blended
+    std::size_t tied = 0;      // of those, a body's limb or shadow found by its body and bone
     std::size_t still = 0;     // found, in the same place
     std::size_t flipbook = 0;  // another model of its animation found where it was: its place blended
     std::size_t newer = 0;     // not found: as in the newer scene
@@ -130,5 +136,8 @@ constexpr float kModelSame = 0.01f;      // world units: the same place
 constexpr float kMaxModelTurn = 120.0f;  // degrees in a frame (a helicopter's rotor turns 48)
 constexpr float kPlacedRadius = 2.5f;    // world units round a body put down in one jump: its limbs, its shadow
 constexpr float kSkinReach = 1.0f;       // a skin's limb: the nearest with its turn, this near (seen 0.01-0.2)
+constexpr float kBoneTurn = 1e-3f;       // a model on a body's bone: its turn the bone's, this near (each entry)
+constexpr float kBoneReach = 1.0f;       // and its place within this of the bone's
+constexpr float kShadowReach = 0.5f;     // a shadow: under its body's root, this near across the ground
 
 } // namespace m3

@@ -164,6 +164,18 @@ struct Real3dScene {
     // frame before (made, lifted, respawned, snapped back), in the world, as
     // its code reads them (games/spikeofe_camera); cleared by the builder.
     std::vector<std::array<float, 3>> placed;
+    // Smooth motion: the game's bodies (players, enemies) with their bones'
+    // matrices in the world (the game's layout: the turn column by column,
+    // then the place), as read after this scene's frame and after the one
+    // before (the 3D draws bodies a frame late; which one a model was drawn
+    // with is told by comparing); cleared by the builder.
+    static constexpr int kGameBones = 20; // the root, then the 19 drawn
+    struct GameBody {
+        uint8_t slot = 0;
+        std::array<std::array<float, 12>, kGameBones> bones{};
+        bool operator==(const GameBody&) const = default;
+    };
+    std::vector<GameBody> bodies, bodies_before;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;
