@@ -694,3 +694,10 @@ if(SPIKEOUT_BUILD_TESTS)
         add_test(NAME boot_rom COMMAND boottest ${SPIKEOUT_ROM_DIR})
     endif()
 endif()
+
+# input-lag (Windows): a virtual pad's button to the screen, in any program's
+# window (tools/input-lag/README.md). Off by default: it fetches ViGEmClient.
+option(SPIKEOUT_INPUT_LAG "Build the input-lag test tool (Windows)" OFF)
+if(SPIKEOUT_INPUT_LAG AND WIN32)
+    add_subdirectory(tools/input-lag)
+endif()
