@@ -93,6 +93,30 @@ void SpikeoutCamera::read(std::span<const uint8_t> ram, Real3dScene& scene) {
     }
     scene.bodies = skeletons_;
     scene.bodies_before = skeletons_before_;
+
+    // The live effects (frames left not 0), this read's and the one before (kept as the bodies are).
+    std::vector<Real3dScene::GameEffect> effects;
+    const uint32_t list = word(ram, kEffectList) & 0xFFFFFF;
+    if (list != 0 && list + kEffects * kEffectStride <= ram.size())
+        for (uint32_t e = 0; e < kEffects; ++e) {
+            const uint32_t at = list + kEffectStride * e;
+            const uint8_t left = ram[at + kEffectLeft];
+            if (left == 0) continue;
+            Real3dScene::GameEffect& effect = effects.emplace_back();
+            effect.index = static_cast<uint8_t>(e);
+            effect.kind = ram[at + kEffectKind];
+            effect.left = left;
+            effect.heading = static_cast<uint16_t>(ram[at + kEffectHeading] << 8 | ram[at + kEffectHeading + 1]);
+            for (uint32_t k = 0; k < 3; ++k) effect.place[k] = std::bit_cast<float>(word(ram, at + 4 * k));
+            const uint32_t kind_at = kEffectKinds + kEffectKindStride * effect.kind + kEffectKindPull;
+            effect.pull = kind_at + 4 <= ram.size() ? std::bit_cast<float>(word(ram, kind_at)) : 0.0f;
+        }
+    if (effects != effects_) {
+        effects_before_ = std::move(effects_);
+        effects_ = std::move(effects);
+    }
+    scene.effects = effects_;
+    scene.effects_before = effects_before_;
 }
 
 } // namespace m3::games

@@ -36,6 +36,13 @@ constexpr uint32_t kBodyRespawn = 16162;  // a byte set to kRespawned when it's 
 constexpr uint8_t kRespawned = 216;
 constexpr float kBodyJump = 1.5f;         // world units in a frame: more is a placement (fastest move seen 0.95)
 
+// The effects: a list of 40 records, 24 bytes each, at the address in kEffectList; each kind's line (20 bytes) in
+// kEffectKinds (the decompile's effect_draw_all / effect_draw_one; docs/smooth-motion.md).
+constexpr uint32_t kEffectList = 0x104058; // a word: where the list is
+constexpr uint32_t kEffects = 40, kEffectStride = 24;
+constexpr uint32_t kEffectKind = 12, kEffectLeft = 13, kEffectHeading = 16; // (+0: its place, 3 floats)
+constexpr uint32_t kEffectKinds = 0x93424, kEffectKindStride = 20, kEffectKindPull = 8;
+
 // Reads the camera after each frame and keeps the one before: a scene's
 // game_camera and game_camera_before; and the bodies put down in one jump
 // (Real3dScene::placed: those of this read and the one before, as the 3D
@@ -57,6 +64,7 @@ private:
     bool bodies_read_ = false;
     std::vector<std::array<float, 3>> placed_now_, placed_before_;
     std::vector<Real3dScene::GameBody> skeletons_, skeletons_before_;
+    std::vector<Real3dScene::GameEffect> effects_, effects_before_;
 };
 
 } // namespace m3::games

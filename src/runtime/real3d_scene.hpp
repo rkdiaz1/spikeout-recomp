@@ -176,6 +176,17 @@ struct Real3dScene {
         bool operator==(const GameBody&) const = default;
     };
     std::vector<GameBody> bodies, bodies_before;
+    // The game's effects (sparks, dust, trails: each drawn turned to the camera, games/spikeofe_camera), this read's
+    // and the one before: the record's index (of the game's list), kind, frames left, its place, its own heading (a
+    // 16-bit angle) and how far it's drawn toward the eye (its kind's).
+    struct GameEffect {
+        uint8_t index = 0, kind = 0, left = 0;
+        uint16_t heading = 0;
+        std::array<float, 3> place{};
+        float pull = 0;
+        bool operator==(const GameEffect&) const = default;
+    };
+    std::vector<GameEffect> effects, effects_before;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;

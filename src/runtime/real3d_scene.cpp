@@ -155,6 +155,8 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
     scene.placed.clear();
     scene.bodies.clear();
     scene.bodies_before.clear();
+    scene.effects.clear();
+    scene.effects_before.clear();
     models_.clear();
     viewport_models_.clear();
     visits_ = 0;

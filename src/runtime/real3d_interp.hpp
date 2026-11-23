@@ -106,6 +106,9 @@ struct CameraInterpStats {
     std::size_t newer = 0;     // not found: as in the newer scene
     std::size_t ambiguous = 0; // copies alike: as in the newer scene
     std::size_t shadows = 0;   // flat under a body: moved with their bone across the ground
+    std::size_t billboards = 0; // facing the eye (effects): kept facing it, their place seen through the blended camera
+    std::size_t billboards_moved = 0; // of those, found in the frame before: their place blended too
+    std::size_t billboards_exact = 0; // of those, the game's effect record found: rebuilt as the game draws it
     std::size_t placed = 0;    // near a body put down in one jump: as in the newer scene
     std::size_t skins = 0;     // moved with their limb
     std::size_t skins_near = 0; // of those, no limb with their turn: with the nearest model
@@ -148,5 +151,9 @@ constexpr float kBoneTurn = 1e-3f;       // a model on a body's bone: its turn t
 constexpr float kBoneReach = 1.0f;       // and its place within this of the bone's
 constexpr float kShadowReach = 1.5f;     // a shadow: a body's bone this near across the ground (seen to 1.4)
 constexpr float kShadowFlat = 0.99f;     // and its up axis this near straight up
+constexpr float kBodyPair = 1.5f;        // a body's root, from one frame to the next, at most this far (else put down)
+constexpr float kBodySameRecord = 0.2f;  // pairing bodies: the same record (slot) preferred by this much
+constexpr float kBillboardFace = 1e-3f;  // a billboard's axes, across or along the view axis this near (seen 0.000)
+constexpr float kEffectOffset = 1.0f;    // an effect's piece, from its pulled place, at most (seen 0 to 0.81)
 
 } // namespace m3

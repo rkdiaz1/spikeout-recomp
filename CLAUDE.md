@@ -31,9 +31,17 @@ Read docs/smooth-motion.md first: the plan, every step's state, measurements and
   models per body) moved with their bone across the ground, bodies put down in one jump drawn as the newer frame.
 - PROOF RULES (the owner's): smooth off must stay identical to main by GPU picture hashes (gamerun --load-state
   build\bot\run2\bot-19700.state --frames 20700 --no-sound --renderer gpu --gpu-scale 2 --gpu-hash-frames
-  --screenshot X.png -> 6802950d37b121a4; bot-5600 --frames 6200 -> 5e596bef0a25394f). Halfway pictures:
-  gamerun --interp --renderer gpu --gpu-scale 1 --screenshot X.png --shot-every 1 writes X-N-before/-mid/N.png
-  (scale 1 only). LOOK AT CHARACTERS ENLARGED: a halfway picture at full size hid a broken White.
+  --screenshot X.png -> 03276d057442b487; bot-5600 --frames 6200 -> 3f89cabdb940a58a; main's own build gives the
+  same on 2026-11-23: the 2026-11-21 values, 6802950d37b121a4 and 5e596bef0a25394f, changed with this PC, likely its
+  GPU driver; check main's build when they differ). Halfway pictures:
+  gamerun --interp --renderer gpu --gpu-scale 1 --screenshot X.png --shot-every 1 [--shot-from N] writes
+  X-N-before/-mid/N.png (scale 1 only). LOOK AT CHARACTERS ENLARGED: a halfway picture at full size hid a broken White.
+  Ghosts: Z:\Emu\tmp\ghostscore.ps1 -Dir D -From A -To B scores each halfway picture by its pixels outside both
+  neighbours' range and lists the spikes (outside the repository). The owner's play, recorded (spikeout --record F)
+  and replayed (gamerun --replay F), reproduces what they saw exactly.
+- EFFECTS (2026-11-23): rebuilt as the game draws them from its effect records (docs/smooth-motion.md "EFFECTS,
+  REBUILT"); SPIKEOUT_INTERP_DEBUG=1 prints each one's match and the "effect check" (rebuilt for the frame before
+  against where the game drew it: all within 0.001 on stage 1, stage 3 and the owner's recording).
 - TEST STATES (git-ignored, the main checkout's build/): build\bot\run2\bot-19700 (docks), -22700 (Phoenix's
   deck), -20600 (helicopter), run1\bot-12800 (coast car park), gate2\bot-15500, bot-5600 (stage 1, shakes at
   5803 and 8323), fullrec3\owner-62721.state + build\linkstudy\seg3\inputs.bin (seg3 replayed exactly: a crowd of

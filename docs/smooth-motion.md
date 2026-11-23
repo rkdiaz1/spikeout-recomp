@@ -226,6 +226,45 @@ rate on such screens only).
    place. The key is now (body, bone, the model's address); a model swapped on its bone (a head's or hand's) is
    found by the bone alone only when the frame before had one model there. Halfway pictures of seg3's crowd, the
    deck and the helicopter fights: every fighter whole.
+   FIXED 2026-11-22 (the owner saw an enemy "flash like a ghost" in the window, stage 1's camp after the door; found in
+   the owner's recording, spikeout --record, replayed by gamerun --replay, 71/71 hashes): two identical soldiers side
+   by side swap their models' copies between frames (each drawn from the other's copy the next frame; their body
+   records stay). Matched by address, each soldier's limbs took the other's place, both were drawn in the middle and
+   one vanished for a picture (frames 3150, 3156, 3403; at 3150 64 of 148 limbs untied). Now a limb found on its body
+   and bone pairs with any model of that body's bone in the frame before when its address isn't there (it moves
+   through the skeleton either way); and bodies are paired between frames by their root's place (pair_bodies; the
+   same record preferred by 0.2 units, within 1.5), not by record, should the game ever swap records. Frame 3150:
+   147 limbs tied, both soldiers whole. The recording's 1,500 halfway pictures (2800-4299): 19 changed (those
+   frames, a few limbs elsewhere), every frame and "before" picture identical. Found with a script that scores
+   each halfway picture by its pixels outside both neighbours' range and lists the spikes (Z:\Emu\tmp\ghostscore.ps1,
+   outside the repository); SPIKEOUT_INTERP_DEBUG=1 prints each limb's matching; gamerun --shot-from N.
+   Still there, another kind: a pillar coming into view at the picture's edge drawn wider halfway than in either
+   frame (3511, 3465 of the recording); not looked into yet.
+   EFFECTS, REBUILT AS THE GAME DRAWS THEM (2026-11-22/23; the owner chose the exact way over blending the spin).
+   The game turns each effect to the camera every frame (sparks, dust, fire, trails; the decompile's
+   effect_draw_all / effect_draw_one), so a halfway picture must turn it to the camera between, not blend it.
+   games/spikeofe_camera reads the effect list each frame (40 records of 24 bytes at the address in 0x104058: place,
+   kind, frames left, heading; each kind's pull toward the eye at 0x93424 + 20 kind + 8), this read's and the one
+   before (Real3dScene::effects, effects_before). Measured (gamerun SPIKEOUT_EFFECTS_TRACE=1, stage 1 3501-6500), each
+   model turned to the eye (facing_eye) is a piece of a record: at the record's place pulled its pull toward the eye,
+   or at its own offset from there in the effect's turned frame (mostly along its own up: 0.25 footstep dust, 0.81
+   kind 12; the dust has two or three puffs a little to the side; kind 18's piece moves out 0.028 a frame); its roll
+   in eye space its heading (65536 a turn) less the camera's (atan2 of its forward across the ground), plus 180
+   degrees, plus a spin some kinds add as they age (the dust about 0.4 degrees a frame). CameraBlend matches each such
+   model to its record (find_effect: within 1.0, the offset least to the side of its own up) and the same record a
+   frame older in a (index and frames left), with a's piece at the nearest own offset; a halfway picture puts it at
+   the record's place between, pulled toward the eye between, turned by its heading's change less the camera's plus
+   its spin's change, its piece's own offset blended. Models turned to the eye with no record (the map screen's
+   markers) keep the earlier handling: their turn as in the newer frame, their place through the blended camera.
+   Proved (SPIKEOUT_INTERP_DEBUG=1, "effect check": each effect rebuilt for the frame before's moment against where
+   the game drew it there): stage 1 3,200 effects from their records, 3,000 checked, all within 0.001 (worst 0);
+   stage 3 (seg3, 62722-68000) 11,662 and 10,950; the owner's recording 5,321 and 4,972; every kind seen (6, 12, 14,
+   16, 17, 18, 19, 21, 23, 24, 35). For pieces that move out as they age the check takes a's own offset, so it proves
+   their place, pull and turn, not the offset. Smooth off: main's hashes (below). Network effect: none (drawing only;
+   the records only read).
+   THE HAND-OFF'S REFERENCE HASHES were stale: on 2026-11-23 main's own build (b8bb16b, Z:\Emu\tmp\wt-smooth-base)
+   gives bot-19700 --frames 20700: 03276d057442b487 and bot-5600 --frames 6200: 3f89cabdb940a58a (render scale 2), as
+   this branch does with smooth off (likely a GPU driver update since 2026-11-21).
    SHADOWS (corrects the line above: those "copies alike" at the fighters' feet were the shadows): the game draws
    each body's shadow as many 5-polygon models, flat on the ground, in a ring up to ~1.4 units round its feet. A
    flat model (its up axis within 0.99 of straight up) not found or alike, within 1.5 units of a body's bone across

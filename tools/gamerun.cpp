@@ -367,6 +367,7 @@ struct Options {
     const char* screenshot = nullptr;
     const char* wav = nullptr;
     uint64_t shot_every = 0, tilegen_trace = 0;
+    uint64_t shot_from = 0; // --shot-from FRAME: --shot-every's pictures only from that frame on
     int probe_x = -1, probe_y = -1;
     int sound_volume = 100, music_volume = 100;
     uint64_t probe_frame = 0;
@@ -2053,19 +2054,97 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                             double across = 1e30;
                             for (const auto& body : s1.bodies_before)
                                 across = std::min(across, std::hypot(p[0] - body.bones[0][9], p[2] - body.bones[0][11]));
-                            std::printf("  named model %u: %u polygons at %.2f %.2f %.2f, %.2f from a body's root\n", model.number,
-                                        model.polygon_count, p[0], p[1], p[2], across);
+                            const auto& mm = model.matrix.m; // (and its turn in eye space: the three axes, each its length)
+                            auto axis = [&](int k) {
+                                const double x = mm[static_cast<size_t>(k * 4)], y = mm[static_cast<size_t>(k * 4 + 1)],
+                                             z = mm[static_cast<size_t>(k * 4 + 2)];
+                                const double n = std::sqrt(x * x + y * y + z * z);
+                                return std::array<double, 4>{x / n, y / n, z / n, n};
+                            };
+                            const auto ax = axis(0), ay = axis(1), az = axis(2);
+                            std::printf("  named model %u: %u polygons at %.2f %.2f %.2f, %.2f from a body's root; eye axes "
+                                        "x(%.3f %.3f %.3f)*%.2f y(%.3f %.3f %.3f)*%.2f z(%.3f %.3f %.3f)*%.2f\n",
+                                        model.number, model.polygon_count, p[0], p[1], p[2], across, ax[0], ax[1], ax[2], ax[3],
+                                        ay[0], ay[1], ay[2], ay[3], az[0], az[1], az[2], az[3]);
                         }
                     }
+                    // (SPIKEOUT_EFFECTS_TRACE: each model turned to the eye against the game's effect records: the
+                    // record whose place, drawn its pull toward the eye, lands on it (this read's or the one before's),
+                    // how far, and its roll in eye space beside the record's heading and the camera's)
+                    static const bool effects_trace = std::getenv("SPIKEOUT_EFFECTS_TRACE") != nullptr;
+                    if (effects_trace)
+                        for (const auto& model : s1.models) {
+                            if (model.viewport >= s1.viewports.size()) continue;
+                            const auto& mm = model.matrix.m;
+                            auto part = [&](int col, int row) { return static_cast<double>(mm[static_cast<size_t>(col * 4 + row)]); };
+                            auto len = [&](int col) { return std::sqrt(part(col, 0) * part(col, 0) + part(col, 1) * part(col, 1) + part(col, 2) * part(col, 2)); };
+                            if (std::fabs(part(2, 0)) / len(2) > 1e-3 || std::fabs(part(2, 1)) / len(2) > 1e-3 ||
+                                std::fabs(part(0, 2)) / len(0) > 1e-3 || std::fabs(part(1, 2)) / len(1) > 1e-3)
+                                continue;
+                            // the camera: world -> eye x = R w + t; the eye at -R^T t; its world forward R^T (0,0,-1)
+                            const auto& cm = s1.viewports[model.viewport].camera.m;
+                            auto R = [&](int row, int col) { return static_cast<double>(cm[static_cast<size_t>(col * 4 + row)]); };
+                            double eye[3], fwd[3], p[3];
+                            for (int k = 0; k < 3; ++k) {
+                                eye[k] = -(R(0, k) * cm[12] + R(1, k) * cm[13] + R(2, k) * cm[14]);
+                                fwd[k] = -R(2, k);
+                            }
+                            const double e[3] = {mm[12] - cm[12], mm[13] - cm[13], mm[14] - cm[14]};
+                            for (int k = 0; k < 3; ++k) p[k] = R(0, k) * e[0] + R(1, k) * e[1] + R(2, k) * e[2]; // R^T (x - t), R a rotation
+                            double best = 1e30;
+                            const m3::Real3dScene::GameEffect* found = nullptr;
+                            const char* which = "";
+                            int pull_way = 0; // the pull that fits: toward the eye (1), none (0), away (-1)
+                            for (const auto* list : {&s1.effects, &s1.effects_before})
+                                for (const auto& fx : *list)
+                                    for (const int way : {1, 0, -1}) {
+                                        double to[3], n = 0;
+                                        for (int k = 0; k < 3; ++k) to[k] = eye[k] - fx.place[static_cast<size_t>(k)], n += to[k] * to[k];
+                                        n = std::sqrt(n);
+                                        double dd = 0;
+                                        for (int k = 0; k < 3; ++k) {
+                                            const double q = fx.place[static_cast<size_t>(k)] + (n > 0 ? static_cast<double>(way) * fx.pull * to[k] / n : 0);
+                                            dd += (q - p[k]) * (q - p[k]);
+                                        }
+                                        if (std::sqrt(dd) < best)
+                                            best = std::sqrt(dd), found = &fx, pull_way = way,
+                                            which = list == &s1.effects ? "this read" : "the read before";
+                                    }
+                            if (best > 2) continue; // (not an effect: the radar's arrows and such)
+                            double off[3] = {0, 0, 0}; // what's left: the model's place less the record's, pulled toward the eye
+                            if (found) {
+                                double to[3], n = 0;
+                                for (int k = 0; k < 3; ++k) to[k] = eye[k] - found->place[static_cast<size_t>(k)], n += to[k] * to[k];
+                                n = std::sqrt(n);
+                                for (int k = 0; k < 3; ++k)
+                                    off[k] = p[k] - found->place[static_cast<size_t>(k)] - (n > 0 ? found->pull * to[k] / n : 0);
+                            }
+                            const double roll = std::atan2(part(0, 1), part(0, 0)) * 180 / 3.14159265358979;
+                            { // the left over in eye space, then in the effect's own frame (the roll undone)
+                                double oe[3];
+                                for (int k = 0; k < 3; ++k) oe[k] = R(k, 0) * off[0] + R(k, 1) * off[1] + R(k, 2) * off[2];
+                                const double rr = -roll * 3.14159265358979 / 180, cs = std::cos(rr), sn = std::sin(rr);
+                                std::printf("  effect left over: world %.4f %.4f %.4f; eye %.4f %.4f %.4f; own %.4f %.4f %.4f\n", off[0],
+                                            off[1], off[2], oe[0], oe[1], oe[2], cs * oe[0] - sn * oe[1], sn * oe[0] + cs * oe[1], oe[2]);
+                            }
+                            const double cam_yaw = std::atan2(fwd[0], fwd[2]) * 180 / 3.14159265358979;
+                            if (found)
+                                std::printf("  effect: record %u kind %u left %u (%s) %.4f away, pull %.3f way %d; roll %.2f, heading %.2f, "
+                                            "camera %.2f\n", found->index, found->kind, found->left, which, best, found->pull,
+                                            pull_way, roll, found->heading * 360.0 / 65536.0, cam_yaw);
+                            else std::printf("  effect: no record (roll %.2f, camera %.2f)\n", roll, cam_yaw);
+                        }
                     const auto& c = s1.game_camera;
                     std::printf("frame %llu camera: eye %.3f %.3f %.3f look %.3f %.3f %.3f shake %.3f driver %u shot %u/%u; "
                                 "moved %.3f turned %.3f%s; %zu viewports, %zu models (%zu blended (%zu tied), %zu flipbook, %zu still, %zu newer, "
-                                "%zu alike, %zu shadows, %zu placed, %zu skins (%zu near, %zu shaped), %zu skins alone; %zu bodies placed)%s%s\n",
+                                "%zu alike, %zu shadows, %zu placed, %zu skins (%zu near, %zu shaped), %zu skins alone, %zu facing the eye "
+                                "(%zu moved, %zu from their records); %zu bodies placed)%s%s\n",
                                 static_cast<unsigned long long>(frame), c.eye[0], c.eye[1], c.eye[2], c.look[0], c.look[1],
                                 c.look[2], c.shake, c.driver, c.shot_timer, c.shot, camera_stats.eye_move, camera_stats.turn,
                                 camera_stats.lagged ? " (drawn a frame behind)" : "", camera_stats.viewports, camera_stats.models,
                                 camera_stats.blended, camera_stats.tied, camera_stats.flipbook, camera_stats.still, camera_stats.newer, camera_stats.ambiguous, camera_stats.shadows,
-                                camera_stats.placed, camera_stats.skins, camera_stats.skins_near, camera_stats.skins_shaped, camera_stats.skins_alone, s1.placed.size(),
+                                camera_stats.placed, camera_stats.skins, camera_stats.skins_near, camera_stats.skins_shaped, camera_stats.skins_alone,
+                                camera_stats.billboards, camera_stats.billboards_moved, camera_stats.billboards_exact, s1.placed.size(),
                                 camera_stats.cut != m3::CameraInterpStats::Cut::none ? "; a cut: " : "",
                                 kCuts[static_cast<int>(camera_stats.cut)]);
                     for (size_t v = 0; v < s1.viewports.size(); ++v) {
@@ -3026,7 +3105,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             for (uint32_t reg : {0x20u, 0x40u, 0x44u, 0x60u, 0x64u, 0x68u, 0x6Cu}) std::printf(" %02x=%08x", reg, m.bus.tile_reg(reg));
             std::printf("\n");
         }
-        if (o.screenshot && o.shot_every && frame % o.shot_every == 0 && !quiet) {
+        if (o.screenshot && o.shot_every && frame % o.shot_every == 0 && frame >= o.shot_from && !quiet) {
             const std::string path = board_path(o.screenshot, m.index);
             const size_t dot = path.find_last_of('.');
 #ifdef SPIKEOUT_GPU
@@ -3173,7 +3252,8 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
 #ifdef SPIKEOUT_GPU
         // --screen-shot WxH: the picture as the window shows it at that size, drawn by its own screen pass (the 3D at
         // --gpu-scale, the 2D layers scaled as --layers-2d says), read back: FILE-FRAME-screen.png
-        if (o.screen_shot && o.screenshot && o.shot_every && frame % o.shot_every == 0 && !quiet && m.presenter && m.gpu) {
+        if (o.screen_shot && o.screenshot && o.shot_every && frame % o.shot_every == 0 && frame >= o.shot_from && !quiet &&
+            m.presenter && m.gpu) {
             const std::string path = board_path(o.screenshot, m.index);
             const size_t dot = path.find_last_of('.');
             const int e = m.builder.extend();
@@ -4311,6 +4391,7 @@ int main(int argc_given, char** argv_given) {
         else if (arg == "--sound-volume" && i + 1 < argc) o.sound_volume = std::atoi(argv[++i]);
         else if (arg == "--music-volume" && i + 1 < argc) o.music_volume = std::atoi(argv[++i]);
         else if (arg == "--shot-every" && i + 1 < argc) o.shot_every = std::strtoull(argv[++i], nullptr, 0);
+        else if (arg == "--shot-from" && i + 1 < argc) o.shot_from = std::strtoull(argv[++i], nullptr, 0);
         else if (arg == "--boards" && i + 1 < argc) o.boards = std::max<std::size_t>(1, std::strtoull(argv[++i], nullptr, 0));
         else if (arg == "--slice" && i + 1 < argc) o.slice = std::max<uint32_t>(1, static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0)));
         else if (arg == "--link-latency" && i + 1 < argc) o.link_latency = std::strtoull(argv[++i], nullptr, 0);

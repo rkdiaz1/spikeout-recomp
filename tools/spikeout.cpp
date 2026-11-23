@@ -169,6 +169,19 @@ constexpr int kWidth = m3::TilegenRenderer::kWidth, kHeight = m3::TilegenRendere
 constexpr std::size_t kMaxBoards = 4;
 constexpr uint32_t kTurnLines = 8; // display lines a linked board runs before passing the turn on
 
+// The calling thread's name, for debuggers, crash dumps and per-thread measurements (Windows 10 1607 and later:
+// looked up at run time; elsewhere nothing).
+void name_this_thread([[maybe_unused]] const wchar_t* name) {
+#ifdef _WIN32
+    using Set = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const Set set = [] {
+        HMODULE k = GetModuleHandleW(L"kernel32.dll");
+        return k ? reinterpret_cast<Set>(reinterpret_cast<void*>(GetProcAddress(k, "SetThreadDescription"))) : nullptr;
+    }();
+    if (set) set(GetCurrentThread(), name);
+#endif
+}
+
 // Smooth motion's matching (m3::CameraBlend::prepare: which model in one frame is which in the next) on a thread of
 // its own, so no picture holds it (~1.7 ms in a fight: at 240 a second, a picture has 4.2). The window hands each new
 // frame's 3D scene over (`submit`, a copy, as it kept one before); the thread keeps the frame before, matches the pair
@@ -230,6 +243,7 @@ private:
         bool models = true;
     };
     void run() {
+        name_this_thread(L"smooth matching");
         m3::Real3dScene held; // the frame before (the last one matched)
         uint64_t held_number = ~0ull;
         for (;;) {
@@ -3294,7 +3308,10 @@ int main(int argc, char** argv) {
             shared.one_board_wanted = shared.one_board == Shared::OneBoard::always;
         }
         for (std::size_t i = 0; i < boards; ++i)
-            games.emplace_back([&, i] { run_game(roms, i, ring.get(), *turns, shared); });
+            games.emplace_back([&, i] {
+                name_this_thread(i == 0 ? L"game" : L"game (another board)");
+                run_game(roms, i, ring.get(), *turns, shared);
+            });
     };
     auto stop_games = [&] {
         shared.quit = true;
@@ -5803,7 +5820,15 @@ int main(int argc, char** argv) {
 
     uint64_t frames_seen = 0;
     uint64_t loops_run = 0;
+    // Tests (SPIKEOUT_SMOOTH_LOG): a pass of the loop that takes over 100 ms, its steps' times printed
+    std::vector<std::pair<const char*, std::chrono::steady_clock::time_point>> loop_laps;
+    auto lap = [&](const char* step) {
+        if (smooth_log) loop_laps.emplace_back(step, std::chrono::steady_clock::now());
+    };
+    name_this_thread(L"window");
     while (running) {
+        loop_laps.clear();
+        lap("start");
         if (++loops_run == 2) start_went_well(); // (the first picture shown: an update to this version went well)
 #ifdef SPIKEOUT_GPU
         // (F12's picture, drawn again by the presenter at the last present: written on a thread of its own, the game not
@@ -5867,8 +5892,11 @@ int main(int argc, char** argv) {
             const auto rest = due - clock::now() - std::chrono::milliseconds(1);
             if (rest > clock::duration::zero())
                 SDL_DelayPrecise(static_cast<Uint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(rest).count()));
+            lap("before the wait");
             while (clock::now() < due) std::this_thread::yield();
+            lap("waited");
             std::lock_guard<std::mutex> guard(shared.lock);
+            lap("the game's lock");
             frames_seen = shared.frames_done;
         } else {
             // The keys and pads read just before the game's next frame starts (Shared::next_due; a little before: the
@@ -7067,6 +7095,7 @@ int main(int argc, char** argv) {
 #ifdef SPIKEOUT_GPU
             // A newer frame for the GPU to draw (the swap leaves the older one
             // in its place, for the game thread to fill next).
+            lap("events, screens");
             const bool remade = shared.gpu_frame.number == gpu_frame.number && shared.gpu_frame.version > gpu_frame.version;
             if (shared.gpu_3d && (shared.gpu_frame.number > gpu_frame.number || remade)) {
                 if (remade) drawn_number = 0; // (its 3D drawn again)
@@ -7100,6 +7129,7 @@ int main(int argc, char** argv) {
                 }
                 shared.texture_rows.clear();
             }
+            lap("new frame taken");
 #endif
             const bool all_reported = shared.netplay ? (reported & (1u << shared.local)) != 0 : reported == (1u << boards) - 1;
             if (max_frames && all_reported) { // a test run: keep the last frames and close
@@ -7282,6 +7312,7 @@ int main(int argc, char** argv) {
                     drawn_number = gpu_frame.number;
                 }
                 const auto drawn_at = std::chrono::steady_clock::now();
+                lap("3D drawn");
                 const int extend = real3d_gpu->extend();
                 const bool wide = extend > 0 && extend == gpu_frame.extend &&
                                   gpu_frame.bottom_wide.size() == static_cast<std::size_t>(kWidth + 2 * extend) * kHeight;
@@ -7293,6 +7324,16 @@ int main(int argc, char** argv) {
                                               sky_shift_x, sky_shift_y);
                 if (smooth_log && smoothing) {
                     const auto presented_at = std::chrono::steady_clock::now();
+                    lap("presented");
+                    if (presented_at - loop_laps.front().second > std::chrono::milliseconds(100)) {
+                        std::string steps;
+                        for (size_t k = 1; k < loop_laps.size(); ++k)
+                            steps += std::string(k > 1 ? ", " : "") + loop_laps[k].first + " +" +
+                                     std::to_string(static_cast<int>(std::chrono::duration<double, std::milli>(
+                                         loop_laps[k].second - loop_laps[k - 1].second).count())) + " ms";
+                        std::fprintf(smooth_log_file, "smooth motion: a slow pass (frame %llu): %s\n",
+                                     static_cast<unsigned long long>(gpu_frame.number), steps.c_str());
+                    }
                     smooth_log_draw += std::chrono::duration<double>(drawn_at - smooth.last_picture).count();
                     smooth_log_present += std::chrono::duration<double>(presented_at - drawn_at).count();
                 }
