@@ -1,8 +1,10 @@
 #include "net/session.hpp"
 
+#include "net/compress.hpp"
 #include "net/event_log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <utility>
 
 namespace net {
 
@@ -37,7 +40,16 @@ enum Message : uint8_t { kWelcome = 1, kRoster = 2, kStart = 3, kSuspect = 4, kH
                         kWatchers = 22,     // (the host to the players: how many watch, and who)
                         kWatchMode = 23,    // (a spectator to the host: it runs one board: the players' backups wanted)
                         kStateSize = 24,    // (before kState: its size, for the receiver's progress)
-                        kNode = 25 };       // (its own board's part of a link packet, for one board a PC's check: Session::send_node)
+                        kNode = 25,         // (its own board's part of a link packet, for one board a PC's check: Session::send_node)
+                        // A joiner's state in chunks from several players (Session::share_capture): the host asks its
+                        // helpers to take every board's state at a frame (kShareAt), sends the joiner and them the plan
+                        // (kSharePlan: each chunk's hash and packed size, who sends it), each sends its chunks (kShareChunk)
+                        // or says which of them it can't (kShareCant: its own differ), the joiner asks the host for any
+                        // missing (kShareWant)
+                        kShareAt = 26, kSharePlan = 27, kShareChunk = 28, kShareCant = 29, kShareWant = 30,
+                        // A joiner that saw the game's Communication error just after its join: the host asked to save a report
+                        // of its own (its recording from the game's start: the room's history before the error; Session::ask_report)
+                        kWantReport = 31 };
 
 // Spectators (docs/netplay.md, "Spectators"): each talks to the room's host only, sending as kWatcherBase + its
 // number; the players never wait for them, nor count them. They take every seat's inputs from the host and run each
@@ -47,8 +59,10 @@ constexpr auto kWatchInfoEvery = std::chrono::milliseconds(1000);
 
 constexpr std::size_t kFragment = 1000;    // reliable payload a datagram
 constexpr std::size_t kWindow = 256;       // reliable fragments in flight (a save state: some MB)
+constexpr std::size_t kSackWords = kWindow / 64; // (an acknowledgement names which of the whole window it has: Reliable::Sack)
 constexpr uint64_t kTakeMargin = 8;        // frames ahead a cabinet is handed to the player taking it
 constexpr uint64_t kTakeAheadMost = 3600;  // (and asked for further ahead, by a joiner still catching up: a minute at most)
+constexpr uint64_t kSeatFrameEvery = 32; // (a seat taken in progress from a multiple of it: rollback keeps those frames, tools::rollback::kAlways)
 constexpr double kMeetGame = 57.52;        // (the game's frames a second, recomp::FrameTiming::kRefreshHz: the meeting's sum)
 // The authority fills the cabinets no player has (none pressed) this many frames past its own inputs. A one-board
 // machine's side runs read a cabinet's next frame's inputs before this machine's own of it are set (input delay 0:
@@ -173,22 +187,31 @@ struct Reliable {
     // Acknowledged: everything before `ack`, and of the 64 pieces after it, those `sack`'s bits name (bit i: ack + 1
     // + i) that came beyond the gap: only the pieces really lost are sent again (one lost piece no longer brings its
     // whole window again, which a slow line or a relay drops in turn).
-    void acked(uint32_t ack, uint64_t sack) {
-        while (!out.empty() && static_cast<int32_t>(out.front().seq - ack) < 0) out.pop_front();
-        if (!sack) return;
+    // (the whole window since 2026-11-24, kProtocol 4: 64 pieces before, every piece further past a lost one was sent
+    // again and counted lost, the pace halved over and over: a 2 MB/s line with 0.5% loss carried a joiner's state at
+    // 0.4-0.8 MB/s)
+    using Sack = std::array<uint64_t, kSackWords>;
+    void acked(uint32_t ack, const Sack& sack) {
+        while (!out.empty() && static_cast<int32_t>(out.front().seq - ack) < 0) {
+            if (out.front().ever_sent && !out.front().sacked) delivered += out.front().data.size() + 32;
+            out.pop_front();
+        }
+        if (sack == Sack{}) return;
         for (Fragment& f : out) {
             const int32_t d = static_cast<int32_t>(f.seq - ack) - 1;
             if (d < 0) continue;
-            if (d >= 64) break;
-            if (sack >> d & 1) f.sacked = true;
+            if (d >= static_cast<int32_t>(kWindow)) break;
+            if (!f.sacked && sack[static_cast<std::size_t>(d) / 64] >> (d % 64) & 1) f.sacked = true, delivered += f.data.size() + 32;
         }
     }
+    // Bytes the receiver has said it has, in all (the pace's measure of what the line carries: Impl::pace).
+    uint64_t delivered = 0;
     // What we have beyond the next piece expected, for the sender (acked's `sack`).
-    uint64_t sack_bits() const {
-        uint64_t bits = 0;
+    Sack sack_bits() const {
+        Sack bits{};
         for (const auto& [seq, piece] : early) {
             const int32_t d = static_cast<int32_t>(seq - rx_next) - 1;
-            if (d >= 0 && d < 64) bits |= uint64_t{1} << d;
+            if (d >= 0 && d < static_cast<int32_t>(kWindow)) bits[static_cast<std::size_t>(d) / 64] |= uint64_t{1} << (d % 64);
         }
         return bits;
     }
@@ -208,6 +231,25 @@ struct Reliable {
         return done;
     }
 };
+
+// An acknowledgement's pieces beyond the gap on the wire: how many of its words, up to its last not all clear (most
+// often none: one byte), then those words.
+void write_sack(Writer& w, const Reliable::Sack& sack) {
+    std::size_t n = sack.size();
+    while (n > 0 && sack[n - 1] == 0) --n;
+    w.u8(static_cast<uint8_t>(n));
+    for (std::size_t i = 0; i < n; ++i) w.u64(sack[i]);
+}
+Reliable::Sack read_sack(Reader& r) {
+    Reliable::Sack sack{};
+    const uint8_t n = r.u8();
+    if (n > sack.size()) {
+        r.skip(r.left() + 1); // (not ours: the reader failed)
+        return sack;
+    }
+    for (std::size_t i = 0; i < n; ++i) sack[i] = r.u64();
+    return sack;
+}
 
 struct Stream {
     bool known = false;
@@ -294,6 +336,8 @@ struct Session::Impl {
     // A rate for bulk sending (Impl::cap_take): bytes a second, and the bytes allowed now.
     struct Cap {
         double rate = 256e3, tokens = 0; // bytes a second; bytes allowed now
+        double start = 0; // (its rate when idle: a transfer after a quiet spell starts there)
+        bool held = false; // (something waited for it this turn: the line filled by us, not by others)
         Clock::time_point at{}, paused_until{}, changed{};
     };
 
@@ -323,10 +367,14 @@ struct Session::Impl {
         // Its reliable channel paced (a joiner's every-board state: MBs a relay or a slow line drops in a burst):
         // the rate grows a quarter each second nothing was sent again, halves when pieces had to be.
         Cap pace;
+        uint64_t delivered_seen = 0; // (its channel's Reliable::delivered at the pace's last turn)
         unsigned resent = 0, sent = 0; // (pieces this second)
         // (the host: every board's state on its way to it, its pieces' sequence numbers [state_first, state_end))
         uint32_t state_first = 0, state_end = 0;
         bool state_going = false;
+        // (the newest of its board requests taken (kWantBoard): each comes reliably and as datagrams, send_urgent; a
+        // copy, or one of an older frame, ignored)
+        uint64_t board_wanted_last = ~0ull;
     };
     std::array<Peer, kMaxSeats> peers;
     std::array<Stream, kMaxSeats> streams;
@@ -416,6 +464,43 @@ struct Session::Impl {
         while (boards_expected.size() > 256) boards_expected.erase(boards_expected.begin()); // (asked and never come)
     }
     uint32_t state_size = 0; // (a joiner: the coming kState's size, from kStateSize: its progress)
+    // A joiner's state in chunks from several players (item 4, 2026-11-24; kShare*). The plan's chunks: each one's place,
+    // reference, hash, packed size and sender.
+    struct PlanChunk {
+        uint32_t offset = 0, size = 0;
+        int32_t ref = -1;
+        uint64_t hash = 0;
+        uint32_t packed = 0;
+        uint8_t owner = 0;
+    };
+    // The host's, and a helper's: its own chunks of that frame's state, and the plan (helpers: once it has come).
+    struct ShareOut {
+        uint64_t frame = 0;
+        std::vector<Session::ShareChunk> mine;
+        std::vector<PlanChunk> plan;
+        std::vector<uint8_t> joiners; // (the seats the plan is for)
+        bool planned = false, sent = false;
+    } share_out;
+    uint64_t share_at = 0, share_asked = 0; // (a helper: asked to take every board's state at this frame; taken: take_share_capture)
+    uint64_t share_host_frame = 0;            // (the host: the frame its helpers take, its own state of it to share)
+    std::vector<uint8_t> share_helpers;       // (the host: those asked)
+    // The joiner's: the plan, and what has come of it (a chunk against another waiting for that one).
+    struct ShareIn {
+        bool on = false;
+        uint64_t frame = 0;
+        uint32_t raw_size = 0;
+        std::vector<PlanChunk> plan;
+        std::vector<uint8_t> raw;
+        std::vector<bool> have;
+        std::map<uint32_t, std::vector<uint8_t>> waiting; // (by chunk: packed, its reference not here yet)
+        std::vector<bool> asked_host; // (by chunk: asked of the host)
+        std::map<uint8_t, Clock::time_point> heard; // (by sender: its last chunk, or the plan)
+        std::map<uint8_t, std::size_t> from_kb;     // (by sender: bytes come, for the log)
+        Clock::time_point planned{};
+        std::size_t got = 0, bytes = 0, total = 0;
+        Clock::time_point progress{}, asked{};
+        uint8_t from = 0; // (the host that sent the plan)
+    } share_in;
     Clock::time_point watch_since{}, watch_told{}; // (a spectator: let in then; the wait for the game last logged then)
     std::optional<StartInfo> late_start;
     std::optional<uint64_t> mine_from;
@@ -556,6 +641,7 @@ struct Session::Impl {
                                 std::to_string(static_cast<int>(peers[s].pace.rate / 1024)) + " KB/s, rtt " + std::to_string(peers[s].rtt) +
                                 (peers[s].rel.out.empty() ? std::string() : ", front " + std::to_string(peers[s].rel.out.front().seq) + " type " +
                                  std::to_string(peers[s].rel.out.front().data.empty() ? -1 : peers[s].rel.out.front().data[0])) + ";";
+                line += " uplink " + std::to_string(static_cast<int>(uplink.rate / 1024)) + " KB/s;";
                 if (is_host && watcher_count()) { // (spectators: their shared cap, and what waits for each)
                     line += " spectators' cap " + std::to_string(static_cast<int>(spectator_cap.rate / 1024)) + " KB/s:";
                     for (const Watcher& v : watchers)
@@ -661,6 +747,65 @@ struct Session::Impl {
     // they were and halves, pausing a second, as soon as one rises (a full uplink delays the inputs first). The same
     // for the host's channel to each spectator (its every-board state too) and a player's backups to one.
     Cap spectator_cap;
+    // Every player's reliable channel together, within this machine's uplink (the same rules as each one's pace, over
+    // all of them). Each paced alone, a one-board host sending a joiner its whole backup and the others theirs offered
+    // its line three times what it takes: the line's queue filled and the inputs waited in it (a joiner 11.5 s for the
+    // host's, a room 11.9 s for a backup, 2026-11-23, issue22.ps1 -OthersOne -JoinerOne on 2 MB/s test lines).
+    Cap uplink;
+    unsigned uplink_sent = 0, uplink_resent = 0; // (pieces this second, every player's)
+    uint64_t uplink_delivered_seen = 0;
+    // A pace's new rate when its line fills (round trips rising) or loses pieces: what the receivers said they had over the
+    // last turn, a quarter less (under the line's own speed, so its queue drains within a second: the inputs wait in it), never more than it was; nothing said had:
+    // half. Halved each time, a 2 MB/s line filled by a joiner's state ran at 0.76 MB/s after two rises (2026-11-24).
+    static double eased(double rate, uint64_t delivered, Clock::duration over) {
+        const double s = std::chrono::duration<double>(over).count();
+        const double measured = s > 0 ? static_cast<double>(delivered) / s : 0.0;
+        // (too little through to say what the line carries (a channel just opened, a quiet second): halved, as before)
+        if (measured < rate / 4) return std::max(kPaceMin, rate / 2);
+        static const double ease = [] { // (tests: SPIKEOUT_PACE_EASE=F, the share of what went through kept)
+            const char* e = std::getenv("SPIKEOUT_PACE_EASE");
+            return e && *e ? std::atof(e) : 0.75;
+        }();
+        // (never below half: a second only partly busy (a backup queued halfway through it) said little of the line, and
+        // 0.75 of it cut a one-board room's channel from 628 to 140 KB/s, its shadows' backups 6 s late, the room
+        // waiting, 2026-11-24)
+        return std::max({kPaceMin, rate / 2, std::min(rate, ease * measured)});
+    }
+    void pace_uplink(Clock::time_point now) {
+        Cap& c = uplink;
+        if (c.changed == Clock::time_point{}) {
+            bool fast = true, any = false;
+            for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s)
+                if (s != my_seat && peers[s].present) any = true, fast = fast && fast_line(peers[s].address);
+            if (!any) return;
+            c.rate = c.start = fast ? kPaceMax : kPaceStart * 2, c.changed = now;
+        }
+        if (now - c.changed < std::chrono::seconds(1)) return;
+        // (rising: this machine's own uplink filling shows in every player's round trip: two at once, or the only one;
+        // one far player's alone is its own path's, its pace's to answer, issue 30)
+        int playing = 0, rising = 0;
+        for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s) {
+            const Peer& o = peers[s];
+            if (s == my_seat || !o.present || o.dropped || o.rtt < 0 || o.rtt_floor < 0) continue;
+            ++playing;
+            if (o.rtt > o.rtt_floor + 40) ++rising;
+        }
+        const bool filling = rising >= 2 || (playing == 1 && rising == 1);
+        uint64_t delivered = 0;
+        for (const Peer& o : peers) delivered += o.rel.delivered;
+        const uint64_t got = delivered >= uplink_delivered_seen ? delivered - uplink_delivered_seen : 0;
+        uplink_delivered_seen = delivered;
+        bool queued = false;
+        for (const Peer& o : peers) queued = queued || (o.present && !o.rel.out.empty());
+        // (cut only when we fill the line: something waited this turn. A rise while sending little isn't ours: cut to what
+        // little went through, a helper's limit sank to 48 KB/s while it sent only inputs, its share of a joiner's state
+        // then at 0.2 MB/s on a 2 MB/s line, 2026-11-24. Idle: back to the start)
+        const bool busy = c.held || queued;
+        if (busy && (uplink_resent > std::max(4u, uplink_sent / 20) || (filling && uplink_sent >= 16))) c.rate = eased(c.rate, got, now - c.changed);
+        else if (busy && uplink_sent >= 16) c.rate = std::min(kPaceMax, c.rate * 1.25);
+        else if (!busy) c.rate = std::max(c.rate, c.start);
+        c.changed = now, c.held = false, uplink_sent = 0, uplink_resent = 0;
+    }
     static constexpr double kCapMin = 16e3, kCapMax = 4e6;
     bool cap_take(Cap& c, std::size_t bytes, Clock::time_point now) {
         if (now < c.paused_until) return false;
@@ -698,10 +843,13 @@ struct Session::Impl {
     // A player's reliable channel's rate, each second: up a quarter while what's sent gets through (a busy second
     // with almost nothing sent again), halved when more had to be (a relay or a line dropping the rest), from 1 MB/s.
     static constexpr double kPaceStart = 1e6, kPaceMin = 32e3, kPaceMax = 16e6;
+    // (a LAN's address: a line many times faster, its pace from far higher; not with SPIKEOUT_TEST_LINK, a slow line
+    // simulated between this PC's own processes)
+    static bool fast_line(const Address& a) { return !a.relayed && private_address(a.ip) && test_link().bytes_per_s <= 0; }
     void pace(Peer& p, Clock::time_point now) {
         Cap& c = p.pace;
         if (c.changed == Clock::time_point{}) // (the same network: a line many times faster, so from far higher)
-            c.rate = !p.address.relayed && private_address(p.address.ip) ? kPaceMax / 2 : kPaceStart, c.changed = now;
+            c.rate = c.start = fast_line(p.address) ? kPaceMax / 2 : kPaceStart, c.changed = now;
         if (now - c.changed < std::chrono::seconds(1)) return;
         // (and halved, as the spectators' rate is, when a player's round trip rises: the uplink filling delays the
         // players' inputs before anything is lost, and they come first)
@@ -721,9 +869,21 @@ struct Session::Impl {
             else ++others_rising;
         }
         const bool rising = own_rising || others_rising >= 2;
-        if (p.resent > std::max(4u, p.sent / 20) || (rising && p.sent > 0)) c.rate = std::max(kPaceMin, c.rate / 2);
-        else if (p.sent >= 16) c.rate = std::min(kPaceMax, c.rate * 1.25); // (only a busy second shows the line takes more)
-        c.changed = now, p.resent = 0, p.sent = 0;
+        static const bool pace_log = std::getenv("SPIKEOUT_PACE_LOG") != nullptr; // (tests: each busy second's pace and why)
+        if (pace_log && (p.sent || p.resent || !p.rel.out.empty()))
+            log("pace to seat " + std::to_string(&p - peers.data() + 1) + ": " + std::to_string(static_cast<int>(c.rate / 1024)) +
+                " KB/s, sent " + std::to_string(p.sent) + ", resent " + std::to_string(p.resent) + ", queued " +
+                std::to_string(p.rel.out.size()) + ", rtt " + std::to_string(p.rtt) + " (least " + std::to_string(p.rtt_floor) + ")" +
+                (own_rising ? ", its rtt rising" : "") + (others_rising ? ", " + std::to_string(others_rising) + " others' rising" : "") +
+                ", had " + std::to_string((p.rel.delivered - p.delivered_seen) / 1024) + " KB" +
+                "; uplink " + std::to_string(static_cast<int>(uplink.rate / 1024)) + " KB/s");
+        const uint64_t got = p.rel.delivered >= p.delivered_seen ? p.rel.delivered - p.delivered_seen : 0;
+        p.delivered_seen = p.rel.delivered;
+        const bool busy = c.held || !p.rel.out.empty(); // (as the uplink's: cut only when we fill the line; idle, back to the start)
+        if (busy && (p.resent > std::max(4u, p.sent / 20) || (rising && p.sent >= 16))) c.rate = eased(c.rate, got, now - c.changed);
+        else if (busy && p.sent >= 16) c.rate = std::min(kPaceMax, c.rate * 1.25); // (only a busy second shows the line takes more)
+        else if (!busy) c.rate = std::max(c.rate, c.start);
+        c.changed = now, c.held = false, p.resent = 0, p.sent = 0;
     }
     template <class P> void pump_reliable(uint8_t seat, P& p, Cap* cap = nullptr, Cap* shared_cap = nullptr) {
         const auto now = Clock::now();
@@ -739,14 +899,19 @@ struct Session::Impl {
             if (n++ >= kWindow) break;
             if (f.sacked || (f.ever_sent && now - f.sent < resend)) continue;
             const std::size_t bytes = f.data.size() + 32;
-            if (cap && !cap_take(*cap, bytes, now)) break; // (its own pace)
+            if (cap && !cap_take(*cap, bytes, now)) { // (its own pace)
+                cap->held = true;
+                break;
+            }
             if (shared_cap && !cap_take(*shared_cap, bytes, now)) { // (spectator traffic: its share only)
+                shared_cap->held = true;
                 if (cap) cap->tokens += static_cast<double>(bytes); // (not sent: its own pace's share back)
                 break;
             }
             if constexpr (requires { p.resent; }) ++(f.ever_sent ? p.resent : p.sent);
+            if (shared_cap == &uplink) ++(f.ever_sent ? uplink_resent : uplink_sent);
             Writer w = header(kReliable, session, me());
-            w.u32(p.rel.rx_next), w.u64(p.rel.sack_bits()), w.u8(1), w.u32(f.seq), w.u8(f.flags);
+            w.u32(p.rel.rx_next), write_sack(w, p.rel.sack_bits()), w.u8(1), w.u32(f.seq), w.u8(f.flags);
             w.out.insert(w.out.end(), f.data.begin(), f.data.end());
             send_peer(p, w);
             f.sent = now, f.ever_sent = true;
@@ -754,7 +919,7 @@ struct Session::Impl {
         }
         if (p.rel.ack_due && !sent_any) {
             Writer w = header(kReliable, session, me());
-            w.u32(p.rel.rx_next), w.u64(p.rel.sack_bits()), w.u8(0);
+            w.u32(p.rel.rx_next), write_sack(w, p.rel.sack_bits()), w.u8(0);
             send_peer(p, w);
         }
         p.rel.ack_due = false;
@@ -960,7 +1125,7 @@ struct Session::Impl {
         v.address = d.from, v.heard = Clock::now(), v.reached = true;
         if (type == kReliable) {
             const uint32_t ack = r.u32();
-            const uint64_t sack = r.u64();
+            const Reliable::Sack sack = read_sack(r);
             const uint8_t has = r.u8();
             if (!r.ok()) return;
             v.rel.acked(ack, sack);
@@ -983,6 +1148,12 @@ struct Session::Impl {
                     watchers_sent = Clock::time_point{}; // (the players told at once)
                 }
                 if (m[0] == kWantBackup && cb.backup_wanted) cb.backup_wanted(static_cast<uint8_t>(kWatcherBase + id));
+                if (m[0] == kWantReport && cb.report_wanted) { // (a spectator saw the game's error just after it came: Session::ask_report)
+                    Reader q(m.data() + 1, m.size() - 1);
+                    const uint64_t frame = q.u64();
+                    const std::string why = q.str();
+                    if (q.ok()) cb.report_wanted(static_cast<uint8_t>(kWatcherBase + id), frame, why);
+                }
             }
         } else if (type == kInput) {
             v.their_time = r.u32(), v.their_time_at = Clock::now();
@@ -1144,7 +1315,7 @@ struct Session::Impl {
         b.address = d.from, b.reached = true, b.heard = Clock::now();
         if (type != kReliable) return;
         const uint32_t ack = r.u32();
-        const uint64_t sack = r.u64();
+        const Reliable::Sack sack = read_sack(r);
         const uint8_t has = r.u8();
         if (!r.ok()) return;
         b.rel.acked(ack, sack);
@@ -1293,7 +1464,7 @@ struct Session::Impl {
         else if (type == kGoodbye && !said_bye[from]) on_bye(from);
         else if (type == kUrgent) { // (a drop's message, as its own datagram: send_urgent)
             std::vector<uint8_t> m = r.bytes();
-            if (r.ok() && !m.empty() && (m[0] == kSuspect || m[0] == kHave || m[0] == kIdle)) on_message(from, m);
+            if (r.ok() && !m.empty() && (m[0] == kSuspect || m[0] == kHave || m[0] == kIdle || m[0] == kWantBoard || m[0] == kShareAt)) on_message(from, m);
         } else if (type == kNodeData && cb.node) { // (a node, as its own datagram: Session::send_node)
             const uint64_t seq = r.u64();
             std::vector<uint8_t> node = r.bytes();
@@ -1413,7 +1584,7 @@ struct Session::Impl {
 
     void on_reliable(uint8_t from, Peer& p, Reader& r) {
         const uint32_t ack = r.u32();
-        const uint64_t sack = r.u64();
+        const Reliable::Sack sack = read_sack(r);
         const uint8_t has = r.u8();
         if (!r.ok()) return;
         p.rel.acked(ack, sack);
@@ -1422,7 +1593,14 @@ struct Session::Impl {
         const uint8_t flags = r.u8();
         if (!r.ok()) return;
         std::vector<uint8_t> data(r.here(), r.here() + r.left());
-        for (auto& m : p.rel.receive(seq, flags, std::move(data))) on_message(from, m);
+        for (auto& m : p.rel.receive(seq, flags, std::move(data))) {
+            static const bool slow_log = std::getenv("SPIKEOUT_PACE_LOG") != nullptr; // (tests: a message's handling held long)
+            const auto t0 = Clock::now();
+            on_message(from, m);
+            if (slow_log && !m.empty() && Clock::now() - t0 > std::chrono::milliseconds(50))
+                log("message type " + std::to_string(m[0]) + " (" + std::to_string(m.size() / 1024) + " KB) took " +
+                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()) + " ms");
+        }
     }
 
     // A player's goodbye (kBye in the reliable channel, or its kGoodbye datagram, whichever comes first).
@@ -1436,6 +1614,172 @@ struct Session::Impl {
             room_closed = true;
             log("the host closed the room");
         }
+    }
+
+    // Every board as the host has them, come (kState, packed; or put together from chunks, raw: share_in): a game
+    // joined in progress, or ours put back in step.
+    void take_state(uint8_t from, uint64_t frame, std::vector<uint8_t> state, bool raw) {
+        // (only as asked: joining a game in progress, or out of step and asking (out_of_step); any other a peer
+        // pushed would replace every board here: roadmap, safe loading)
+        const bool joining_now = late && !started && late_start;
+        if (!joining_now && !(started && want_state)) {
+            log("a state from seat " + std::to_string(from + 1) + " not asked for: ignored");
+            return;
+        }
+        want_state = false;
+        state_at = frame;
+        my_hashes.clear(), their_hashes.clear();
+        if (late && !started && late_start) {
+            StartInfo info = *late_start;
+            info.state_frame = frame, info.state = std::move(state), info.state_raw = raw;
+            log("every board's state from the host: frame " + std::to_string(frame));
+            // (every seat's inputs from the state's frame: what the boards run on from there; the host has them all,
+            // as it made the state there. Asked for at once: the acks below go out with our next datagram)
+            // Any older ones dropped: the others send to a new player from the moment it's in, before it has read
+            // that it joined in progress (KKW's timeline: inputs at 0.580 s, "joined" 0.581), so a stream may have
+            // begun at frame 1 already (2026-11-13's first try kept it: the history still from 1)
+            // (a player only: a spectator, also "late" here, keeps its streams its own way, deliver_watched, as before)
+            if (!history_from && !watch_mode) {
+                history_from = frame;
+                for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s) {
+                    Stream& st = streams[s];
+                    if (st.known && st.first <= frame && st.next() > frame)
+                        st.frames.erase(st.frames.begin(), st.frames.begin() + static_cast<std::ptrdiff_t>(frame - st.first));
+                    else
+                        st.frames.clear();
+                    st.known = true, st.first = frame;
+                }
+                for (uint8_t s = 0; s < kMaxSeats; ++s)
+                    if (peers[s].present) peers[s].inputs_due = true;
+            }
+            begin(info);
+        } else if (started && cb.resync) {
+            StartInfo info = start_info;
+            info.state_frame = frame, info.state = std::move(state);
+            log("put back in step with the host's boards at frame " + std::to_string(frame));
+            cb.resync(info);
+        }
+    }
+
+    // A joiner's state in chunks from several players (item 4).
+    void send_chunk(uint8_t to, uint64_t frame, uint32_t i, const std::vector<uint8_t>& packed) {
+        Writer w;
+        w.u8(kShareChunk), w.u64(frame), w.u32(i), w.bytes(packed);
+        send_reliable(to, w.out);
+    }
+    void share_ask(const std::vector<uint32_t>& chunks) { // (the joiner: these from the host)
+        if (chunks.empty()) return;
+        Writer w;
+        w.u8(kShareWant), w.u64(share_in.frame), w.u32(static_cast<uint32_t>(chunks.size()));
+        for (const uint32_t i : chunks) {
+            w.u32(i);
+            if (i < share_in.asked_host.size()) share_in.asked_host[i] = true;
+        }
+        send_reliable(share_in.from, w.out);
+        share_in.asked = Clock::now();
+    }
+    // (a helper: its chunks the plan gives it, those the same as the plan's (place, reference, hash); the others said
+    // it can't)
+    void share_send_helper() {
+        ShareOut& o = share_out;
+        if (!o.planned || o.mine.empty() || o.sent) return;
+        o.sent = true;
+        std::vector<uint32_t> cant;
+        std::size_t sent = 0;
+        for (uint32_t i = 0; i < o.plan.size(); ++i) {
+            const PlanChunk& p = o.plan[i];
+            if (p.owner != my_seat) continue;
+            if (i < o.mine.size() && o.mine[i].offset == p.offset && o.mine[i].size == p.size && o.mine[i].ref == p.ref &&
+                o.mine[i].hash == p.hash) {
+                for (const uint8_t j : o.joiners) send_chunk(j, o.frame, i, o.mine[i].packed);
+                ++sent;
+            } else {
+                cant.push_back(i);
+            }
+        }
+        if (!cant.empty()) {
+            Writer w;
+            w.u8(kShareCant), w.u64(o.frame), w.u32(static_cast<uint32_t>(cant.size()));
+            for (const uint32_t i : cant) w.u32(i);
+            for (const uint8_t j : o.joiners) send_reliable(j, w.out);
+        }
+        log("every board's state at frame " + std::to_string(o.frame) + ": " + std::to_string(sent) + " chunks of it sent to the joiner, " +
+            std::to_string(cant.size()) + " left to the host (ours differ)");
+    }
+    // (the joiner: chunk `i` unpacked into its place, its reference here; then those waiting for it)
+    bool share_place(uint32_t i, const std::vector<uint8_t>& packed) {
+        ShareIn& s = share_in;
+        const PlanChunk& p = s.plan[i];
+        std::span<const uint8_t> ref;
+        if (p.ref >= 0) {
+            const PlanChunk& r = s.plan[static_cast<std::size_t>(p.ref)];
+            ref = std::span<const uint8_t>(s.raw.data() + r.offset, r.size);
+        }
+        const auto raw = decompress_against(packed, ref, p.size);
+        if (!raw || raw->size() != p.size || Session::chunk_hash(raw->data(), p.size) != p.hash) {
+            log("every board's state: chunk " + std::to_string(i) + " not as planned: asked of the host");
+            share_ask({i});
+            return false;
+        }
+        std::memcpy(s.raw.data() + p.offset, raw->data(), p.size);
+        s.have[i] = true, ++s.got, s.bytes += packed.size(), s.progress = Clock::now();
+        for (auto it = s.waiting.begin(); it != s.waiting.end();) { // (those against it)
+            if (s.plan[it->first].ref == static_cast<int32_t>(i)) {
+                const uint32_t k = it->first;
+                std::vector<uint8_t> w = std::move(it->second);
+                it = s.waiting.erase(it);
+                share_place(k, w);
+                it = s.waiting.begin();
+            } else {
+                ++it;
+            }
+        }
+        return true;
+    }
+    // (the joiner: a chunk come)
+    void share_chunk(uint64_t frame, uint32_t i, std::vector<uint8_t> packed) {
+        ShareIn& s = share_in;
+        if (!s.on || frame != s.frame || i >= s.have.size() || s.have[i] || s.waiting.count(i)) return;
+        const int32_t ref = s.plan[i].ref;
+        s.progress = s.heard[s.plan[i].owner] = Clock::now();
+        s.from_kb[s.plan[i].owner] += packed.size();
+        if (ref >= 0 && !s.have[static_cast<std::size_t>(ref)]) { // (its reference not here yet: kept)
+            s.waiting[i] = std::move(packed);
+            return;
+        }
+        share_place(i, packed);
+        if (!s.on || s.got < s.have.size()) return;
+        s.on = false;
+        std::string by; // (each sender's share and when its last came, from the plan)
+        for (const auto& [o, b] : s.from_kb) {
+            char t[96];
+            std::snprintf(t, sizeof t, "%sseat %u %zu KB by %.1f s", by.empty() ? "" : ", ", static_cast<unsigned>(o) + 1, b / 1024,
+                          std::chrono::duration<double>(s.heard[o] - s.planned).count());
+            by += t;
+        }
+        log("every board's state at frame " + std::to_string(s.frame) + ": all " + std::to_string(s.got) + " chunks here (" + by + ")");
+        take_state(s.from, s.frame, std::move(s.raw), true);
+    }
+    // (the joiner, now and then: a helper's chunks asked of the host once it has sent nothing for 5 s (a helper gone or
+    // stuck); the host's own come by its reliable channel, never asked again (asking everything again after 2 s of a busy
+    // line had the host send most of the state twice, 2026-11-24); and anything still missing after 15 s of nothing
+    // coming at all asked again)
+    void share_check(Clock::time_point now) {
+        ShareIn& s = share_in;
+        if (!s.on || now - s.asked < std::chrono::seconds(2)) return;
+        const bool stalled = now - s.progress >= std::chrono::seconds(15);
+        std::vector<uint32_t> missing;
+        for (uint32_t i = 0; i < s.have.size(); ++i) {
+            if (s.have[i] || s.waiting.count(i)) continue;
+            const uint8_t helper = s.plan[i].owner;
+            const bool helper_quiet = helper != s.from && !s.asked_host[i] && now - s.heard[helper] >= std::chrono::seconds(5);
+            if (helper_quiet || stalled) missing.push_back(i);
+        }
+        if (missing.empty()) return;
+        log("every board's state: " + std::to_string(missing.size()) + " chunks not come" + (stalled ? " (nothing for 15 s)" : " from a quiet helper") +
+            ": asked of the host");
+        share_ask(missing);
+        if (stalled) s.progress = now;
     }
 
     void on_message(uint8_t from, const std::vector<uint8_t>& m) {
@@ -1541,46 +1885,82 @@ struct Session::Impl {
             std::vector<uint8_t> state = r.bytes();
             if (from != authority() && from != host_seat) break;
             if (!r.ok()) break;
-            // (only as asked: joining a game in progress, or out of step and asking (out_of_step); any other a peer
-            // pushed would replace every board here: roadmap, safe loading)
-            const bool joining_now = late && !started && late_start;
-            if (!joining_now && !(started && want_state)) {
-                log("a state from seat " + std::to_string(from + 1) + " not asked for: ignored");
-                break;
+            take_state(from, frame, std::move(state), false);
+            break;
+        }
+        case kShareAt: { // (the host: every board's state to be taken here at this frame, for a joiner: Session::share_capture)
+            const uint64_t at = r.u64();
+            if (!r.ok() || (from != authority() && from != host_seat)) break;
+            if (at > share_asked) share_at = at, share_asked = at; // (its datagram copies too: once)
+            break;
+        }
+        case kSharePlan: { // (the host's plan of a joiner's state in chunks: to the joiner, and to its helpers)
+            const uint64_t frame = r.u64();
+            const uint32_t raw_size = r.u32(), n = r.u32();
+            if (!r.ok() || n == 0 || n > 4096) break;
+            std::vector<PlanChunk> plan(n);
+            for (PlanChunk& p : plan)
+                p.offset = r.u32(), p.size = r.u32(), p.ref = static_cast<int32_t>(r.u32()), p.hash = r.u64(), p.packed = r.u32(), p.owner = r.u8();
+            std::vector<uint8_t> joiners(r.u8());
+            for (uint8_t& j : joiners) j = r.u8();
+            if (!r.ok() || (from != authority() && from != host_seat)) break;
+            bool sound = true; // (each chunk inside the state, its reference an earlier chunk of the same size or none)
+            for (uint32_t i = 0; i < n && sound; ++i) {
+                const PlanChunk& p = plan[i];
+                sound = p.size > 0 && p.size <= (4u << 20) && uint64_t{p.offset} + p.size <= raw_size &&
+                        (p.ref < 0 || (static_cast<uint32_t>(p.ref) < i && plan[static_cast<std::size_t>(p.ref)].ref < 0));
             }
-            want_state = false;
-            state_at = frame;
-            my_hashes.clear(), their_hashes.clear();
-            if (late && !started && late_start) {
-                StartInfo info = *late_start;
-                info.state_frame = frame, info.state = std::move(state);
-                log("every board's state from the host: frame " + std::to_string(frame));
-                // (every seat's inputs from the state's frame: what the boards run on from there; the host has them all,
-                // as it made the state there. Asked for at once: the acks below go out with our next datagram)
-                // Any older ones dropped: the others send to a new player from the moment it's in, before it has read
-                // that it joined in progress (KKW's timeline: inputs at 0.580 s, "joined" 0.581), so a stream may have
-                // begun at frame 1 already (2026-11-13's first try kept it: the history still from 1)
-                // (a player only: a spectator, also "late" here, keeps its streams its own way, deliver_watched, as before)
-                if (!history_from && !watch_mode) {
-                    history_from = frame;
-                    for (uint8_t s = 0; s < seats && s < kMaxSeats; ++s) {
-                        Stream& st = streams[s];
-                        if (st.known && st.first <= frame && st.next() > frame)
-                            st.frames.erase(st.frames.begin(), st.frames.begin() + static_cast<std::ptrdiff_t>(frame - st.first));
-                        else
-                            st.frames.clear();
-                        st.known = true, st.first = frame;
-                    }
-                    for (uint8_t s = 0; s < kMaxSeats; ++s)
-                        if (peers[s].present) peers[s].inputs_due = true;
-                }
-                begin(info);
-            } else if (started && cb.resync) {
-                StartInfo info = start_info;
-                info.state_frame = frame, info.state = std::move(state);
-                log("put back in step with the host's boards at frame " + std::to_string(frame));
-                cb.resync(info);
+            if (!sound || raw_size > kMaxRoomState) break;
+            if (std::find(joiners.begin(), joiners.end(), my_seat) != joiners.end()) { // (ours: the joiner's)
+                if (!(late && !started && late_start)) break;
+                ShareIn& s = share_in;
+                s = ShareIn{};
+                s.on = true, s.frame = frame, s.raw_size = raw_size, s.from = from, s.plan = std::move(plan);
+                s.raw.assign(raw_size, 0), s.have.assign(n, false), s.asked_host.assign(n, false);
+                std::set<uint8_t> senders;
+                for (const PlanChunk& p : s.plan) s.total += p.packed, senders.insert(p.owner);
+                s.progress = s.planned = Clock::now();
+                for (const uint8_t o : senders) s.heard[o] = s.progress;
+                state_size = static_cast<uint32_t>(s.total);
+                log("every board's state at frame " + std::to_string(frame) + " coming in " + std::to_string(n) + " chunks (" +
+                    std::to_string(s.total / 1024) + " KB) from " + std::to_string(senders.size()) + " players");
+            } else if (frame == share_asked) { // (a helper's: its chunks of it, once its own state of that frame is taken)
+                ShareOut& o = share_out;
+                if (o.frame != frame) o = ShareOut{}, o.frame = frame;
+                o.plan = std::move(plan), o.joiners = std::move(joiners), o.planned = true;
+                share_send_helper();
             }
+            break;
+        }
+        case kShareChunk: { // (the joiner: a chunk of its state)
+            const uint64_t frame = r.u64();
+            const uint32_t i = r.u32();
+            std::vector<uint8_t> packed = r.bytes();
+            if (r.ok()) share_chunk(frame, i, packed);
+            break;
+        }
+        case kShareCant: { // (the joiner: a helper's chunks that differ from the host's: asked of the host)
+            const uint64_t frame = r.u64();
+            std::vector<uint32_t> chunks(r.u32());
+            if (!r.ok() || chunks.size() > 4096) break;
+            for (uint32_t& i : chunks) i = r.u32();
+            if (r.ok() && share_in.on && frame == share_in.frame) share_ask(chunks);
+            break;
+        }
+        case kShareWant: { // (the host: chunks a joiner hasn't had from its helpers)
+            const uint64_t frame = r.u64();
+            std::vector<uint32_t> chunks(r.u32());
+            if (!r.ok() || chunks.size() > 4096) break;
+            for (uint32_t& i : chunks) i = r.u32();
+            if (!r.ok() || frame != share_out.frame) break;
+            for (const uint32_t i : chunks)
+                if (i < share_out.mine.size()) send_chunk(from, frame, i, share_out.mine[i].packed);
+            break;
+        }
+        case kWantReport: { // (a joiner saw the game's error just after its join: a report of ours, the room's history in it)
+            const uint64_t frame = r.u64();
+            const std::string why = r.str();
+            if (r.ok() && cb.report_wanted) cb.report_wanted(from, frame, why);
             break;
         }
         case kWantState: // (out of step: our boards' state wanted)
@@ -1589,7 +1969,11 @@ struct Session::Impl {
             break;
         case kWantBoard: { // (one board a PC: our own board's state at the end of a frame, for the asker's shadow of it)
             const uint64_t frame = r.u64();
-            if (r.ok() && from < seats && cb.board_wanted) cb.board_wanted(from, frame);
+            if (!r.ok() || from >= seats) break;
+            uint64_t& last = peers[from].board_wanted_last;
+            if (last != ~0ull && frame <= last) break; // (its other copy: send_urgent)
+            last = frame;
+            if (cb.board_wanted) cb.board_wanted(from, frame);
             break;
         }
         case kStatus: { // (its machine and how it plays: the overlay's)
@@ -1676,7 +2060,12 @@ struct Session::Impl {
             } else if (asked)
                 log("seat " + std::to_string(from + 1) + " asks for its cabinet from frame " + std::to_string(asked) +
                     ", we're at " + std::to_string(here));
-            const uint64_t x = asked > ours ? std::min(asked, ours + kTakeAheadMost) : ours;
+            // (a multiple of 32: rollback keeps every 32nd frame of each board, never thinned out within its window
+            // (tools::rollback::kAlways), so every machine can read each board out as it was there once that frame is
+            // settled, a joiner's frames settling last: copies of the boards made at the seat's frame, not whole backups
+            // sent, tools::net_frame::JoinBases)
+            const uint64_t chosen = asked > ours ? std::min(asked, ours + kTakeAheadMost) : ours;
+            const uint64_t x = (chosen + kSeatFrameEvery - 1) / kSeatFrameEvery * kSeatFrameEvery;
             Writer w;
             w.u8(kTaken), w.u8(from), w.u64(x);
             send_all(w.out);
@@ -2022,7 +2411,19 @@ struct Session::Impl {
                 targets_asked = Clock::now();
             }
             std::lock_guard guard(lock);
-            while (auto d = socket.receive()) ++datagrams_in, received(*d);
+            // (at most ~10 ms of reading a turn, then the rest of the turn: acknowledgements, paces, sends. Draining until
+            // nothing was left, a joiner taking a state from two players at once read for seconds, acknowledged nothing,
+            // and both senders' windows stood full, 2026-11-24)
+            const auto read_from = Clock::now();
+            std::size_t read = 0;
+            while (auto d = socket.receive()) {
+                ++datagrams_in, ++read, received(*d);
+                if ((read & 31) == 0 && Clock::now() - read_from > std::chrono::milliseconds(10)) break;
+            }
+            static const bool loop_log = std::getenv("SPIKEOUT_PACE_LOG") != nullptr; // (tests: a turn's reading held long)
+            if (loop_log && Clock::now() - read_from > std::chrono::milliseconds(300))
+                log("network turn: " + std::to_string(read) + " datagrams read in " +
+                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - read_from).count()) + " ms");
             const auto now = Clock::now();
             send_held(now); // (tests: SPIKEOUT_TEST_LATENCY's, due)
             if (is_host && now - last_beacon > kBeaconEvery) beacon(now);
@@ -2091,6 +2492,8 @@ struct Session::Impl {
                         peers[s] = Peer{};
                         send_all(roster_message());
                     }
+            pace_uplink(now);
+            share_check(now); // (a joiner's chunks not come: asked of the host)
             for (uint8_t s = 0; s < kMaxSeats; ++s) {
                 Peer& p = peers[s];
                 if (s == my_seat || !p.present || p.dropped) continue;
@@ -2100,7 +2503,7 @@ struct Session::Impl {
                 if ((p.inputs_due || inputs_pending(s, p)) && now - p.inputs_sent >= kInputResend) send_inputs(s, p);
                 else if (now - p.inputs_sent >= kKeepAlive) send_inputs(s, p);
                 pace(p, now);
-                pump_reliable(s, p, &p.pace);
+                pump_reliable(s, p, &p.pace, &uplink); // (its own pace, and the uplink's for every player together)
             }
             if (!is_host && !leaving) pump_spectators(now); // (a player's backups to spectators on one board: last)
             if (!is_host && !started && my_seat == kNoSeat && leaving) break;
@@ -2389,6 +2792,189 @@ void Session::send_state(uint64_t frame, std::vector<uint8_t> state) {
     }
 }
 
+std::vector<uint8_t> Session::share_capture(uint64_t frame) {
+    Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    std::vector<uint8_t> helpers;
+    bool joiner = false; // (a player waiting for the state: spectators get it whole, as before)
+    for (uint8_t s = 0; s < kMaxSeats; ++s) {
+        const Impl::Peer& p = m.peers[s];
+        if (s == m.my_seat || !p.present || p.dropped || !p.connected) continue;
+        if (p.wants_state) {
+            joiner = true;
+            continue;
+        }
+        if (s < m.seats && p.status.boards == Status::Boards::every && m.view(s).state == SeatView::State::playing) helpers.push_back(s);
+    }
+    static const bool off = [] { // (tests: SPIKEOUT_NO_SHARE=1 sends the state whole from the host, as before, to compare)
+        const char* e = std::getenv("SPIKEOUT_NO_SHARE");
+        return e && *e && *e != '0';
+    }();
+    if (!joiner || helpers.empty() || off) return {};
+    m.share_host_frame = frame, m.share_helpers = helpers;
+    Writer w;
+    w.u8(kShareAt), w.u64(frame);
+    for (const uint8_t s : helpers) m.send_urgent(s, w.out); // (as datagrams too: to be had before they reach that frame)
+    m.log("every board's state for a joiner at frame " + std::to_string(frame) + ": " + std::to_string(helpers.size()) +
+          " other player(s) asked to send parts of it");
+    return helpers;
+}
+
+uint64_t Session::share_frame() const {
+    std::lock_guard guard(impl_->lock);
+    return impl_->share_host_frame;
+}
+
+uint64_t Session::chunk_hash(const uint8_t* data, std::size_t size) {
+    uint64_t h = 0xcbf29ce484222325ull; // (FNV-1a, 8 bytes at a time)
+    std::size_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        uint64_t v;
+        std::memcpy(&v, data + i, 8);
+        h = (h ^ v) * 0x100000001b3ull;
+    }
+    for (; i < size; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
+    return h;
+}
+
+std::vector<Session::ShareChunk> Session::share_chunks(const std::vector<uint8_t>& raw) {
+    // Each board's state starts with this tag (m3::State::tag, its NUL written too).
+    static constexpr char kTag[] = "spikeout save state 1";
+    constexpr std::size_t kTagSize = sizeof kTag, kChunk = 1u << 20;
+    std::vector<std::size_t> boards;
+    for (std::size_t i = 0; i + kTagSize <= raw.size();) {
+        const auto* at = static_cast<const uint8_t*>(std::memchr(raw.data() + i, 's', raw.size() - i));
+        if (!at) break;
+        const std::size_t k = static_cast<std::size_t>(at - raw.data());
+        if (k + kTagSize <= raw.size() && std::memcmp(at, kTag, kTagSize) == 0) {
+            boards.push_back(k);
+            i = k + kTagSize;
+        } else {
+            i = k + 1;
+        }
+    }
+    std::vector<ShareChunk> out;
+    std::vector<std::pair<std::size_t, std::size_t>> parts; // (from, to)
+    if (boards.empty()) {
+        parts.emplace_back(0, raw.size());
+    } else {
+        if (boards[0] > 0) parts.emplace_back(0, boards[0]);
+        for (std::size_t b = 0; b < boards.size(); ++b) parts.emplace_back(boards[b], b + 1 < boards.size() ? boards[b + 1] : raw.size());
+    }
+    const bool first_is_board = !boards.empty() && boards[0] == 0;
+    std::size_t first_board = boards.empty() ? parts.size() : (first_is_board ? 0 : 1); // (the part the others go against)
+    std::vector<int32_t> first_chunks; // (the first board's chunk by its place in the board)
+    for (std::size_t pi = 0; pi < parts.size(); ++pi) {
+        const auto [from, to] = parts[pi];
+        for (std::size_t o = from, k = 0; o < to; o += kChunk, ++k) {
+            ShareChunk c;
+            c.offset = static_cast<uint32_t>(o), c.size = static_cast<uint32_t>(std::min(kChunk, to - o));
+            c.hash = chunk_hash(raw.data() + o, c.size);
+            std::span<const uint8_t> ref;
+            if (pi == first_board) {
+                first_chunks.push_back(static_cast<int32_t>(out.size()));
+            } else if (pi > first_board && k < first_chunks.size()) {
+                const ShareChunk& r = out[static_cast<std::size_t>(first_chunks[k])];
+                c.ref = first_chunks[k];
+                ref = std::span<const uint8_t>(raw.data() + r.offset, r.size);
+            }
+            c.packed = compress_against(std::span<const uint8_t>(raw.data() + o, c.size), ref);
+            out.push_back(std::move(c));
+        }
+    }
+    return out;
+}
+
+void Session::share_state(uint64_t frame, uint32_t raw_size, std::vector<ShareChunk> chunks) {
+    Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    std::vector<uint8_t> joiners;
+    for (uint8_t s = 0; s < kMaxSeats; ++s) {
+        Impl::Peer& p = m.peers[s];
+        if (s == m.my_seat || !p.present || !p.wants_state) continue;
+        p.wants_state = false;
+        joiners.push_back(s);
+    }
+    m.share_host_frame = 0;
+    if (joiners.empty() || chunks.empty()) return;
+    std::vector<uint8_t> senders{m.my_seat}; // (the host and its helpers, chunk by chunk to the one with the least so far)
+    for (const uint8_t s : m.share_helpers)
+        if (m.peers[s].present && !m.peers[s].dropped) senders.push_back(s);
+    Impl::ShareOut& o = m.share_out;
+    o = Impl::ShareOut{};
+    o.frame = frame, o.joiners = joiners, o.planned = o.sent = true;
+    std::vector<std::size_t> load(senders.size(), 0);
+    o.plan.resize(chunks.size());
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        Impl::PlanChunk& p = o.plan[i];
+        p.offset = chunks[i].offset, p.size = chunks[i].size, p.ref = chunks[i].ref, p.hash = chunks[i].hash;
+        p.packed = static_cast<uint32_t>(chunks[i].packed.size());
+        const std::size_t k = static_cast<std::size_t>(std::min_element(load.begin(), load.end()) - load.begin());
+        p.owner = senders[k], load[k] += p.packed;
+    }
+    o.mine = std::move(chunks);
+    Writer w;
+    w.u8(kSharePlan), w.u64(frame), w.u32(raw_size), w.u32(static_cast<uint32_t>(o.plan.size()));
+    for (const Impl::PlanChunk& p : o.plan)
+        w.u32(p.offset), w.u32(p.size), w.u32(static_cast<uint32_t>(p.ref)), w.u64(p.hash), w.u32(p.packed), w.u8(p.owner);
+    w.u8(static_cast<uint8_t>(joiners.size()));
+    for (const uint8_t j : joiners) w.u8(j);
+    for (const uint8_t j : joiners) m.send_reliable(j, w.out);
+    for (std::size_t k = 1; k < senders.size(); ++k) m.send_reliable(senders[k], w.out);
+    std::size_t mine = 0, total = 0;
+    for (uint32_t i = 0; i < o.plan.size(); ++i) {
+        total += o.plan[i].packed;
+        if (o.plan[i].owner != m.my_seat) continue;
+        for (const uint8_t j : joiners) m.send_chunk(j, frame, i, o.mine[i].packed);
+        ++mine;
+    }
+    m.log("every board's state (frame " + std::to_string(frame) + ", " + std::to_string(raw_size / 1024) + " KB, " +
+          std::to_string(total / 1024) + " KB packed in " + std::to_string(o.plan.size()) + " chunks) to " + std::to_string(joiners.size()) +
+          " joiner(s): " + std::to_string(mine) + " chunks from here, the rest from " + std::to_string(senders.size() - 1) +
+          " other player(s)");
+}
+
+bool Session::state_wanted() const {
+    const Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    for (const Impl::Peer& p : m.peers)
+        if (p.present && p.wants_state) return true;
+    for (const Impl::Watcher& v : m.watchers)
+        if (v.present && v.wants_state) return true;
+    return false;
+}
+
+uint64_t Session::take_share_capture() {
+    std::lock_guard guard(impl_->lock);
+    return std::exchange(impl_->share_at, 0);
+}
+
+uint64_t Session::share_helper_frame() const {
+    std::lock_guard guard(impl_->lock);
+    return impl_->share_asked;
+}
+
+void Session::share_offer(uint64_t frame, std::vector<ShareChunk> chunks) {
+    Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    if (frame != m.share_asked) return;
+    Impl::ShareOut& o = m.share_out;
+    if (o.frame != frame) o = Impl::ShareOut{}, o.frame = frame;
+    o.mine = std::move(chunks);
+    m.share_send_helper(); // (the plan here already: at once; else as it comes)
+}
+
+void Session::ask_report(uint64_t frame, const std::string& why) {
+    Impl& m = *impl_;
+    std::lock_guard guard(m.lock);
+    const uint8_t host = m.host_seat;
+    if (host >= kMaxSeats || host == m.my_seat || (m.my_watch == kNoSeat && !m.peers[host].present)) return; // (a spectator: to the host)
+    Writer w;
+    w.u8(kWantReport), w.u64(frame), w.str(why.substr(0, 200));
+    m.send_reliable(host, w.out);
+    m.log("the game's error just after our join: the host asked for a report of its own (the room's history)");
+}
+
 void Session::want_board(uint8_t seat, uint64_t frame) {
     Impl& m = *impl_;
     std::lock_guard guard(m.lock);
@@ -2396,7 +2982,9 @@ void Session::want_board(uint8_t seat, uint64_t frame) {
     Writer w;
     w.u8(kWantBoard), w.u64(frame);
     m.expect_board(seat, frame);
-    m.send_reliable(seat, w.out);
+    // (as datagrams too: behind a backup's pieces in the reliable channel it came seconds late, the asked machine
+    // already past the frame and standing for the asker's inputs meanwhile, 2026-11-23)
+    m.send_urgent(seat, w.out);
 }
 
 bool Session::sending() const {
@@ -2774,6 +3362,7 @@ Session::JoinProgress Session::join_progress() const {
     } else if (m.late && !m.started) {
         out.stage = JoinProgress::Stage::receiving;
         out.bytes = m.state_received(), out.total = m.state_size;
+        if (m.share_in.on) out.bytes = m.share_in.bytes; // (in chunks from several players: those come)
     } else if (m.late && m.started && !m.mine_from) {
         out.stage = JoinProgress::Stage::seating;
     }

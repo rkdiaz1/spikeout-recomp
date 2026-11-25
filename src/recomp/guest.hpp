@@ -145,6 +145,20 @@ inline void set_fprf(CpuState& s, uint64_t result, bool single) {
     s.fpscr = (s.fpscr & ~0x1F000u) | c << 12;
 }
 
+// FPRF worked out when it is looked at (CpuState::fprf_pending): an arithmetic result only notes itself (the game
+// reads FPRF rarely: mcrfs, mffs), and flush_fprf works out what set_fprf would have from the last one, before
+// anything reads or changes the FPSCR. The same FPSCR as set_fprf after each result, whenever it is seen.
+inline void note_fprf(CpuState& s, uint64_t result, bool single) {
+    s.fprf_value = result;
+    s.fprf_pending = single ? 2u : 1u;
+}
+inline void flush_fprf(CpuState& s) {
+    if (!s.fprf_pending) return;
+    const bool single = s.fprf_pending == 2;
+    s.fprf_pending = 0;
+    set_fprf(s, s.fprf_value, single);
+}
+
 // Result of a single-precision instruction: rounded to single, kept as a double.
 inline uint64_t round_single(double d) { return bits(static_cast<double>(static_cast<float>(d))); }
 
@@ -173,6 +187,7 @@ inline uint32_t double_to_single(uint64_t d) {
 
 // fcmpu/fcmpo: CR field and FPSCR[FPCC] = FL FG FE FU.
 inline void fcmp(CpuState& s, uint32_t field, uint64_t a, uint64_t b) {
+    flush_fprf(s); // (FPCC is FPRF's low four bits: its C bit stays the last result's)
     const double x = f64(a), y = f64(b);
     const uint32_t c = (x != x || y != y) ? 1u : x < y ? 8u : x > y ? 4u : 2u;
     s.set_crf(field, c);
@@ -207,6 +222,7 @@ inline void fpscr_written(const CpuState& s) {
 // mcrfs: copy an FPSCR field to CR and clear the exception bits in it
 // (FX, OX, UX, ZX, XX and the VX causes).
 inline void mcrfs(CpuState& s, uint32_t crfd, uint32_t crfs) {
+    flush_fprf(s);
     const uint32_t shift = 28 - 4 * crfs;
     s.set_crf(crfd, (s.fpscr >> shift) & 0xF);
     s.fpscr &= ~(0x9FF80700u & (0xFu << shift));

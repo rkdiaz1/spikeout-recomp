@@ -2,9 +2,12 @@
 
 #include "ppc/disasm.hpp"
 #include "ppc/instruction.hpp"
+#include "recomp/guest.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
+#include <vector>
 
 namespace recomp {
 
@@ -24,7 +27,38 @@ GuestError::GuestError(uint32_t at, const std::string& what) : std::runtime_erro
 
 OutOfBudget::OutOfBudget(uint32_t at) : GuestError(at, "block budget used up") {}
 
-Context::Context(m3::Bus& b, std::span<const FunctionEntry> functions) : bus(b), functions_(functions) {
+namespace {
+// find()'s direct table for a function table: made the first time it is seen, kept for the run (the tables are the
+// generated code's, or the JIT's, both for the whole run).
+std::shared_ptr<const std::vector<uint32_t>> direct_table(std::span<const FunctionEntry> functions, uint32_t bytes) {
+    // (known by where it is, its size and its addresses' hash: a table freed and another made in its place, as tests
+    // do, isn't taken for it)
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (const FunctionEntry& e : functions) hash = (hash ^ e.addr) * 0x100000001B3ull;
+    struct Made {
+        const FunctionEntry* at;
+        std::size_t size;
+        uint64_t hash;
+        std::shared_ptr<const std::vector<uint32_t>> table;
+    };
+    static std::mutex lock;
+    static std::vector<Made> made;
+    std::lock_guard<std::mutex> guard(lock);
+    for (const Made& m : made)
+        if (m.at == functions.data() && m.size == functions.size() && m.hash == hash) return m.table;
+    auto table = std::make_shared<std::vector<uint32_t>>(bytes / 4, 0u);
+    for (std::size_t i = 0; i < functions.size(); ++i) {
+        const uint32_t a = functions[i].addr;
+        if (a < bytes && (a & 3) == 0 && (*table)[a / 4] == 0) (*table)[a / 4] = static_cast<uint32_t>(i + 1); // (the first: as lower_bound)
+    }
+    if (made.size() >= 16) made.erase(made.begin()); // (a few kept: a run has one or two)
+    made.push_back({functions.data(), functions.size(), hash, table});
+    return table;
+}
+} // namespace
+
+Context::Context(m3::Bus& b, std::span<const FunctionEntry> functions)
+    : bus(b), functions_(functions), direct_(direct_table(functions, kDirectBytes)) {
     cpu.reset();
     bus.irq().on_change_user = this;
     bus.irq().on_change = [](void* self) { static_cast<Context*>(self)->recheck(); };
@@ -129,10 +163,13 @@ void Context::slow_tick(uint32_t pc) {
 
 void Context::state(m3::State& s) {
     s.tag("ppc");
-    // CpuState has padding only after its last field.
+    // CpuState has padding only after its last saved field.
     static_assert(offsetof(ppc::CpuState, tb) == offsetof(ppc::CpuState, ear) + 4);
+    // (FPRF worked out first: what's saved is the FPSCR as the game would read it; a loaded one has none pending)
+    if (!s.loading()) recomp::ops::flush_fprf(cpu);
     s.bytes(&cpu, offsetof(ppc::CpuState, reserve));
     s.io(cpu.reserve);
+    if (s.loading()) cpu.fprf_pending = 0;
     // The block's tick has counted it: it counts again when it is resumed.
     uint64_t before = blocks - 1;
     s.io(before);
@@ -149,6 +186,10 @@ void Context::state(m3::State& s) {
 }
 
 const FunctionEntry* Context::find(uint32_t addr) const {
+    if (addr < kDirectBytes && (addr & 3) == 0) { // (the game's code: one look)
+        const uint32_t i = (*direct_)[addr / 4];
+        return i ? &functions_[i - 1] : nullptr;
+    }
     auto it = std::lower_bound(functions_.begin(), functions_.end(), addr,
                                [](const FunctionEntry& e, uint32_t a) { return e.addr < a; });
     return it != functions_.end() && it->addr == addr ? &*it : nullptr;

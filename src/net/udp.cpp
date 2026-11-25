@@ -195,6 +195,12 @@ bool UdpSocket::open(uint16_t port, bool shared) {
     fd_ = static_cast<intptr_t>(s);
     const int on = 1;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof on);
+    // (room for bursts: a joiner taking a state from three players at ~1.5 MB/s each filled Windows' default 64 KB in
+    // ~15 ms, every short pause in reading dropped datagrams, each sender's pace cut for them, 2026-11-24. The system
+    // may give less (Linux: up to net.core.rmem_max): what it gives is used)
+    const int receive_bytes = 4 << 20, send_bytes = 1 << 20;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&receive_bytes), sizeof receive_bytes);
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&send_bytes), sizeof send_bytes);
     if (shared) {
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof on);
 #ifdef SO_REUSEPORT

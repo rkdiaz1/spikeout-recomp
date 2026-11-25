@@ -32,6 +32,7 @@
 #include "runtime/watched_memory.hpp"
 #include "runtime/netboard.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -107,6 +108,25 @@ struct CommBoardOptions {
     // 40. Both: none.
     bool ring_second_pass = true;
     bool slave_table_late = true;
+    // Every cabinet shown the table by the counts (2026-11-19, docs/fidelity.md, "The link's table by the counts"):
+    // each board keeps the last few exchanges' whole tables (every node's part of one exchange: the master's from its
+    // data frame come back round, a slave's from its data frame and the second pass), each marked with the master's
+    // logic count in it; its main board, reading the other nodes, is shown the newest whole table in which the master's
+    // count is the count this cabinet last wrote (else the newest with an earlier one; none yet: what came, as before).
+    // Two cabinets at one count then see one table, whatever the gap between their counts: the master a count ahead
+    // (as usual), or the counts equal (the master's frame once a vblank late, the game's own wait at 0x5099C: report
+    // 5139's Communication error). Replaces slave_table_late (off while this is on); ring_second_pass carries it.
+    bool count_matched = true;
+    // The link chip as the firmware programs it (2026-11-25, docs/fidelity.md, "The link as the hardware does it"): the
+    // data frame's receive area lies inside its send area (out from 0x100, in at 0xD00, a node's part on), and the chip
+    // passes on what it receives AS IT RECEIVES IT (cut-through): each node sends its own part, then relays the stream
+    // coming in, the master included, so the master's relay is the stream come back round: every node gets every node's
+    // part of THIS exchange in one tick, no second pass. What comes in lands in the bank the 68000 has selected; the main
+    // board sees it after the next tick's bank flip (the firmware's IRQ 5), so what it reads changes only at ticks,
+    // wherever in the tick the parts arrived. Emulated a part at a time: a node's own part as a plain packet (a stream's
+    // start), the relay as kStreamMagic packets with their offset in the stream. Replaces ring_second_pass,
+    // slave_table_late and count_matched (all three ignored while on).
+    bool cut_through = true;
 
     // These three (ring_forwarding, double_buffer, slave_irq5_per_frame 0)
     // are the ring model, the default since 2026-10-26: linked games at an
@@ -118,6 +138,8 @@ struct CommBoardOptions {
         slave_irq5_per_frame = kSame;
         ring_second_pass = false;
         slave_table_late = false;
+        count_matched = false;
+        cut_through = false;
     }
     double main_frame_hz = 57.524160;
     uint64_t main_hz = 166'000'000; // the main board's CPU clock
@@ -161,6 +183,10 @@ public:
     std::array<uint64_t, 8> irqs_taken{}; // by level
     uint64_t packets_sent = 0, packets_received = 0;
     uint64_t ring_passes = 0; // (second-pass packets sent, Options::ring_second_pass: not in save states)
+    // Options::count_matched, how the main board's reads were served (not in save states): from a whole table of the
+    // count it last wrote, from one of an earlier count (none of its own count whole yet), as the data came (no whole
+    // table yet).
+    uint64_t table_reads_exact = 0, table_reads_earlier = 0, table_reads_as_came = 0;
 
     // The 68000's accesses to its control and I/O registers, the first
     // `trace_limit` of them: what the firmware does with the hardware.
@@ -221,9 +247,34 @@ private:
     static constexpr uint64_t kForwarding = UINT64_MAX; // send_done_: waiting for what it passes on
     void release_reset();
 
+    // Options::cut_through
+    bool cut() const { return options_.cut_through && options_.ring_forwarding; }
+    bool data_descriptor() const { // (the receive area inside the send area: the data frame's)
+        return recv_offset_ > send_offset_ && recv_offset_ < send_offset_ + (send_size_ & 0x7FFFu);
+    }
+    void stream_receive();
+    void stream_take(const uint8_t* data, std::size_t size, std::size_t offset);
+    void stream_relay();
+    void send_at(uint64_t cycle, const uint8_t* data, std::size_t size);
+    bool rx_stream_ = false;  // a data frame coming in (its first part taken)
+    uint32_t rx_got_ = 0;     // its bytes in, from its start
+    bool tx_stream_ = false;  // a data frame going out, the rest relayed as it comes
+    uint32_t tx_sent_ = 0;    // its bytes gone, from its start
+    uint64_t tx_start_ = 0;   // 68000 cycle it started
+
     uint8_t* bank(bool host);
     uint8_t& host_comm(uint32_t addr) { return bank(true)[(addr ^ options_.comm_ram_xor) & 0xFFFF]; }
     uint8_t& host_ram(uint32_t addr, uint32_t byte); // byte 0/1 of the PowerPC word
+
+    // Options::count_matched
+    uint8_t host_view(uint32_t at, bool count); // comm RAM byte `at` (68000 address) as the main board reads it
+    int chosen_table();                         // the table shown now (-1: none, the bank as it is)
+    int new_table(uint32_t count);              // the oldest slot, made the newest table of that count
+    uint8_t* table_part(int table, std::size_t hop) { return tables_.data() + (std::size_t(table) * kMaxNodes + hop) * kPart; }
+    uint32_t part_count(const uint8_t* part) const; // a node's logic count (its header's +0x1C) in its part, as stored
+    uint32_t own_count() const {
+        return uint32_t{own_count_[0]} << 24 | uint32_t{own_count_[1]} << 16 | uint32_t{own_count_[2]} << 8 | own_count_[3];
+    }
 
     Options options_;
     std::unique_ptr<NetLink> link_;
@@ -236,6 +287,38 @@ private:
     static constexpr std::size_t kLateTable = 0x8000;
     WatchedVector<uint8_t> late_;
     uint32_t late_size_ = 0;
+    // Options::count_matched: kTables exchanges' tables, each kMaxNodes parts by ring position (0 the master), in comm
+    // RAM's order; for each, the master's count in it, its age (table_seq_, higher newer) and the parts in (bit per
+    // position). The ring's cabinets and this board's position from the second passes (nodes_ 0: not yet known); the
+    // data frame's receive offset (the first node's part where the main board reads it) and a node's part from the
+    // firmware's data frames; the count this cabinet last wrote (its part's header +0x1C, PowerPC order) as the main
+    // board writes it. In save states and rollback's snapshots.
+    static constexpr std::size_t kTables = 6, kMaxNodes = 4, kPart = 0xC00, kNodeCount = 0x1C;
+    // (kBlock: a node's header and records, the 576 words link_frame takes each frame: at least that much of each part
+    // for a table; the rest of the part (0x900 on: the area state a joining cabinet copies, 0x6E7C4) as much as came,
+    // table_len_ its bytes, past it the bank as it is: a four-cabinet ring's come-back is a byte short)
+    static constexpr std::size_t kBlock = 0x900;
+    WatchedVector<uint8_t> tables_;
+    std::array<uint32_t, kTables> table_count_{}, table_seq_{};
+    std::array<uint8_t, kTables> table_have_{};
+    std::array<uint16_t, kTables * kMaxNodes> table_len_{};
+    // (a whole table shown from the next data frame this board takes in, not as its last part comes: what the main
+    // board is shown changes at the exchanges only, as the firmware's own data frames, wherever the second pass falls
+    // between them (one board a PC: a side run's link a little earlier or later than the real one's sees the same))
+    std::array<uint8_t, kTables> table_shown_{};
+    void show_whole_tables();
+    void table_put(int table, std::size_t at, const uint8_t* from, std::size_t size) { // (a part in, `size` bytes of it)
+        size = std::min(size, kPart);
+        std::copy_n(from, size, table_part(table, at));
+        table_len_[std::size_t(table) * kMaxNodes + at] = static_cast<uint16_t>(size);
+    }
+    uint32_t table_seq_next_ = 0;
+    uint8_t nodes_ = 0, hop_ = 0;
+    uint16_t view_base_ = 0, view_send_ = 0, part_ = 0;
+    std::array<uint8_t, 4> own_count_{};
+    uint8_t own_known_ = 0; // bit per byte of own_count_ written
+    int view_ = -1;         // (chosen_table's, worked out again when view_dirty_: not state)
+    bool view_dirty_ = true;
     std::array<uint16_t, 128> io_{};
     std::array<uint16_t, 128> ctrl_{};
     uint16_t commbank_ = 0;

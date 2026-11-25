@@ -53,9 +53,14 @@ void TilegenRenderer::draw_line(const Bus& bus, int line) {
 void TilegenRenderer::draw_line(std::span<const uint8_t> ram, const std::array<uint32_t, 64>& regs, int line,
                                 const TileSides* sides) {
     if (line < 0 || line >= kHeight) return;
-    auto word = [&](uint32_t index) -> uint32_t { // the tile generator's 32-bit word `index`
+    auto word = [&](uint32_t index) -> uint32_t { // the tile generator's 32-bit word `index` (its RAM little-endian)
         const std::size_t at = std::size_t{index} * 4;
         if (at + 3 >= ram.size()) return 0;
+        if constexpr (std::endian::native == std::endian::little) {
+            uint32_t w;
+            std::memcpy(&w, ram.data() + at, 4);
+            return w;
+        }
         return uint32_t{ram[at]} | uint32_t{ram[at + 1]} << 8 | uint32_t{ram[at + 2]} << 16 | uint32_t{ram[at + 3]} << 24;
     };
     const uint32_t control = regs[0x20 / 4];
@@ -83,6 +88,11 @@ void TilegenRenderer::draw_line(std::span<const uint8_t> ram, const std::array<u
             return w; // (the tile generator's words little-endian, as word() reads them)
         };
         const uint32_t mask = (word(kLineMask / 4 + y) >> (pair == 0 ? 16 : 0)) & 0xFFFF;
+        auto pixel_colour = [&](uint32_t base, uint32_t value) -> uint32_t { // (0: transparent; a colour's alpha set)
+            const uint32_t colour = colour_of(base | value);
+            return (colour & 0x8000) ? 0u
+                                     : 0xFF000000u | to_r[colour & 0x1F] | to_g[(colour >> 5) & 0x1F] | to_b[(colour >> 10) & 0x1F];
+        };
 
         struct Layer {
             bool enabled, above, four_bit;
@@ -256,11 +266,17 @@ void TilegenRenderer::draw_line(std::span<const uint8_t> ram, const std::array<u
                 out = (pass == 1 ? (l.above ? top_own_ : bottom_own_) : (l.above ? top_side_ : bottom_side_)).data() +
                       static_cast<std::size_t>(2 * extend_) * y + (sx < 0 ? sx + extend_ : sx - kWidth + extend_);
             const uint32_t n = end - x;
-            for (uint32_t i = 0, fx = px & 7; i < n; ++i, ++fx) {
-                const uint32_t colour = colour_of(base | pixels[fx]);
-                if (colour & 0x8000) continue; // transparent
-                out[i] = 0xFF000000u | to_r[colour & 0x1F] | to_g[(colour >> 5) & 0x1F] | to_b[(colour >> 10) & 0x1F];
+            // (a tile row of one pixel value, as an empty tile's or a plain fill's: its colour once, then the run
+            // skipped when it is transparent, else filled: the same pixels as one at a time)
+            uint64_t row8;
+            std::memcpy(&row8, pixels, 8);
+            if (row8 == (pixels[0] * 0x0101010101010101ull)) {
+                if (const uint32_t c = pixel_colour(base, pixels[0])) std::fill_n(out, n, c);
+                sx += static_cast<int>(n);
+                continue;
             }
+            for (uint32_t i = 0, fx = px & 7; i < n; ++i, ++fx)
+                if (const uint32_t c = pixel_colour(base, pixels[fx])) out[i] = c; // (0: transparent)
             sx += static_cast<int>(n);
         }
     }

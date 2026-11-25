@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -335,6 +336,10 @@ private:
     uint64_t cycle_of_tb(uint64_t tb) const;
 
     std::span<const FunctionEntry> functions_;
+    // find()'s table: for each word of the first kDirectBytes, its entry's index in functions_ + 1 (0: none), made
+    // once for each function table and shared (it never changes); other addresses searched.
+    static constexpr uint32_t kDirectBytes = 0x100000;
+    std::shared_ptr<const std::vector<uint32_t>> direct_;
     std::span<const FunctionEntry> blocks_;
     std::function<void(uint32_t)> snapshot_;
     Hook hook_ = nullptr;

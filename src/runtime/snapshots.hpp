@@ -56,6 +56,16 @@ public:
     void restore(uint64_t frame, const std::function<void(State&)>& walk);
     bool has(uint64_t frame) const;
     uint64_t last() const { return frames_.empty() ? 0 : frames_.back().frame; }
+    // The board as it was at kept frame `frame`, read out (the board itself as it is): each big buffer and the small
+    // state, as save() took them then. False: not kept. (One board a PC: a copy of a board at a joiner's seat frame,
+    // tools::net_frame::JoinBases, once that frame is settled.)
+    bool state_at(uint64_t frame, std::vector<std::vector<uint8_t>>& regions, std::vector<uint8_t>& small) const;
+    // Started again from a copy of the board at `frame` (state_at's, read out of another Snapshots), not from the board
+    // as it is now: the next save() finds every page written since that frame. `walk` only finds where the board's
+    // buffers are. False (nothing changed): the copy's buffers aren't the board's. (A joiner's first backup at its
+    // seat's frame, read out of rollback once that frame is final: tools::net_frame::JoinBases)
+    bool adopt(uint64_t frame, const std::function<void(State&)>& walk, std::vector<std::vector<uint8_t>> regions,
+               std::vector<uint8_t> small);
 
     // The last save, as it found the board (one board's backups, tools::backup): its small state, each big buffer as
     // it was then, and the pages it found written since the save before (none after starting again: started()).

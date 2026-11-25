@@ -8,7 +8,10 @@
 #
 # Needs build/onepc/fight-4700.state (the two-board fight, saved with --save-state at frame 4700) and the
 # ROMs in build/roms/spikeofe. -Prepare makes, from it, the reference (build/onepc/mash.txt) and the two
-# states the runs start from (mash-5990.state, mash-10890.state); once, or after a change that moves the game.
+# states the runs start from (mash-5990.state, mash-10890.state), and board 1's own state at the end of 10910
+# (board1-10910.state, gamerun --board-state: slave-apart's shadow from it, as network play takes a shadow from the other
+# machine's real board; the other shadow tests build theirs from the staying board's state, an approximation that
+# can't know the other board's CPU timing); once, or after a change that moves the game.
 # Outputs go to build/onepc/tests. Run from PowerShell with the toolchain's PATH (CLAUDE.md).
 param([string[]]$Only, [switch]$Prepare, [string]$Exe)
 $ErrorActionPreference = 'Stop'
@@ -28,7 +31,9 @@ if ($Prepare) {
     $jobs = @(
         @("$dir/mash.txt", (@('--blocks', '7000000000') + $never)),
         @("$out/save-5990.txt", @('--blocks', '7000000000', '--frames', '5991', '--save-state', "$dir/mash-5990.state@5990")),
-        @("$out/save-10890.txt", @('--blocks', '7000000000', '--frames', '10891', '--save-state', "$dir/mash-10890.state@10890"))
+        @("$out/save-10890.txt", @('--blocks', '7000000000', '--frames', '10891', '--save-state', "$dir/mash-10890.state@10890")),
+        # (slave-apart's shadow: board 1's real state at the end of 10910, as network play sends a board's for one)
+        @("$out/board1-10910.txt", @('--blocks', '7000000000', '--frames', '10911', '--board-state', '1@10910', "$dir/board1-10910.state"))
     )
     $running = foreach ($j in $jobs) {
         Start-Job -ArgumentList $root, $exe, $roms, ($common + @('--load-state', "$dir/fight-4700.state") + $presses + $j[1]), $j[0] {
@@ -38,7 +43,7 @@ if ($Prepare) {
         }
     }
     Wait-Job $running | Out-Null
-    Get-ChildItem "$dir/mash-5990.state", "$dir/mash-10890.state", "$dir/mash.txt" | ForEach-Object { "$($_.Name): $($_.Length) bytes" }
+    Get-ChildItem "$dir/mash-5990.state", "$dir/mash-10890.state", "$dir/board1-10910.state", "$dir/mash.txt" | ForEach-Object { "$($_.Name): $($_.Length) bytes" }
     return
 }
 
@@ -51,7 +56,7 @@ $tests = @(
     @('master-shadow',   'mash-5990',  350000000,  1, @('--one-board', '0@6000', '--one-board-tasks', '--one-board-shadow', '6100')),
     @('slave-handback',  'mash-5990',  350000000,  0, @('--one-board', '1@6000', '--one-board-camera', "$dir/cam3.rec", '--one-board-tasks', '--one-board-shadow', '6100', '--one-board-hand-back', '6250')),
     @('master-handback', 'mash-5990',  350000000,  1, @('--one-board', '0@6000', '--one-board-tasks', '--one-board-shadow', '6100', '--one-board-hand-back', '6250')),
-    @('slave-apart',     'mash-10890', 1400000000, 0, @('--one-board', '1@10900', '--one-board-camera', "$dir/cam3.rec", '--one-board-tasks', '--one-board-shadow', '10910')),
+    @('slave-apart',     'mash-10890', 1400000000, 0, @('--one-board', '1@10900', '--one-board-camera', "$dir/cam3.rec", '--one-board-tasks', '--one-board-shadow', '10910', '--one-board-shadow-state', "$dir/board1-10910.state")),
     @('slave-nocam',     'mash-5990',  350000000,  0, @('--one-board', '1@6000', '--one-board-tasks')),
     @('slave-auto',      'mash-5990',  1400000000, 0, @('--one-board', '1@6000', '--one-board-auto')),
     @('master-auto',     'mash-5990',  1400000000, 1, @('--one-board', '0@6000', '--one-board-auto')),

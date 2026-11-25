@@ -4,6 +4,9 @@ namespace m3 {
 
 namespace {
 
+// The system registers' region (memory_map.cpp's "system": its start, size and mirror bits), for the straight paths.
+constexpr uint32_t kSystemBase = 0xF0100000, kSystemSize = 0x40, kSystemMirror = 0x0E000000;
+
 // System registers (Supermodel's Model3.cpp, Read/WriteSystemRegister).
 constexpr uint32_t kSysCromBank = 0x08;  // CROM bank select: bank = ~value & 0xF (reset writes 0xFF)
 constexpr uint32_t kSysIrqEnable = 0x14;
@@ -323,11 +326,37 @@ void Bus::dma_write32(uint32_t reg, uint32_t value) {
     case 0x00: dma_.src = value; break;
     case 0x04: dma_.dest = value; break;
     case 0x08: { // length in words: the data moves now, the copy completes when the bus would have carried it
-        for (uint32_t n = value; n != 0; --n) {
-            const uint32_t word = read32(dma_.src);
-            write32(dma_.dest, (dma_.config & 0x80) ? bswap32(word) : word);
-            dma_.src += 4;
-            dma_.dest += 4;
+        // (From work RAM into one of the Real3D's word-written memories, as the game's display lists go: write_slow's
+        // checks once for the whole copy, each word then straight to the Real3D, in the same order as one at a time.
+        // Not while writes are watched or held: then word by word, as before.)
+        const uint64_t bytes = uint64_t{value} * 4;
+        const Region* to = value ? find_region(dma_.dest) : nullptr;
+        const bool real3d_words = to && (to->device == Device::Real3dCullingLow || to->device == Device::Real3dCullingHigh ||
+                                         to->device == Device::Real3dTextureFifo || to->device == Device::Real3dPolygonRam ||
+                                         to->device == Device::Real3dConfig);
+        if (real3d_words && !on_watch_ && !hold_devices_ && uint64_t{dma_.src} + bytes <= kWorkRamSize &&
+            uint64_t{dma_.dest} + bytes - 1 <= 0xFFFFFFFFu && to->contains(static_cast<uint32_t>(dma_.dest + bytes - 1)) &&
+            to->mirror == 0 && emulated(*to, dma_.dest) && (to->access & kWrite)) {
+            const bool swap = dma_.config & 0x80;
+            uint32_t off = to->offset(dma_.dest);
+            for (uint32_t n = value; n != 0; --n, dma_.src += 4, dma_.dest += 4, off += 4) {
+                const uint32_t word = load_be32(&ram_[dma_.src]);
+                const uint32_t v = swap ? bswap32(word) : word;
+                switch (to->device) {
+                case Device::Real3dCullingLow:  real3d_.write_culling_low(off, v); break;
+                case Device::Real3dCullingHigh: real3d_.write_culling_high(off, v); break;
+                case Device::Real3dTextureFifo: real3d_.write_texture_fifo(v); break;
+                case Device::Real3dPolygonRam:  real3d_.write_polygon(off, v); break;
+                default:                        real3d_.write_config(off, v); break;
+                }
+            }
+        } else {
+            for (uint32_t n = value; n != 0; --n) {
+                const uint32_t word = read32(dma_.src);
+                write32(dma_.dest, (dma_.config & 0x80) ? bswap32(word) : word);
+                dma_.src += 4;
+                dma_.dest += 4;
+            }
         }
         const uint64_t t = now();
         const uint64_t start = dma_.busy ? std::max(t, dma_.done_at) : t; // after one still going
@@ -346,8 +375,26 @@ void Bus::dma_write32(uint32_t reg, uint32_t value) {
     }
 }
 
+// The program ROMs' byte at `addr` (from kBankedCromBase: the banked window, then the fixed ROM), as device_read
+// gives it: 0xFF past a ROM's end.
+uint8_t Bus::crom_byte(uint32_t addr) const {
+    if (addr >= kFixedCromBase) {
+        const auto& crom = roms_.region(RomRegionId::Crom);
+        const uint32_t off = addr - kFixedCromBase;
+        return off < crom.size() ? crom[off] : 0xFF;
+    }
+    const auto& banked = roms_.region(RomRegionId::BankedCrom);
+    const std::size_t off = std::size_t{crom_bank_} * kCromWindowSize + (addr - kBankedCromBase);
+    return off < banked.size() ? banked[off] : 0xFF;
+}
+
 uint8_t Bus::read_byte(uint32_t addr) {
     if (addr < kWorkRamSize) return ram_[addr];
+    // (the program ROMs, the game's tables and data: straight there, as the region's device_read; not while side runs
+    // count what they read)
+    if (addr >= kBankedCromBase && !hold_devices_) return crom_byte(addr);
+    // (the system registers, any mirror: the JTAG routine reads one for every bit)
+    if (const uint32_t sys = (addr & ~kSystemMirror) - kSystemBase; !hold_devices_ && sys < kSystemSize) return system_read(sys);
     const Region* region = find_region(addr);
     if (hold_devices_ && region) ++held_reads_[static_cast<std::size_t>(region->device)];
     if (!region || !emulated(*region, addr)) {
@@ -373,6 +420,17 @@ uint32_t Bus::read_slow32(uint32_t addr) {
         uint32_t v = 0;
         for (uint32_t i = 0; i < 4; ++i) v = v << 8 | read_byte(addr + i);
         return v;
+    }
+    // (the program ROMs: straight there, as below; not a read across the banked window's end, which the region's
+    // device_read takes on into the next bank, nor one past the top of memory)
+    if (addr >= kBankedCromBase && addr <= 0xFFFFFFFCu && !hold_devices_ && (addr >= kFixedCromBase || addr + 3 < kFixedCromBase)) {
+        const bool fixed = addr >= kFixedCromBase;
+        const auto& rom = roms_.region(fixed ? RomRegionId::Crom : RomRegionId::BankedCrom);
+        const std::size_t off = fixed ? std::size_t{addr - kFixedCromBase}
+                                      : std::size_t{crom_bank_} * kCromWindowSize + (addr - kBankedCromBase);
+        if (off + 3 < rom.size()) return uint32_t{rom[off]} << 24 | uint32_t{rom[off + 1]} << 16 | uint32_t{rom[off + 2]} << 8 | rom[off + 3];
+        return uint32_t{crom_byte(addr)} << 24 | uint32_t{crom_byte(addr + 1)} << 16 | uint32_t{crom_byte(addr + 2)} << 8 |
+               crom_byte(addr + 3);
     }
     const Region* region = find_region(addr);
     if (hold_devices_ && region) ++held_reads_[static_cast<std::size_t>(region->device)];
@@ -407,6 +465,18 @@ void Bus::write_slow(uint32_t addr, uint32_t value, uint32_t size) {
                 if (marks_) marks_[(addr + i) >> kMarkShift] = 1;
                 ram_[addr + i] = static_cast<uint8_t>(value >> (8 * (size - 1 - i)));
             }
+        return;
+    }
+    // (The tile generator's RAM, characters, maps and palette in a row, as the switch below stores it, high byte first:
+    // straight there, the game's busiest device writes after the Real3D's. Not while writes are held.)
+    if (!hold_devices_ && addr >= kTileRamBase && addr - kTileRamBase <= kTileRamSize - size) {
+        for (uint32_t i = 0; i < size; ++i) tile_ram_[addr + i - kTileRamBase] = static_cast<uint8_t>(value >> (8 * (size - 1 - i)));
+        return;
+    }
+    // (The system registers, in any of their mirrors: the game's JTAG routine writes one for every bit. As the
+    // switch's System case; held writes have their own rule below.)
+    if (const uint32_t sys = (addr & ~kSystemMirror) - kSystemBase; !hold_devices_ && sys + size <= kSystemSize) {
+        for (uint32_t i = 0; i < size; ++i) system_write(sys + i, static_cast<uint8_t>(value >> (8 * (size - 1 - i))));
         return;
     }
     const Region* region = find_region(addr);

@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
@@ -21,6 +23,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -146,7 +149,9 @@ private:
 // kStateFormat: raised whenever what board_state writes changes shape (a device's state, a section).
 // 2: widescreen's tile sides 26 columns a side (21:9), 12 before (format 1's still load: m3::TileSides::state).
 // 3: the network board's slave table (m3::CommBoardOptions::slave_table_late; format 2's still load: CommBoard::state).
-inline constexpr uint64_t kStateFormat = 3;
+// 4: the network board's tables by the counts (m3::CommBoardOptions::count_matched; format 3's still load: CommBoard::state).
+// 5: the network board's data frames as they stream (m3::CommBoardOptions::cut_through; format 4's still load: CommBoard::state).
+inline constexpr uint64_t kStateFormat = 5;
 inline uint64_t code_id() {
     static const uint64_t id = [] {
         uint64_t h = 0xCBF29CE484222325ull;
@@ -311,17 +316,34 @@ public:
         std::unique_lock lock(mutex_);
         changed_.wait(lock, [&] { return turn_ == i; });
     }
-    void pass(std::size_t i) {
+    // `spin`: a board running its frame (spun on at the meeting a while first). Stand-ins (made blocks, a link replayed,
+    // one board's other cabinets) wait most of a frame for the board that runs: spinning there only took CPU from the
+    // side runs' workers (one board 4.2-4.4 ms own work a frame without, 4.5-5.2 with, 2026-11-22): they sleep at once.
+    void pass(std::size_t i, bool spin = false) {
         if (parallel_) {
             std::unique_lock lock(mutex_);
-            const uint64_t round = round_;
+            const uint64_t round = round_.load(std::memory_order_relaxed);
             if (++arrived_ == running()) {
                 release();
+                const bool wake = sleepers_ != 0;
                 lock.unlock();
-                changed_.notify_all();
+                if (wake) changed_.notify_all();
             } else {
                 at_barrier_[i] = true;
-                changed_.wait(lock, [&] { return round_ != round; });
+                lock.unlock();
+                // (spun on a while first: the boards meet 53 times a frame, and waking a sleeping thread costs
+                // more than most waits here; what each board does between meetings is the same either way)
+                const auto until = std::chrono::steady_clock::now() + (spin ? spin_ : std::chrono::microseconds(0));
+                for (unsigned n = 0; spin && round_.load(std::memory_order_acquire) == round; ++n) {
+                    pause();
+                    if ((n & 63) == 63 && std::chrono::steady_clock::now() >= until) break;
+                }
+                if (round_.load(std::memory_order_acquire) == round) {
+                    lock.lock();
+                    ++sleepers_;
+                    changed_.wait(lock, [&] { return round_.load(std::memory_order_relaxed) != round; });
+                    --sleepers_;
+                }
             }
             return;
         }
@@ -351,7 +373,7 @@ private:
         if (between_) between_();
         arrived_ = 0;
         std::fill(at_barrier_.begin(), at_barrier_.end(), false);
-        ++round_;
+        round_.fetch_add(1, std::memory_order_release); // (last: a board spinning on it then sees all the above)
     }
     void advance(std::size_t i) {
         for (std::size_t k = 1; k <= done_.size(); ++k) {
@@ -371,7 +393,24 @@ private:
     bool parallel_ = false;
     std::function<void()> between_;
     std::size_t arrived_ = 0; // parallel: at the barrier this round
-    uint64_t round_ = 0;
+    std::atomic<uint64_t> round_{0};
+    std::size_t sleepers_ = 0; // (boards asleep at the barrier, no longer spinning)
+    std::chrono::microseconds spin_{barrier_spin_us(done_.size())};
+    // How long a board spins at a meeting before it sleeps: 30 us (four boards' meetings, 53 a frame: 1.7x faster than
+    // sleeping at once, the same RAM every frame; docs/netplay.md "The boards' meetings"; held to as many cores as
+    // boards still 2.1x), none where the boards outnumber the cores (spinning there would take the time of the board
+    // everyone waits for). SPIKEOUT_BARRIER_SPIN_US=N sets it (0: sleep at once, as before).
+    static long barrier_spin_us(std::size_t boards) {
+        if (const char* v = std::getenv("SPIKEOUT_BARRIER_SPIN_US")) return std::strtol(v, nullptr, 10);
+        return std::thread::hardware_concurrency() >= boards ? 30 : 0;
+    }
+    static void pause() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
+    }
 };
 
 // The link setting (0 stand-alone, 1 master, 2 slave) is the byte at

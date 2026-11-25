@@ -49,6 +49,13 @@ struct CpuState {
     uint32_t reserve_addr = 0;
     bool reserve = false;
 
+    // FPSCR[FPRF] worked out when looked at (recomp::ops::note_fprf, flush_fprf): the last arithmetic result's bits
+    // and its precision (1 double, 2 single; 0: fpscr's FPRF is up to date). Every back end flushes it before an
+    // instruction reads or changes the FPSCR (and fcmpu/fcmpo, which keep FPRF's C bit), and Context::state before a
+    // save state is written; past `reserve`, it isn't in save states (a loaded state's fpscr is whole: none pending).
+    uint64_t fprf_value = 0;
+    uint32_t fprf_pending = 0;
+
     // CR field n (0-7) as a 4-bit value: LT GT EQ SO.
     constexpr uint32_t crf(uint32_t n) const { return (cr >> (28 - 4 * n)) & 0xF; }
     constexpr void set_crf(uint32_t n, uint32_t v) {

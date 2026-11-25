@@ -174,8 +174,20 @@ struct Screen {
     std::vector<uint32_t> frame = std::vector<uint32_t>(kWidth * kHeight, 0xFF000000u); // last finished frame
     uint64_t frame_number = 0;
     std::string stopped; // why the game stopped, once it has
-    // Inputs, active low, as the I/O board shows them.
-    std::atomic<uint8_t> bank0{0xFF}, bank1{0xFF}, controls{0xFF};
+    // Inputs, active low, as the I/O board shows them: the three bytes in one word, written and read whole (the window's
+    // thread reads the keys and pads, the game's thread takes them at its frame's start: one moment's buttons, never
+    // half of one read and half of the next; issue 7).
+    struct InputBytes {
+        uint8_t bank0 = 0xFF, bank1 = 0xFF, controls = 0xFF;
+    };
+    std::atomic<uint32_t> input_word{0xFFFFFFu};
+    void set_input(const InputBytes& b) {
+        input_word.store(uint32_t{b.bank0} | uint32_t{b.bank1} << 8 | uint32_t{b.controls} << 16, std::memory_order_release);
+    }
+    InputBytes input() const {
+        const uint32_t w = input_word.load(std::memory_order_acquire);
+        return {static_cast<uint8_t>(w), static_cast<uint8_t>(w >> 8), static_cast<uint8_t>(w >> 16)};
+    }
     // The board's memory that a cabinet keeps switched off: the settings
     // EEPROM (64 words) and the backup RAM (rankings). The game takes them as
     // it starts and gives them back as it stops; the window keeps them in
@@ -565,33 +577,29 @@ std::string pad_input_name(int code, SDL_Gamepad* pad) {
 
 // Keys and pads to the I/O boards' input bytes (bits clear while pressed):
 // player 1's onto board `focus`, player 2's onto board 1 when there is one.
+// Each cabinet's bytes worked out first, then each stored once: the game thread reads them at its frame's start, with
+// no lock (issue 7, 2026-11-18: they were set to 0xFF, nothing held, and then to the buttons held; a frame starting in
+// between saw every button let go for that frame, a charge fired early a level lower: c2 as c1, c4 as c3).
 void read_inputs(Shared& shared, std::size_t focus, const tools::Settings& settings, const std::array<SDL_Gamepad*, 2>& pads,
                  bool test, bool service) {
     const bool* k = SDL_GetKeyboardState(nullptr);
-    for (Screen& s : shared.screens) {
-        s.bank0 = 0xFF;
-        s.bank1 = 0xFF;
-        s.controls = 0xFF;
-    }
-    auto apply = [&](Screen& s, std::size_t player) {
+    using Bytes = Screen::InputBytes;
+    std::array<Bytes, kMaxBoards> bytes{};
+    auto apply = [&](Bytes& s, std::size_t player) {
         const auto held = pad_actions(pads[player], settings.pad_buttons[player]);
-        uint8_t bank0 = s.bank0, controls = s.controls;
         for (std::size_t a = 0; a < tools::kActions; ++a) {
             const int key = settings.keys[player][a];
             if (!(held[a] || (key > 0 && k[key]))) continue;
-            if (kActionBits[a].bank0) bank0 = static_cast<uint8_t>(bank0 & ~(1u << kActionBits[a].bit));
-            else controls = static_cast<uint8_t>(controls & ~(1u << kActionBits[a].bit));
+            if (kActionBits[a].bank0) s.bank0 = static_cast<uint8_t>(s.bank0 & ~(1u << kActionBits[a].bit));
+            else s.controls = static_cast<uint8_t>(s.controls & ~(1u << kActionBits[a].bit));
         }
-        s.bank0 = bank0;
-        s.controls = controls;
     };
-    if (shared.boards > 1 && focus != 1) apply(shared.screens[1], 1);
-    Screen& p1 = shared.screens[focus];
+    if (shared.boards > 1 && focus != 1 && bytes.size() > 1) apply(bytes[1], 1);
+    Bytes& p1 = bytes[focus];
     apply(p1, 0);
-    uint8_t bank0 = p1.bank0;
-    if (k[SDL_SCANCODE_F2] || test) bank0 = static_cast<uint8_t>(bank0 & ~(1u << 2));
-    if (k[SDL_SCANCODE_F1] || service) bank0 = static_cast<uint8_t>(bank0 & ~(1u << 3));
-    p1.bank0 = bank0;
+    if (k[SDL_SCANCODE_F2] || test) p1.bank0 = static_cast<uint8_t>(p1.bank0 & ~(1u << 2));
+    if (k[SDL_SCANCODE_F1] || service) p1.bank0 = static_cast<uint8_t>(p1.bank0 & ~(1u << 3));
+    for (std::size_t i = 0; i < bytes.size(); ++i) shared.screens[i].set_input(bytes[i]);
     shared.fast = k[SDL_SCANCODE_TAB];
 }
 
@@ -971,7 +979,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             const auto met = meet_timing ? clock::now() : clock::time_point{};
             tools::one_board::Game::meet(part, line); // (--net-one-board: the other cabinet's blocks due)
             const auto passing = clock::now();
-            turns.pass(index);
+            turns.pass(index, !(one_board && shared.one_board_frame != ~0ull)); // (a board running its frame, every board here: spun on a while at the meeting)
             const double waited = std::chrono::duration<double, std::milli>(clock::now() - passing).count();
             auto_board.wait(index, waited); // (Auto: not this board's work)
             if (meet_timing) // (SPIKEOUT_NET_DEBUG: the module's link runs at the meetings, and the meetings' waits)
@@ -1320,12 +1328,21 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             // (at the snapshot point; a shadow's request too: the backups first)
             // (the steps in tools/net_frame.hpp, shared with gamerun)
             const auto board_walk = [&](m3::State& st) { tools::board_state(st, c, timing, {}); };
-            const auto backup_now = [&, board_walk](uint64_t at) {
-                tools::net_frame::backup_now(*shared.netplay, shared.backups, shared.backup_bases, shared.boards, index, shared.ring, at, board_walk);
+            const auto backup_now = [&, board_walk](uint64_t at, const std::vector<uint8_t>& must = {}) {
+                tools::net_frame::backup_now(*shared.netplay, shared.backups, shared.backup_bases, shared.boards, index, shared.ring, at, board_walk, must);
             };
             if (index == shown && shared.real_netboard &&
                 tools::net_frame::backup_due(*shared.netplay, shared.backups, *shared.inputs, shared.rollback != nullptr, shared.boards, frame))
                 c.request_snapshot([backup_now, frame](uint32_t) { backup_now(frame); });
+            // (a player joining in progress: every machine's copies of the boards as at its seat's frame, as gamerun)
+            if (shared.real_netboard) {
+                if (index == shown)
+                    tools::net_frame::JoinBases::own_frame_end(*shared.netplay, shared.boards, shown, frame, *shared.inputs,
+                                                               shared.rollback.get(), shared.backups, shared.backup_bases, c, shared.ring, board_walk);
+                else
+                    tools::net_frame::JoinBases::board_frame_end(*shared.netplay, index, shown, frame, *shared.inputs, shared.rollback.get(),
+                                                                 shared.boards, c, shared.ring, board_walk);
+            }
             // Leaving (Shared::parting_wanted): the others told of a frame a little ahead; at its end, this board's state
             // to every one of them.
             if (index == shown && one_board && shared.parting_wanted && !shared.parting_frame) {
@@ -1342,7 +1359,7 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                                                                shown, frame, seats, parting, one_board))
                             return;
                         if (!parting && shared.real_netboard) {
-                            backup_now(frame);
+                            backup_now(frame, seats);
                             tools::net_frame::board_by_backup(*shared.netplay, frame, seats, "spikeout");
                             return;
                         }
@@ -1447,6 +1464,10 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                     if (row[i] != ' ' || (n && what.back() != ' ')) what += row[i], ++n;
                 std::printf("spikeout: %s\n", what.c_str());
                 net::events::add(net::events::Kind::note, 0xFF, 0xFF, frame, 0, "communication error on the screen at frame " + std::to_string(frame));
+                // (just after our join (600 frames, 10 s, from the state's): the error came with the room's state, its cause
+                // before our join: the host asked for a report of its own, with the room's history (Session::ask_report))
+                if (shared.net_start.state_frame && frame <= *shared.net_start.state_frame + 600)
+                    shared.netplay->session().ask_report(frame, what);
                 if (shared.linked.capture_frame == 0 && !(alone && !one_board->all_whole())) {
                     // (every board's state, as F9 saves it, two frames on; packed off the game thread, then the bundle)
                     shared.linked.to_file = true;
@@ -1497,7 +1518,8 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                 }
             }
             if (index == shown) {
-                tools::InputTable::Inputs in{out.bank0, out.bank1, out.controls, 0xFF};
+                const Screen::InputBytes now = out.input();
+                tools::InputTable::Inputs in{now.bank0, now.bank1, now.controls, 0xFF};
                 // Tests: SPIKEOUT_TEST_PRESS=NAME@FRAME[:N],... (gamerun --press's names) holds this player's
                 // NAME for N frames (6) from FRAME instead of the keys and pads: a run gamerun can repeat.
                 static const std::vector<TestPress> test_presses = parse_test_presses(std::getenv("SPIKEOUT_TEST_PRESS"));
@@ -1533,8 +1555,8 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
                               : sound_state;
                     tools::board_state(s, c, timing, carried);
                     std::lock_guard guard(shared.linked.lock);
+                    if (shared.linked.boards[index].empty()) ++shared.linked.saved; // (once a board: a rollback saves again, gamerun's note)
                     shared.linked.boards[index] = std::move(s.data());
-                    ++shared.linked.saved;
                 });
             // (--net-one-board: a shadow of another cabinet is exact in what it sends, not in all of its RAM)
             // (rollback: once every board's inputs up to that frame are in and none guessed wrong, and this board has
@@ -1601,9 +1623,10 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
             bus.inputs.controls = got->controls;
             bus.inputs.controls2 = got->controls2;
         } else {
-            bus.inputs.bank0 = out.bank0;
-            bus.inputs.bank1 = out.bank1;
-            bus.inputs.controls = out.controls;
+            const Screen::InputBytes now = out.input();
+            bus.inputs.bank0 = now.bank0;
+            bus.inputs.bank1 = now.bank1;
+            bus.inputs.controls = now.controls;
         }
         if (index == 0 && !networked && shared.save_request.exchange(false))
             c.request_snapshot([&](uint32_t) {
@@ -2355,7 +2378,7 @@ std::string direct_ring_fx_rml(const net::DirectRoom::View& v, int lit) {
         constexpr float kEdge = 26; // (from edge to edge of the seats' circles: the dot never over a seat's name)
         const float sx = ax + (bx - ax) / whole * kEdge, sy = ay + (by - ay) / whole * kEdge, len = whole - 2 * kEdge;
         rml += "<div class=\"rfx\" style=\"left: " + dp(sx) + "dp; top: " + dp(sy) + "dp; width: " + dp(len) + "dp; transform: rotate(" +
-               dp(deg) + "deg);\"><div class=\"rping\"></div></div>";
+               dp(deg) + "deg);\"><div class=\"rping\"><div class=\"rglow2\"></div><div class=\"rglow1\"></div><div class=\"rcore\"></div></div></div>";
     }
     return rml;
 }
@@ -3685,9 +3708,14 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(delay), one_way);
         std::vector<uint8_t> state; // (a game joined in progress: every board as the host had them)
         if (start.state_frame) {
-            tools::problems::keep_join_state(*start.state_frame, start.state); // (as it came, packed: for a problem's bundle)
-            if (auto unpacked = net::decompress(start.state)) state = std::move(*unpacked);
-            else std::printf("spikeout: the host's state doesn't unpack\n");
+            if (start.state_raw) { // (put together from chunks several players sent: as it is; packed for a problem's bundle)
+                tools::problems::keep_join_state(*start.state_frame, net::compress(start.state));
+                state = std::move(start.state);
+            } else {
+                tools::problems::keep_join_state(*start.state_frame, start.state); // (as it came, packed: for a problem's bundle)
+                if (auto unpacked = net::decompress(start.state)) state = std::move(*unpacked);
+                else std::printf("spikeout: the host's state doesn't unpack\n");
+            }
         } else if (!test_state_file.empty() && netgame->host) { // (tests: SPIKEOUT_TEST_NET_STATE, above, as gamerun's)
             std::vector<uint8_t> bytes = test_state_file;
             if (bytes.size() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD)
@@ -6413,7 +6441,11 @@ int main(int argc, char** argv) {
         {
             static auto slow_from = now;
             static uint64_t slow_frames_from = 0;
-            if (!(netgame && netgame->running) || shared.catching_up) {
+            // (counted afresh with each network game: its start zeroes net_frames, and a minute measured from the
+            // game before's count said "slow" wrongly, issue 38: 43.1 for 57.3 after watching a game first)
+            static auto slow_game = net_game_began;
+            if (!(netgame && netgame->running) || shared.catching_up || slow_game != net_game_began) {
+                slow_game = net_game_began;
                 slow_from = now, slow_frames_from = shared.net_frames.load();
             } else if (now - slow_from >= std::chrono::seconds(60)) {
                 const double secs = std::chrono::duration<double>(now - slow_from).count();
@@ -6510,8 +6542,7 @@ int main(int argc, char** argv) {
             if (netgame->running)
                 if (const auto again = netgame->play->take_resync()) net_resync(*again);
             if (netgame && netgame->running && shared.paused) { // (the menu open)
-                Screen& s = shared.screens[shared.local];
-                s.bank0 = 0xFF, s.bank1 = 0xFF, s.controls = 0xFF;
+                shared.screens[shared.local].set_input({});
             }
         }
         if (discovery) discovery->poll(); // (games heard of, for the nearby list)

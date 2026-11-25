@@ -341,8 +341,14 @@ Real3dGpu::~Real3dGpu() {
 // viewport with its decals after the rest of it.
 void Real3dGpu::build(const m3::Real3dScene& scene) {
     const auto& polys = scene.polygons;
-    vertices_.clear();
+    vertex_bytes_ = 0;
     groups_.clear();
+    // (bytes put at `used` of `list`, grown only past its largest size yet)
+    auto append = [](std::vector<uint8_t>& list, std::size_t& used, const void* from, std::size_t size) {
+        if (used + size > list.size()) list.resize(std::max(list.size() * 2, used + size));
+        std::memcpy(list.data() + used, from, size);
+        used += size;
+    };
     polygons_.resize(polys.size() * sizeof(GpuPolygon));
     for (size_t i = 0; i < polys.size(); ++i) {
         const GpuPolygon g = pack(polys[i]);
@@ -360,7 +366,7 @@ void Real3dGpu::build(const m3::Real3dScene& scene) {
     // triangles).
     std::vector<uint32_t> quad_of(polys.size(), kNoQuad);
     std::vector<bool> bounded; // by quad
-    quads_.clear();
+    quad_bytes_ = 0;
     if (quads_on_)
         for (size_t i = 0; i < polys.size(); ++i) {
             const m3::Real3dScene::Polygon& p = polys[i];
@@ -409,10 +415,8 @@ void Real3dGpu::build(const m3::Real3dScene& scene) {
                 q.normal[k][1] = e[k].ny;
                 q.normal[k][2] = e[k].nz;
             }
-            quad_of[i] = static_cast<uint32_t>(quads_.size() / sizeof(GpuQuad));
-            const size_t at = quads_.size();
-            quads_.resize(at + sizeof q);
-            std::memcpy(quads_.data() + at, &q, sizeof q);
+            quad_of[i] = static_cast<uint32_t>(quad_bytes_ / sizeof(GpuQuad));
+            append(quads_, quad_bytes_, &q, sizeof q);
         }
 
     auto emit = [&](std::vector<Draw>& draws, size_t index, bool decal) {
@@ -421,11 +425,9 @@ void Real3dGpu::build(const m3::Real3dScene& scene) {
         const uint32_t quad = quad_of[index];
         auto put = [&](const m3::Real3dScene::Vertex& v) {
             const GpuVertex g{v.x, v.y, v.z, v.u, v.v, v.shade, v.nx, v.ny, v.nz, static_cast<uint32_t>(index), quad};
-            const size_t at = vertices_.size();
-            vertices_.resize(at + sizeof g);
-            std::memcpy(vertices_.data() + at, &g, sizeof g);
+            append(vertices_, vertex_bytes_, &g, sizeof g);
         };
-        const auto first = static_cast<uint32_t>(vertices_.size() / sizeof(GpuVertex));
+        const auto first = static_cast<uint32_t>(vertex_bytes_ / sizeof(GpuVertex));
         put(e[0]);
         put(e[1]);
         put(e[2]);
@@ -557,13 +559,13 @@ void Real3dGpu::render(const m3::Real3dScene& scene, std::span<const uint16_t> t
         cost_ = {};
         cost_.pack_ms = std::chrono::duration<double, std::milli>(uploading - packing).count();
         SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-        upload(vertex_buffer_, vertex_upload_, vertex_capacity_, vertices_.data(), static_cast<uint32_t>(vertices_.size()),
+        upload(vertex_buffer_, vertex_upload_, vertex_capacity_, vertices_.data(), static_cast<uint32_t>(vertex_bytes_),
                SDL_GPU_BUFFERUSAGE_VERTEX, copy);
         upload(polygon_buffer_, polygon_upload_, polygon_capacity_, polygons_.data(), static_cast<uint32_t>(polygons_.size()),
                SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, copy);
         upload(viewport_buffer_, viewport_upload_, viewport_capacity_, viewports_.data(),
                static_cast<uint32_t>(viewports_.size()), SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, copy);
-        upload(quad_buffer_, quad_upload_, quad_capacity_, quads_.data(), static_cast<uint32_t>(quads_.size()),
+        upload(quad_buffer_, quad_upload_, quad_capacity_, quads_.data(), static_cast<uint32_t>(quad_bytes_),
                SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, copy);
         size_t rows_changed = 0; // (more than the whole of it: a whole upload)
         for (const auto& run : changed_rows_) rows_changed += run.second;

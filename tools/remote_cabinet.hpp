@@ -17,7 +17,9 @@
 // interrupts. So this board's own game is untouched: the same, hash for
 // hash, as with the other boards running.
 //
-// Relations: a slave runs a frame behind the master. A record of logic count
+// Relations: on the link as the hardware does it (m3::CommBoardOptions::cut_through, 2026-11-25) the cabinets run
+// level (each Remote's `ahead` 0: tools::one_board::master_lead); on the link before it, as below, a slave ran a
+// frame behind the master. A record of logic count
 // L carries its camera's heading after update L-1, its view of each
 // character from the view tests of L-2, its player's first word's view bits
 // from L-1. A slave's game reads the master's record from two counts back,
@@ -155,6 +157,14 @@ inline void scatter_regions(std::span<uint8_t> ram, const std::vector<uint8_t>& 
     }
 }
 constexpr uint32_t kLinkMemory = 0x140000, kLinkBytes = 0x10000;
+// The cabinets' handshake (0x6F434, mode 5 of the mode dispatch: a room waiting for every cabinet): this cabinet's ready
+// bit (its header's +0x10 bit 0, the word's low byte), its mode (-16372(r13)), how many nodes (-31142(r13)), and its node
+// table (0x140014 + 4 * k, k = 1 .. nodes: where it keeps each other node's header as received; the handshake reads each
+// one's +4 (in the ring), +0x10 (ready) and +0x14)
+constexpr uint32_t kHandshakeReady = 0x140113, kNodeCount = 0x10065A, kNodeTable = 0x140014, kNodeHeadBytes = 0x18;
+// (the handshake's entry, and where its two ends meet after its last read, before it returns: hooked, m3::games;
+// its caller's return point 0x49850 is no block's start, never hooked)
+constexpr uint32_t kHandshake = 0x6F434, kHandshakeReturn = 0x6F504;
 constexpr std::pair<uint32_t, uint32_t> kLinkVars[] = {{0x100004, 0x100008}, {0x1000A4, 0x1000AC}, {0x106288, 0x106295}};
 // In the link memory, what the game (not the link) writes, the same on every cabinet (the world's): +0x44 (0x5A9A4,
 // 0x5A94C), the header's +0x06 (0x4B4C0), +0x18 (0x6F7B0 from 0x59B8C), +0x3F (0x59C7C), +0x50-0x57 and +0x5C-0x5F
@@ -182,6 +192,21 @@ constexpr std::pair<uint32_t, uint32_t> kCabinetOwn[] = {
     {0x104103, 0x104104}, {0x10065B, 0x10065C}, {0x106004, 0x10600C}, {0x106180, 0x106181}, {0x1061B7, 0x1061BB},
     {0x1061CD, 0x1061E6}, {0x106242, 0x10624D}, {0x106268, 0x10626C}, {0x106295, 0x1062A4}, {0x1062AD, 0x1062AE},
     {0x1062C7, 0x1062C8}, {0x1062DC, 0x1062DD}, {0x100100, 0x100120}, {0x140104, 0x140108}, {0x140154, 0x140157}, {0x140300, 0x140304},
+    // (the cabinets' handshake (0x6F434, from the mode dispatch 0x49830 in mode 5, a room waiting for every cabinet as a
+    // player joins): its header's +0x10 bit 0, ready (0x140113, own_mask_ 0x01), and +0x14, its comm timer -32612(r13)
+    // while waiting, then the first other ready one's +0x14. A side run threw its writes away: a made header kept the
+    // +0x14 of its hand-back while the real one counted (3,300 frames of "node" problems through a join, 2026-11-23).
+    // Its own, it must read the others' through its own view of the ring (side_run: its node table and the headers it
+    // points at, from its link memory, in mode 5); through this board's, a made cabinet stayed in the handshake 4,500
+    // frames after its real one left it, its records wrong (issue22.ps1 -OthersOne -JoinerOne, 2026-11-23))
+    {0x10009C, 0x1000A0}, {0x140113, 0x140118},
+    // (its vblank count, the video interrupt's (0x100038, -32712(r13)): its 2D scroll update waits for the vblank (0x5099C)
+    // only while no interrupt has come since its last call, and only the wait clears it, so whether a cabinet waits each
+    // frame or has skipped the wait for good (its frames' work once past the vblank) is its own: one vblank a frame, taken
+    // by its tasks' wait (side_run) or added at the frame's end (end_frame). This board's before, a shadow started from
+    // this board's state took this board's (2026-11-25: one already past it for good started as one waiting, and lost a
+    // frame 228 frames on, tools/onepc-tests.ps1 slave-apart))
+    {kVblankCount, kVblankCount + 1},
     {0x1A34A0, 0x1A34C0}, {0x1A74A0, 0x1A74C0}, {0x1AB4A0, 0x1AB4C0}, {0x1AF4A0, 0x1AF4C0}, {0x1B34A0, 0x1B34C0},
     {0x1B74A0, 0x1B74C0}, {0x1BB4A0, 0x1BB4C0}, {0x1BF4A0, 0x1BF4C0}, {0x1C34A0, 0x1C34C0}, {0x1C74A0, 0x1C74C0},
     {0x1CB4A0, 0x1CB4C0}, {0x1CF4A0, 0x1CF4C0},
@@ -192,15 +217,25 @@ constexpr std::pair<uint32_t, uint32_t> kCabinetOwn[] = {
     // a third cabinet's 9 frames after the others', 2026-11-07, tools/onepc-diff.ps1); bit 0 of its word 0 on the master, 1 on a slave)
     {0x11CF80, 0x11D000}};
 
+// A player's object (0..3), an enemy's (0..7).
+constexpr uint32_t player_object(std::size_t seat) { return 0x1A0000 + 0x4000 * static_cast<uint32_t>(seat); }
+constexpr uint32_t character_object(uint32_t k) { return k < 4 ? 0x1A0000 + 0x4000 * k : 0x1B0000 + 0x4000 * (k - 4); }
+// Each character's fields its cabinet keeps for itself that its record's entry takes the low byte of (0x74808, 0x74884,
+// sync_check_build: +4 the low byte of +0x3F02, +5 of +0x3F22, +6 of +0x34A0 (in kCabinetOwn's view area), +7 of
+// +0x34FC). +0x3F02 and +0x3F22 lie past what a character's set-up clears (rob_create 0x1E3D8: 0x3F00 of its 0x4000
+// bytes) and change with its own player's hits; +0x34FC is its logic count at the set-up. A cabinet's own variables
+// since 2026-11-22: kept as a heuristic only at a hand-back before (Remote::kept), a new enemy or a hit after it made
+// records with this board's bytes and the late joiner's board went out of step (build/t-i22/issue22.ps1 -JoinerOne).
+constexpr std::pair<uint32_t, uint32_t> kCharacterOwn[] = {{0x34FC, 0x3500}, {0x3F02, 0x3F04}, {0x3F22, 0x3F24}};
 inline std::vector<uint32_t> own_addresses() {
     std::vector<uint32_t> out;
     for (const auto& [lo, hi] : kCabinetOwn)
         for (uint32_t a = lo; a < hi; ++a) out.push_back(a);
+    for (uint32_t k = 0; k < 12; ++k)
+        for (const auto& [lo, hi] : kCharacterOwn)
+            for (uint32_t a = lo; a < hi; ++a) out.push_back(character_object(k) + a);
     return out;
 }
-// A player's object (0..3), an enemy's (0..7).
-constexpr uint32_t player_object(std::size_t seat) { return 0x1A0000 + 0x4000 * static_cast<uint32_t>(seat); }
-constexpr uint32_t character_object(uint32_t k) { return k < 4 ? 0x1A0000 + 0x4000 * k : 0x1B0000 + 0x4000 * (k - 4); }
 // A record's character entry's +4..+7 (0x74808, 0x74884): the low bytes of these fields of the character's object
 // (offset, size). Each cabinet keeps its own: +0x34FC is its logic count when the character was set up (0x1E938),
 // which differs between cabinets by as many counts as one had missed before (two in a bot game: 0x24F against
@@ -252,7 +287,15 @@ public:
         for (std::size_t k = 0; k < own_.size(); ++k) {
             for (uint32_t ch = 0; ch < 12; ++ch)
                 if (own_[k] == character_object(ch) + 3) own_mask_[k] = 0x18;
+            if (own_[k] == kHandshakeReady) own_mask_[k] = 0x01; // (the handshake's ready bit, the header's +0x10 bit 0)
         }
+        // (where each character's entry bytes +4..+7 come from in its own variables: kCharacterOwn's low bytes, +0x34A3)
+        for (uint32_t ch = 0; ch < 12; ++ch)
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t a = character_object(ch) + kEntryFields[j].first + kEntryFields[j].second - 1;
+                const auto at = std::find(own_.begin(), own_.end(), a);
+                entry_own_[ch][j] = at == own_.end() ? -1 : static_cast<int>(at - own_.begin());
+            }
     }
 
     ~Cabinets() { stop_workers(); }
@@ -287,6 +330,10 @@ public:
         r->state_own.resize(own_.size());
         for (std::size_t k = 0; k < own_.size(); ++k) r->state_own[k] = ram[own_[k]];
         r->logic = word(kLogicCounter), r->logic_frame = last, r->frame_at[r->logic] = last, r->flow_applied = r->logic;
+        // (its characters' entry bytes for its next record, as its own link's checks left them in its working record)
+        for (uint32_t k = 0; k < 12; ++k)
+            for (uint32_t j = 0; j < 4; ++j) r->entry_own[4 * k + j] = ram[kWorkingRecord + 0x14 + 12 * k + 4 + j];
+        r->entry_own_count = r->logic + 1;
         r->written_frame = last;
         for (uint32_t k = 0; k < 12; ++k)
             for (uint32_t j = 0; j < 4; ++j) {
@@ -344,6 +391,26 @@ public:
     void link_early(std::size_t seat, uint64_t from) {
         if (Remote* r = find(seat)) r->link_from = from;
     }
+    // Level cabinets (tools::one_board::master_lead 0): a shadow from this board's state as it finishes a count (0x36E94,
+    // at cycle `t` of frame `frame`) starts in this very frame, before the made link's usual time (write_at_, near the
+    // frame's end): its link of the count made now (on the link as the hardware does it a block shows only at the next
+    // tick, so made sooner within the frame it is the same), and its own variables after the count (its side run of it
+    // done at this board's dispatcher) kept for shadow_state.
+    void shadow_now(std::size_t seat, uint32_t count, uint64_t frame, uint64_t t) {
+        settle();
+        Remote* r = find(seat);
+        if (!r || !r->making) return;
+        if (r->logic + 1 == count && r->written_frame != frame) { // (its link of the count not made yet: else made already)
+            r->netboard->sync(t);
+            r->written_frame = frame;
+            if (!missed(*r, frame)) {
+                if (ready(*r)) link_run(*r, frame);
+                else r->pending = frame;
+            }
+        }
+        r->own_snap[r->own_logic + 1] = {r->own, r->camera, r->regions};
+        while (r->own_snap.size() > 4) r->own_snap.erase(r->own_snap.begin());
+    }
     // The master's shadow, at this board's dispatcher of count L (the master then just past its link of L+1, a
     // count ahead): its count L run here as it, flow and tasks, up to its drawing's vblank wait; `ram` and `cpu`
     // its RAM and CPU there, for a board to go on from as it (its drawing of L, its link of L+1 at once, its count
@@ -390,6 +457,11 @@ public:
     uint32_t stop_after(std::size_t seat) {
         const Remote* r = find(seat);
         return r && r->shadowed ? r->stop_after : 0;
+    }
+    // Its shadow asked back to side runs, where it stops known yet or not.
+    bool hand_back_asked(std::size_t seat) {
+        const Remote* r = find(seat);
+        return r && r->shadowed && r->hand_back_asked;
     }
     // Its shadow to be handed back, where it stops (known): any time now, from its own board's thread.
     bool hand_back_pending(std::size_t seat) {
@@ -486,8 +558,8 @@ public:
         settle();
         std::size_t n = 0;
         for (const Remote& r : remotes_) {
-            n += r.camera.size() + r.own.size() + r.link.size() + r.link_vars.size() + r.state_own.size() + r.saved_world.size() +
-                 r.view_world.size() + r.regions.size() + r.heading_at.size() * 8 + r.view_at.size() * 12 + r.frame_at.size() * 12;
+            n += r.camera.size() + r.own.size() + r.link.size() + r.link_vars.size() + r.state_own.size() + (r.saved_world ? r.saved_world->size() : 0) +
+                 (r.view_world ? r.view_world->size() : 0) + r.regions.size() + r.heading_at.size() * 8 + r.view_at.size() * 12 + r.frame_at.size() * 12;
             for (const auto& [k, d] : r.flow_delta) n += d.size() * 8;
             for (const auto& [k, s] : r.own_snap) n += s.own.size() + s.camera.size() + s.regions.size();
             for (const auto& [k, s] : r.link_snap) n += s.first.size() + s.second.size();
@@ -500,6 +572,7 @@ private:
     struct Remote {
         std::size_t seat = 0;
         int ahead = 0;
+        bool vblank_taken = false; // (this frame's vblank taken by its tasks' wait, kVblankCount: none added at the frame's end)
         m3::NetBoardDevice* netboard = nullptr;
         Seeder seeder;
         std::vector<uint8_t> camera, own; // (empty: not started)
@@ -514,6 +587,10 @@ private:
         // variables and own variables as its last link run left them; its flows' changes since applied before the next)
         std::vector<uint8_t> link, link_vars, state_own;
         uint32_t flow_applied = 0;
+        // (its characters' entry bytes +4..+7 for its next record, as its last link run's checks wrote them
+        // (sync_check_build, from its own variables): the count of the record they are for, 0 none)
+        uint32_t entry_own_count = 0;
+        std::array<uint8_t, 48> entry_own{};
         Block block{};                     // (its last block)
         uint64_t written_frame = ~0ull;
         uint64_t pending = ~0ull;     // (a frame whose link run waits for its camera's view of its player)
@@ -551,7 +628,7 @@ private:
         // link run then takes its working record as its shadow left it)
         bool hand_back_asked = false, catch_up = false, first_link_working = false;
         uint32_t stop_after = 0, saved_count = 0;
-        std::vector<uint8_t> saved_world, view_world; // (this board's world before its tasks of that count, and after it)
+        std::shared_ptr<const std::vector<uint8_t>> saved_world, view_world; // (this board's world before its tasks of that count, and after it: shared, so a rollback's copy of the module each frame copies a pointer, not 8 MB)
         std::vector<uint8_t> regions; // (its characters' pose buffers, kPoses-, from its animation steps run here)
         // (for a shadow: its own variables and camera as its flow of a count starts (after the count before), its
         // link memory and variables after its link of a count)
@@ -584,9 +661,16 @@ private:
 public:
     // Rollback (tools/rollback.hpp): everything it carries from one frame to the next, the other cabinets' made
     // here, to be put back with the boards (taken at a frame's end, outside any side run).
+    // (this board's record's character entries (+0x14..+0xA3) for a count: sync_check_build's at its link of the count
+    // before, the same on every cabinet but each one's own bytes)
+    // (the last word: 1 where noted at its frame's end, final; a meeting's note can come in the link between its count
+    // going on and its checks, the entries still the count before's)
+    static constexpr uint32_t kEntryWords = (0xA4 - 0x14) / 4;
+    using Entries = std::array<uint32_t, kEntryWords + 1>;
     struct Kept {
         std::vector<Remote> remotes;
         std::map<uint32_t, Players> players_at;
+        std::map<uint32_t, Entries> entries_at;
         std::vector<uint32_t> ahead_record;
         std::map<uint32_t, std::vector<ppc::CpuState>> view_chars;
         std::vector<uint8_t> captured;
@@ -595,10 +679,10 @@ public:
     };
     Kept keep() const {
         settle();
-        return {remotes_, players_at_, ahead_record_, view_chars_, captured_, captured_cpu_, idle_msr_}; }
+        return {remotes_, players_at_, entries_at_, ahead_record_, view_chars_, captured_, captured_cpu_, idle_msr_}; }
     void put_back(const Kept& k) {
         settle();
-        remotes_ = k.remotes, players_at_ = k.players_at, ahead_record_ = k.ahead_record, view_chars_ = k.view_chars;
+        remotes_ = k.remotes, players_at_ = k.players_at, entries_at_ = k.entries_at, ahead_record_ = k.ahead_record, view_chars_ = k.view_chars;
         captured_ = k.captured, captured_cpu_ = k.captured_cpu, idle_msr_ = k.idle_msr;
     }
 
@@ -688,8 +772,10 @@ private:
     uint64_t write_at_;
     std::vector<uint32_t> own_;
     std::vector<uint8_t> own_mask_; // (the bits of each that are a cabinet's own)
+    std::array<std::array<int, 4>, 12> entry_own_{}; // (each character's entry byte +4..+7: its index in own_, -1 none)
     std::vector<Remote> remotes_;
     std::map<uint32_t, Players> players_at_; // (by count)
+    std::map<uint32_t, Entries> entries_at_; // (by count: this board's record's character entries for it, noted at meetings)
     bool in_view_ = false, in_update_ = false, in_link_ = false;
     mutable std::vector<uint32_t> ahead_record_; // (the working record after a flow run on the side)
     std::map<uint32_t, std::vector<ppc::CpuState>> view_chars_; // (this board's view tests, by count: each as called, r14 the character)
@@ -775,7 +861,38 @@ private:
         Stats* stats = nullptr;  // (a worker's: its counts, not this board's)
         uint32_t now = 0, was = 0;
         uint64_t frame = 0, at_frame = 0;
+        const Remote* r = nullptr; // (the cabinet whose side run this is: side_run)
+        std::vector<std::pair<uint32_t, uint8_t>> handshake_saved{}; // (this board's bytes under the handshake's view)
     };
+    // A side run's hook at the cabinets' handshake (kHandshake .. kHandshakeReturn): the other nodes as that cabinet
+    // has them, its node table and the headers it points at (+4 in the ring, +0x10 ready, +0x14), from its link memory
+    // as its last link left them, for the handshake's run only; this board's put back as it returns (the rest of the
+    // flow reads this board's, as every side run). Through this board's view a made cabinet stayed in the handshake
+    // 4,500 frames after its real one had left it (2026-11-23, issue22.ps1 -OthersOne -JoinerOne).
+    static void handshake_hook(Exec& e, uint32_t pc) {
+        if (pc == kHandshakeReturn) {
+            for (auto it = e.handshake_saved.rbegin(); it != e.handshake_saved.rend(); ++it) e.bus.write8(it->first, it->second);
+            e.handshake_saved.clear();
+            return;
+        }
+        if (pc != kHandshake || !e.r || e.r->link.size() != kLinkBytes) return;
+        const auto link_byte = [&](uint32_t a) { return e.r->link[a - kLinkMemory]; };
+        const auto put = [&](uint32_t a) {
+            const uint8_t was = e.bus.read8(a), v = link_byte(a);
+            if (was == v) return;
+            e.handshake_saved.emplace_back(a, was);
+            e.bus.write8(a, v);
+        };
+        const uint32_t nodes = e.bus.read8(kNodeCount);
+        for (uint32_t k = 1; k <= nodes && k < 8; ++k) {
+            const uint32_t slot = kNodeTable + 4 * k;
+            const uint32_t at = uint32_t{link_byte(slot)} << 24 | uint32_t{link_byte(slot + 1)} << 16 | uint32_t{link_byte(slot + 2)} << 8 |
+                                link_byte(slot + 3);
+            for (uint32_t i = 0; i < 4; ++i) put(slot + i);
+            if (at < kLinkMemory || at + kNodeHeadBytes > kLinkMemory + kLinkBytes) continue;
+            for (uint32_t i = 0; i < kNodeHeadBytes; ++i) put(at + i);
+        }
+    }
     // A cabinet's flows and tasks of a count, and its view of its own player after (tasks mode, at this board's
     // dispatcher): its buttons, frame and this board's frame then, worked out here.
     struct Job {
@@ -901,6 +1018,7 @@ private:
         Exec& e = *static_cast<Exec*>(user);
         if (e.in_tasks && pc == kVblankWait) throw TasksDrawing{};
         if (e.inside && pc == kTransferLoop) e.bus.write8(kTransferBusy, 0);
+        if (e.inside) handshake_hook(e, pc);
     }
     // How many workers: SPIKEOUT_SIDE_WORKERS=N (SPIKEOUT_SIDE_THREAD=0: none, side runs on this board's thread); else
     // the system's threads less two (this board's and one for the rest: the window's sound and 2D), at least one,
@@ -1090,6 +1208,12 @@ inline bool Cabinets::started(Remote& r, uint32_t logic) {
     Seed s;
     if (!r.seeder || !r.seeder(r.seat, logic, s) || s.camera.size() != kCameraBytes || s.own.size() != own_.size()) return false;
     r.camera = std::move(s.camera), r.own = std::move(s.own), r.own_logic = s.own_logic;
+    // (its vblank count in the seed (its board's, at its mode dispatch or where it finished a count, 0x36E94): its next
+    // count's scroll update comes after a vblank not in it, and no frame's end here adds it before its first side run.
+    // One past its wait for good (its count running on) has it added; a waiting one (0) is in its wait, which takes it)
+    for (std::size_t k = 0; k < own_.size(); ++k)
+        if (own_[k] == kVblankCount && r.own[k] != 0) r.own[k] = static_cast<uint8_t>(r.own[k] + 1);
+    r.vblank_taken = false;
     if (s.regions.size() == kRegionBytes) r.regions = std::move(s.regions);
     else r.regions = gather_regions(bus_.ram());
     return true;
@@ -1133,7 +1257,8 @@ inline void Cabinets::side_run(Exec& e, Remote& r, uint32_t pc, uint32_t* flags,
     e.c.set_scheduler(nullptr);
     e.c.cpu.msr &= ~recomp::Context::kMsrEE;
     e.c.limit_aside(30'000'000);
-    e.inside = true;
+    e.inside = true, e.r = &r;
+    e.handshake_saved.clear();
     e.bus.hold_device_writes(true);
     std::vector<uint8_t> before; // (its flow's: its own bytes before, for what it changed)
     if (pc == kModeDispatch)
@@ -1195,6 +1320,9 @@ inline void Cabinets::side_run(Exec& e, Remote& r, uint32_t pc, uint32_t* flags,
                             try {
                                 e.c.call(e.bus.read32(entry + 12));
                             } catch (const TasksDrawing&) {
+                                // (its vblank wait (0x36E04): the vblank comes, the wait clears its count; this frame's taken)
+                                e.bus.write8(kVblankCount, 0);
+                                r.vblank_taken = true;
                             }
                         }
                         entry += e.bus.read32(entry + 8);
@@ -1248,7 +1376,8 @@ inline void Cabinets::side_run(Exec& e, Remote& r, uint32_t pc, uint32_t* flags,
     const auto ran_to = std::chrono::steady_clock::now();
     (e.stats ? e.stats->side_seconds : side_seconds_) += std::chrono::duration<double>(ran_to - started_at).count();
     ++(e.stats ? e.stats->side_runs : side_runs_);
-    e.inside = false;
+    e.inside = false, e.r = nullptr;
+    e.handshake_saved.clear(); // (any left: put back with the rest of the run's writes)
     e.bus.hold_device_writes(false);
     if (keep_camera)
         for (uint32_t i = 0; i < kCameraBytes; ++i) r.camera[i] = e.bus.read8(kCamera + i);
@@ -1305,6 +1434,7 @@ inline bool Cabinets::hook(uint32_t pc) {
     if (main_.in_tasks && pc == kVblankWait) throw TasksDrawing{};
     if (main_.inside) { // (a transfer its tasks wait for (a banner's tiles): done at once, its device writes held)
         if (pc == kTransferLoop) bus_.write8(kTransferBusy, 0);
+        handshake_hook(main_, pc);
         return true;
     }
     if (pc == kBeforeIdle) { // (this board's MSR there, which a master's shadow starting there takes)
@@ -1317,7 +1447,13 @@ inline bool Cabinets::hook(uint32_t pc) {
     if (pc == kModeDispatch || pc == kViewTest || pc == kLinkSkipped) settle(); // (the worker's runs' results wanted here)
     if (pc == kLinkSkipped) // (a slave handed back: this board's world after the count it is to catch up, for its view tests)
         for (Remote& r : remotes_)
-            if (!r.saved_world.empty() && r.saved_count == bus_.read32(kLogicCounter)) r.view_world.assign(bus_.ram().begin(), bus_.ram().end());
+            if (r.saved_world && r.saved_count == bus_.read32(kLogicCounter)) r.view_world = std::make_shared<const std::vector<uint8_t>>(bus_.ram().begin(), bus_.ram().end());
+    if (pc == kLinkSkipped) { // (this board's frame's end: its link's checks done, its entries for its next count final)
+        Entries& e = entries_at_[bus_.read32(kLogicCounter) + 1];
+        for (uint32_t i = 0; i < kEntryWords; ++i) e[i] = bus_.read32(kWorkingRecord + 0x14 + 4 * i);
+        e[kEntryWords] = 1;
+        while (entries_at_.size() > 8) entries_at_.erase(entries_at_.begin());
+    }
     const uint32_t logic = bus_.read32(kLogicCounter);
     switch (pc) {
     case kCameraView: // (its writes are the camera's own, until the next view test)
@@ -1344,18 +1480,27 @@ inline bool Cabinets::hook(uint32_t pc) {
         for (Remote& r : remotes_) {
             if (r.hand_back_asked && r.shadowed && r.stop_after == 0) { // (a hand-back: where its shadow stops; a slave's world)
                 r.stop_after = logic + static_cast<uint32_t>(r.ahead);
-                if (r.ahead < 0) r.saved_world.assign(bus_.ram().begin(), bus_.ram().end()), r.saved_count = logic;
+                if (r.ahead < 0) r.saved_world = std::make_shared<const std::vector<uint8_t>>(bus_.ram().begin(), bus_.ram().end()), r.saved_count = logic;
             }
+            // (and any cabinet's whose hand-back hasn't come by this board's flow of the count after its shadow's last (it
+            // comes from the shadow's own thread): this board's world here, its count caught up on it once it comes. Run
+            // later, with the next, that count ran without its tasks (no camera update, no view tests): its camera a count
+            // behind and the joiner out of step, 2026-11-22, two slaves stopping after 102951 with this board at 102952)
+            if (r.hand_back_asked && r.shadowed && r.stop_after != 0 && logic == r.stop_after + 1 && !r.saved_world)
+                r.saved_world = std::make_shared<const std::vector<uint8_t>>(bus_.ram().begin(), bus_.ram().end()), r.saved_count = logic;
+            // (one kept for nothing: its hand-back no longer asked (a shadow still), or handed back with no count to catch up)
+            if (r.saved_world && ((r.shadowed && !r.hand_back_asked) || (!r.shadowed && !r.catch_up)))
+                r.saved_world.reset(), r.view_world.reset();
             if (r.catch_up && !r.shadowed) { // (handed back, a slave: its count after the shadow's last, on the world kept)
                 r.catch_up = false;
                 if (r.saved_count == r.own_logic + 1) {
-                    world_ = &r.saved_world;
+                    world_ = r.saved_world.get();
                     side_run(main_, r, pc, nullptr, true, r.saved_count, 0, true);
                     world_ = nullptr;
                     r.own_logic = r.saved_count;
                     // (its view tests of that count, of what this board's took, on this board's world after it (before
                     // its next link moved the characters the other cabinets' records carry))
-                    world_ = r.view_world.empty() ? nullptr : &r.view_world;
+                    world_ = r.view_world.get();
                     if (const auto chars = view_chars_.find(r.saved_count); chars != view_chars_.end())
                         for (const ppc::CpuState& called : chars->second) { // (with the registers its draw loop called it with)
                             const uint32_t ch = called.gpr[14];
@@ -1370,7 +1515,7 @@ inline bool Cabinets::hook(uint32_t pc) {
                     world_ = nullptr;
                     r.heading_at[r.saved_count] = static_cast<uint16_t>(r.camera[kCameraHeading] << 8 | r.camera[kCameraHeading + 1]);
                 }
-                r.saved_world.clear(), r.saved_world.shrink_to_fit(), r.view_world.clear(), r.view_world.shrink_to_fit();
+                r.saved_world.reset(), r.view_world.reset();
             }
             if (!started(r, logic) || r.own_logic >= logic) continue;
             r.own_snap[r.own_logic + 1] = {r.own, r.camera, r.regions};
@@ -1507,6 +1652,28 @@ inline void Cabinets::make_record(Remote& r, Block& next, const Block& mine, uin
         for (uint32_t i = 0; i < 0x80; ++i) next[rec / 4 + i] = bus_.read32(kWorkingRecord + 4 * i);
     else
         for (uint32_t i = 0; i < 0x80; ++i) next[rec / 4 + i] = mine[(0x100 + 0x200 * static_cast<uint32_t>(from)) / 4 + i];
+    // (its character entries: this board's of the count, sync_check_build's at its link of the count before (each
+    // cabinet's own bytes put right below). A side run's working record has whichever this board's last link left: a
+    // count on, where this board had passed it, the joiner's late seat's flags and sums wrong, 2026-11-22)
+    if (const auto e = entries_at_.find(logic); e != entries_at_.end())
+        for (uint32_t i = 0; i < kEntryWords; ++i) next[(rec + 0x14) / 4 + i] = e->second[i];
+    // (the parts the game writes only now and then (on events): each cabinet's working record keeps them from its own
+    // past, as its last record has them, unless this board's own record changed them this count (an event every cabinet
+    // takes). A cabinet whose seat sat empty has its records cleared each count (link_record_idle) and keeps zeros
+    // there that the others don't: a late joiner's made records took its zeros at +0xA4.. for the others' values, and
+    // its board went out of step, 2026-11-22. The parts written every count are made as above)
+    if (int prev = -1; r.block[(old + 0xDC) / 4] + 1 == logic) {
+        for (int s = 0; s < 4; ++s)
+            if (mine[(0x100 + s * 0x200 + 0xDC) / 4] == logic - 1) prev = s;
+        if (prev >= 0) {
+            const uint32_t mine_prev = 0x100 + 0x200 * static_cast<uint32_t>(prev);
+            // (only these: +0x100.. is the link's own each count (its handshake flags +0x100, +0x11C ...): kept from its last
+            // record there, the made ones went wrong at once, 2026-11-22)
+            for (const auto& [lo, hi] : {std::pair<uint32_t, uint32_t>{0x0E, 0x10}, {0xA4, 0xD4}})
+                for (uint32_t x = lo; x < hi; ++x)
+                    if (get8(next, rec + x) == get8(mine, mine_prev + x)) put8(next, rec + x, get8(r.block, old + x));
+        }
+    }
     // (its buttons)
     next[(rec + 0x04) / 4] = held_(r.seat, frame);
     // (its player's fields as this board had them as it wrote its own record of this count; else as now)
@@ -1564,6 +1731,16 @@ inline void Cabinets::make_record(Remote& r, Block& next, const Block& mine, uin
     // (a character there only with flags above their low byte: this board's entry can keep its own on-screen bits
     // for one gone (its low byte alone), which the other's, its whole word 0, hasn't: sent with them, a three-player
     // game with players pressing all the time went out of step as an enemy left (2026-11-06, docs/netplay.md))
+    // (its own variables as the record of this count reads them: the link (0x6D758) copies the working record into the
+    // block (link_record_make 0x6DA48) and only then runs its checks (0x74284), whose sync_check_build (0x74808) fills
+    // the working record's entries for the next count's record; so a record of count L carries the characters as they
+    // were at the link of L - 1, after the flow of L - 2: own_snap[L - 1] (keyed by the count after its run), as its
+    // view bits are (view_at, logic - 2). Measured too, 2026-11-22: from the snapshot after L - 1 a player's +0x3F22,
+    // one down each count, came one lower than the real record's, and an enemy's view byte d9 for 00)
+    const std::vector<uint8_t>* own_then = nullptr;
+    if (const auto s = r.own_snap.find(logic - 1); s != r.own_snap.end() && s->second.own.size() == own_.size()) own_then = &s->second.own;
+    else if (r.own_logic + 2 == logic && r.own.size() == own_.size()) own_then = &r.own;
+    const std::vector<uint8_t>* view_then = own_then;
     for (uint32_t k = 0; k < 12; ++k) {
         const uint32_t entry = rec + 0x14 + 12 * k;
         const auto v = r.view_at.find({logic - 2, character_object(k)});
@@ -1584,6 +1761,33 @@ inline void Cabinets::make_record(Remote& r, Block& next, const Block& mine, uin
             if (next[(entry + 8) / 4] != kept.mine) kept.on = false;
             else next[(entry + 8) / 4] = kept.theirs;
         }
+        // (its bytes +4..+7, each cabinet's own fields of the character (kEntryFields): from its own variables as its link of
+        // this count reads them, after its flow of the count before, as sync_check_build takes them)
+        static const bool own_log = std::getenv("OWN_LOG") != nullptr; // (tests: an entry's own bytes where they change the record)
+        if (own_log && (next[entry / 4] & 0xFFFFFF00u)) {
+            uint32_t was = 0, own = 0;
+            for (uint32_t j = 0; j < 4; ++j) {
+                was = was << 8 | get8(next, entry + 4 + j);
+                const int i = entry_own_[k][j];
+                const std::vector<uint8_t>* from_own = j == 2 ? view_then : own_then;
+                own = own << 8 | (from_own && i >= 0 ? (*from_own)[static_cast<std::size_t>(i)] : 0xEE);
+            }
+            if (was != own || !own_then)
+                std::printf("own: seat %zu count %u frame %llu character %u: record %08x, own %08x (%s; own after %u, snaps", r.seat, logic,
+                            static_cast<unsigned long long>(frame), k, was, own,
+                            !own_then ? "none" : own_then == &r.own ? "now" : "snap", r.own_logic);
+            if (was != own || !own_then) {
+                for (const auto& [x, s] : r.own_snap) std::printf(" %u", x);
+                std::printf(")\n");
+            }
+        }
+        if ((next[entry / 4] & 0xFFFFFF00u) && r.entry_own_count == logic) // (as its last link run's checks wrote them)
+            for (uint32_t j = 0; j < 4; ++j) put8(next, entry + 4 + j, r.entry_own[4 * k + j]);
+        else if (next[entry / 4] & 0xFFFFFF00u)
+            for (uint32_t j = 0; j < 4; ++j) {
+                const std::vector<uint8_t>* from_own = j == 2 ? view_then : own_then;
+                if (const int i = entry_own_[k][j]; i >= 0 && from_own) put8(next, entry + 4 + j, (*from_own)[static_cast<std::size_t>(i)]);
+            }
         if (!(next[entry / 4] & 0xFFFFFF00u)) {
             next[entry / 4] = 0;
             // (and its own bits of the character's first word gone with it, as its record says: kept from its last
@@ -1739,6 +1943,13 @@ inline void Cabinets::link_run(Remote& r, uint64_t frame) {
     const auto started_at = std::chrono::steady_clock::now();
     try {
         c_.call(kLink);
+        // (its count gone on: its link ran its checks after copying out its record, and sync_check_build (0x74808) wrote
+        // the entries its next record carries into its working record, its own bytes from its own variables: kept for it)
+        if (bus_.read32(kLogicCounter) == logic) {
+            for (uint32_t k = 0; k < 12; ++k)
+                for (uint32_t j = 0; j < 4; ++j) r.entry_own[4 * k + j] = bus_.read8(kWorkingRecord + 0x14 + 12 * k + 4 + j);
+            r.entry_own_count = logic + 1;
+        }
     } catch (const LinkSkipped&) {
     } catch (const std::exception& e) {
         if (failed_.empty()) { // (with the link's error word, -7544(r13): set, its run ends in the "link broken" halt, 0x74350)
@@ -1794,13 +2005,32 @@ inline void Cabinets::hand_back(std::size_t seat, const Seed& seed, std::span<co
     if (!r || !r->netboard) return;
     m3::NetBoardDevice& netboard = *r->netboard;
     start_making(seat, netboard, ram, last);
+    if (std::getenv("HANDBACK_LOG")) { // (tests: what a hand-back starts its side runs from)
+        const auto own_at = [&](uint32_t a) {
+            const auto it = std::find(own_.begin(), own_.end(), a);
+            return it == own_.end() || seed.own.size() != own_.size() ? -1 : int{seed.own[static_cast<std::size_t>(it - own_.begin())]};
+        };
+        std::printf("hand-back: seat %zu at frame %llu: seed count %u, RAM's count %u, this board's %u; heading seed %02x%02x RAM %02x%02x; "
+                    "player 1 +0x3F23 seed %02x RAM %02x, its working record's entry +5 %02x\n",
+                    seat, static_cast<unsigned long long>(last), seed.own_logic, r->logic, bus_.read32(kLogicCounter),
+                    seed.camera[kCameraHeading], seed.camera[kCameraHeading + 1], ram[kCamera + kCameraHeading],
+                    ram[kCamera + kCameraHeading + 1], own_at(character_object(0) + 0x3F23), ram[character_object(0) + 0x3F23],
+                    ram[kWorkingRecord + 0x14 + 5]);
+    }
     r->shadowed = false, r->hand_back_asked = false, r->stop_after = 0;
     r->camera = seed.camera, r->own = seed.own, r->own_logic = seed.own_logic;
     if (seed.regions.size() == kRegionBytes) r->regions = seed.regions;
     r->state_own = seed.own;
     r->first_link_working = true;
-    r->catch_up = r->ahead < 0 && !r->saved_world.empty();
+    r->catch_up = r->saved_world != nullptr; // (a master's, or any whose hand-back came after this board's flow of its next count)
     r->own_snap.clear(), r->link_snap.clear(), r->flow_delta.clear(), r->heading_at.clear(), r->view_at.clear(), r->working_at.clear(), r->game_at.clear();
+    { // (the world's bytes its next link sends, as its shadow's run of its last count left them: without, the first made
+      // header took this board's of another count, +0x50-0x53 a count off, 2026-11-22)
+        auto& g = r->game_at[r->logic];
+        std::size_t n = 0;
+        for (const auto& [lo, hi] : kLinkGameBytes)
+            for (uint32_t a = lo; a < hi; ++a) g[n++] = ram[a];
+    }
     // (what its records of the counts to come take from its camera's runs of this one: its heading, its view bits)
     const uint32_t count = seed.own_logic;
     r->heading_at[count] = static_cast<uint16_t>(seed.camera[kCameraHeading] << 8 | seed.camera[kCameraHeading + 1]);
@@ -1864,6 +2094,14 @@ inline bool Cabinets::ready(const Remote& r) const {
 
 inline void Cabinets::meet(uint64_t frame, uint64_t t) {
     const uint64_t at = timing_.frame_start(frame) + write_at_;
+    { // (this board's entries for its next count, as its link's checks (0x74284 -> sync_check_build) left them in its
+      // working record after copying it out: noted at every meeting, the last before a made link of the count wins)
+        const uint32_t count = bus_.read32(kLogicCounter) + 1;
+        Entries& e = entries_at_[count];
+        if (!e[kEntryWords]) // (not over a final one, its frame's end's)
+            for (uint32_t i = 0; i < kEntryWords; ++i) e[i] = bus_.read32(kWorkingRecord + 0x14 + 4 * i);
+        while (entries_at_.size() > 8) entries_at_.erase(entries_at_.begin());
+    }
     for (Remote& r : remotes_) {
         if (!r.making) continue;
         const uint64_t due = r.link_from && r.link_from < at ? r.link_from : at; // (link_early: sooner)
@@ -1890,6 +2128,12 @@ inline void Cabinets::end_frame(uint64_t frame) {
     meet(frame, end);
     for (Remote& r : remotes_) {
         if (r.link_from < end) r.link_from = 0; // (link_early's, if it was this frame's)
+        // (its vblank count: the frame's vblank, unless its tasks' wait took it (kCabinetOwn); for every cabinet whose own
+        // variables run on the side, made yet or not (gamerun's camera recording starts them ten frames early))
+        if (!r.own.empty() && !r.shadowed && !r.vblank_taken)
+            for (std::size_t k = 0; k < own_.size(); ++k)
+                if (own_[k] == kVblankCount) r.own[k] = static_cast<uint8_t>(r.own[k] + 1);
+        r.vblank_taken = false;
         if (!r.making) continue;
         // (its vblank's countdowns, once a frame (0x496C, from its interrupt, which side runs never take): those of its own
         // variables, its copy's, else they'd stay where its flow set them)

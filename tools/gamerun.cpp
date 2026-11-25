@@ -37,6 +37,17 @@
 // --watch-write LO-HI@FRAME[:N] (hex addresses) prints every write to
 // [LO, HI) in N frames from FRAME (default 1): the block writing, LR and
 // registers (finding the code that draws something; work RAM too).
+// --host-profile FILE[@US][:all] (Windows): the thread running the game (with :all,
+// every thread, each one's count in the file's head) paused every US
+// microseconds (default 100) and where it was in this program noted, then let go;
+// writes "address count" lines, this program's addresses from its start (for
+// addr2line -f -C -e gamerun.exe): where the host's time goes, by its own C++
+// functions. Pausing changes only the time: the run is the same.
+// --pc-profile FILE[@US[:B]] samples board B's (default 0) PowerPC every US
+// microseconds (default 50) on a thread of its own while the game runs (the
+// block each `tick` last recorded: the host's time, whatever it does there,
+// put down to that block) and writes "pc count" lines, most first: where the
+// time goes by the game's own addresses. Reads only: the run is the same.
 // --dump-backup writes the backup RAM (128 KB) at the end. --dump-layers
 // writes each tile layer's whole 512x512 name table with every screenshot
 // (FILE-<frame>-L<n>.png). --map-trace FROM:N prints each tile map the game
@@ -123,7 +134,9 @@
 // --net-irq5-per-frame N, --net-slave-irq5-per-frame N, --net-irq5-phase F,
 // and the ring model's parts: --net-ring-forwarding off, --net-double-buffer
 // off, --net-ring-pass off and --net-slave-late off (each cabinet's view of the
-// table as before 2026-11-16: CommBoardOptions::slave_table_late);
+// table as before 2026-11-16: CommBoardOptions::slave_table_late), --net-count-match
+// off (the table by the cabinets' counts off, preview 7's slave table instead: CommBoardOptions::count_matched);
+// --net-cut-through on (the link chip relaying as it receives, as the firmware programs it: CommBoardOptions::cut_through);
 // --net-old-link puts the link back as it was before the ring model
 // (linked games at 2/(N+1) speed). --net-host-trace FRAME:N adds the main
 // board's accesses to the network board, by time, to the report.
@@ -203,6 +216,7 @@
 #include "runtime/bus.hpp"
 #include "runtime/commboard.hpp"
 #include "runtime/cpu_time.hpp"
+#include "runtime/host_sampler.hpp"
 #include "runtime/rom.hpp"
 #include "runtime/snapshots.hpp"
 #include "runtime/watched_memory.hpp"
@@ -243,6 +257,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -306,6 +321,11 @@ struct Options {
     const char* load_state = nullptr;         // --load-state FILE
     uint32_t watch_lo = 0, watch_hi = 0;      // --watch-write LO-HI@FRAME:N
     uint64_t watch_frame = 0, watch_frames = 1;
+    std::string host_profile;                 // --host-profile FILE[@US]
+    unsigned host_profile_us = 100;
+    bool host_profile_all = false;            // (FILE[@US]:all: every thread)
+    std::string pc_profile;                   // --pc-profile FILE[@US[:B]]
+    unsigned pc_profile_us = 50, pc_profile_board = 0;
     uint64_t rb_from = 0, rb_frames = 0, rb_depth = 4, rb_every = 10; // --rollback-test FRAME:N[:DEPTH[:EVERY[:compare][:quiet][:timed]]]
     uint64_t rb_force_depth = 0, rb_force_every = 0, rb_force_from = 0; // --rollback-force DEPTH:EVERY[:FROM]
     uint64_t rb_sim_latency = 0; // --rollback-sim LATENCY
@@ -420,6 +440,14 @@ struct Options {
     const char* one_board_camera = nullptr;
     std::vector<uint64_t> one_board_missed; // --one-board-miss FRAME (its main board's frames lost, given)
     uint64_t one_board_shadow = 0;          // --one-board-shadow FRAME (its shadow from there)
+    // --one-board-shadow-state FILE: that shadow from the real board's state, as network play takes it from the other machine
+    // (a --board-state of it from a run of every board whole), not from this board's own state as an approximation
+    const char* one_board_shadow_state = nullptr;
+    // --board-state B@FRAME FILE: board B's state as a machine sends its own for a shadow (net_frame::board_whole: at its first
+    // block it can resume at after frame FRAME ends, with the ring's counts), written to FILE
+    int board_state_board = -1;
+    uint64_t board_state_frame = 0;
+    const char* board_state_file = nullptr;
     bool one_board_tasks = false;           // --one-board-tasks (tools::remote::Cabinets::use_tasks)
     bool one_board_auto = false;            // --one-board-auto (a shadow started and stopped by the rules)
     uint64_t one_board_lookahead = 60;      // --one-board-lookahead N (the rules' look at the other cabinet's coin and start)
@@ -463,6 +491,8 @@ struct Options {
     bool double_buffer = m3::CommBoardOptions().double_buffer; // --net-double-buffer on/off
     bool ring_second_pass = m3::CommBoardOptions().ring_second_pass; // --net-ring-pass on/off
     bool slave_table_late = m3::CommBoardOptions().slave_table_late; // --net-slave-late on/off
+    bool count_matched = m3::CommBoardOptions().count_matched; // --net-count-match on/off
+    bool cut_through = m3::CommBoardOptions().cut_through; // --net-cut-through on/off
     bool old_link = false; // --net-old-link: the link before the ring model (CommBoardOptions::use_old_link)
 };
 
@@ -526,10 +556,11 @@ using tools::LinkedState; // (tools/game_setup.hpp)
 // a drop, a long wait for inputs happened, against another process's (issue 22's leave tests))
 std::string net_time_said() {
     static const bool on = std::getenv("GAMERUN_NET_TIMES") != nullptr;
-    static const auto began = std::chrono::steady_clock::now();
     if (!on) return {};
+    // (the wall clock's seconds within the hour: the same moment in every process's log)
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     char b[32];
-    std::snprintf(b, sizeof b, " [at %.3f s]", std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
+    std::snprintf(b, sizeof b, " [at %.3f s]", static_cast<double>(ms % 3600000) / 1000.0);
     return b;
 }
 
@@ -742,6 +773,8 @@ struct Machine {
     double gpu_seconds = 0, gpu_worst = 0;
     // --gpu-time: a frame drawn alone, its costs (ms, summed): the CPU's parts, the GPU's after
     double profile_pack = 0, profile_upload = 0, profile_record = 0, profile_cpu = 0, profile_gpu = 0, profile_gpu_worst = 0;
+    double build_ms = 0; // (--renderer gpu: the scene made from the Real3D's memory, each frame's time)
+    uint64_t builds = 0;
     uint64_t profile_frames = 0, profile_passes = 0, profile_draws = 0;
     uint64_t gpu_worst_frame = 0, gpu_slow = 0; // (slow: over a frame, 17.4 ms)
     uint64_t gpu_hash = 0xCBF29CE484222325ull; // of every picture read back, full size (--gpu-scale)
@@ -844,6 +877,7 @@ struct Pace { // --pace: how well it kept to the arcade's speed (the end says)
 tools::SpeedReport g_speed; // (--pace: the window's measure, lines and summary: tools/speed_report.hpp)
 const m3::RomSet* g_roms = nullptr; // (one board a PC: a board whose player went run on from its backup)
 std::unique_ptr<tools::rollback::Linked> g_net_rb; // (--net-rollback: every board going back together)
+std::atomic<uint64_t> g_join_frame{0}; // (joined in progress: the host's state's frame; the window's net_start.state_frame)
 // --net-arrivals FILE (with --net-replay): the other seats' buttons put in as they came on the reporting PC
 // (tools/net_arrivals.hpp), rollback guessing them till then
 const tools::net_arrivals::Arrivals* g_arrivals = nullptr;
@@ -863,6 +897,7 @@ tools::InputTable::Inputs press_inputs(std::size_t seat, uint64_t frame) {
     return tools::InputTable::Inputs{in[0], 0xFF, in[1], 0xFF};
 }
 int g_drop_board = -1; // --drop B (the side camera's buttons are that cabinet's)
+int g_master_lead = 1;   // (the master's count less a slave's on this run's link: tools::one_board::master_lead)
 struct Cloned {};
 // --wait-seat B@FROM:UNTIL: thrown at board B's first block after FROM's end; run() holds its blocks
 // to UNTIL, then brings the board back there.
@@ -1030,10 +1065,27 @@ void set_up_one_board(std::vector<std::unique_ptr<Machine>>& machines, const Opt
     for (std::size_t b : o.one_board_also) s.going.push_back(b);
     s.frame = o.one_board_frame;
     s.tasks = o.one_board_tasks, s.rules = o.one_board_auto, s.lookahead = o.one_board_lookahead;
+    s.master_lead = tools::one_board::master_lead(link_options(o));
     s.shadow_from = o.one_board_shadow, s.hand_back_at = o.one_board_hand_back;
     s.keep_ram = o.one_board_shadow != 0 || o.one_board_auto || !o.one_board_camera;
     s.slice = o.slice;
     s.net = false; // (no network: network play's set-up is the window's, tools::net_frame::set_up_one_board, at a meeting)
+    if (o.one_board_shadow_state) { // (--one-board-shadow-state: the shadow from the real board's state, as network play takes it)
+        const std::string file = o.one_board_shadow_state;
+        s.wait_board = [file](std::size_t seat, uint64_t frame) -> std::optional<tools::one_board::RemoteBoard> {
+            auto board = tools::one_board::unpack_remote(tools::read_file(file), [](std::span<const uint8_t> d) {
+                return ::net::decompress(d, ::net::kMaxBoardState);
+            });
+            std::printf("one board: board %zu's state for frame %llu from %s%s\n", seat, static_cast<unsigned long long>(frame),
+                        file.c_str(), board ? "" : ": not a board's state");
+            return board;
+        };
+        s.rewind_link = [](std::size_t seat, const tools::one_board::RemoteBoard& b) { // (as network play's: net_frame)
+            if (!g_ring || (g_ring->taken(seat) == b.taken && g_ring->sent(seat) == b.sent)) return;
+            g_ring->rewind(seat, b.taken);
+            g_ring->unsend(seat, b.sent);
+        };
+    }
     if (!s.net && (o.rb_force_every || o.rb_sim_latency)) { // (--rollback-force, -sim: as network play's rollback sets them)
         s.settled = [](uint64_t) { return true; }; // (forced: every input known)
         if (o.rb_sim_latency) { // (simulated: the other seats' buttons from the table, put in late (below))
@@ -1084,6 +1136,7 @@ void set_up_one_board(std::vector<std::unique_ptr<Machine>>& machines, const Opt
     Machine& m = *machines[s.stays];
     const std::size_t gone = s.going.front();
     g_one_board.set_up(std::move(boards), std::move(s));
+    if (o.one_board_shadow_state) g_one_board.want_shadow(gone, o.one_board_shadow);
     for (uint64_t f : o.one_board_missed) m.ob.cabinets->miss(gone, f);
     // (its camera on the side against the recording's, as its update starts: the first difference shown)
     // (ONEBOARD_CAMERA_ALL=1: each count whose differences include a byte not seen to differ before, not the first alone)
@@ -1240,8 +1293,9 @@ void camera_hook(recomp::Context& c, uint32_t pc, void* user) {
                         in[p.bank] = static_cast<uint8_t>(in[p.bank] & ~(1u << p.bit));
                 return ~(uint32_t(in[0]) | uint32_t(in[1]) << 8 | 0xFFu << 16 | 0xFFu << 24);
             };
-            // (the slave, board 1 up, a frame behind this one; the master, board 0, a frame ahead)
-            const uint64_t frame = g_drop_board == 0 ? m.timing.frames() - 1 : m.timing.frames() + 1;
+            // (the master, board 0, the link's lead ahead of a slave (g_master_lead): its frame for this count that many before
+            // this board's; a slave's that many after)
+            const uint64_t frame = g_drop_board == 0 ? m.timing.frames() - static_cast<uint64_t>(g_master_lead) : m.timing.frames() + static_cast<uint64_t>(g_master_lead);
             const uint32_t now = held(frame), was = held(frame - 1);
             m.bus.write32(0x100100, now), m.bus.write32(0x100104, now & ~was), m.bus.write32(0x100108, was & ~now);
             if (!t.own.empty() && t.toggled_at != frame) // (its toggles, 0x10010C, the pressed ones flipped once a frame: kept in its own)
@@ -1521,6 +1575,8 @@ m3::CommBoardOptions link_options(const Options& o) {
     options.double_buffer = o.double_buffer;
     options.ring_second_pass = o.ring_second_pass;
     options.slave_table_late = o.slave_table_late;
+    options.count_matched = o.count_matched;
+    options.cut_through = o.cut_through;
     if (o.old_link) options.use_old_link();
     options.link_cycles_per_byte = o.link_cycles_per_byte;
     options.send_waits_for_receive = o.send_waits_for_receive;
@@ -1780,8 +1836,12 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
             if (m.recording_host) m.host_log.push_back({HostCall::Pass, 0, 0, 0, m.c.cycles()});
             m.line = line;
             tools::one_board::Game::meet(m.ob, line); // (--one-board: the other cabinets' blocks due)
+            if (m.ob.skip_meeting) { // (a shadow started before this meeting, passed already as it waited: one pass a meeting)
+                m.ob.skip_meeting = false;
+                return;
+            }
             const auto passing = std::chrono::steady_clock::now();
-            turns.pass(m.index);
+            turns.pass(m.index, !m.ob.cabinets); // (a board running its frame, every board here: spun on a while at the meeting)
             const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - passing).count();
             m.frame_waits += waited; // (GAMERUN_RB_PROFILE)
             if (g_auto_board) g_auto_board->wait(m.index, waited); // (--net-auto-board: a meeting's wait isn't this board's work, as the window)
@@ -2056,10 +2116,16 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         if (drawn && m.gpu) { // on the GPU, from the same scene
             const auto start = std::chrono::steady_clock::now();
             const m3::Real3d& mem = m.bus.real3d();
-            if (o.renderer == R::Gpu) m.builder.build(mem, m.scene);
+            if (o.renderer == R::Gpu) {
+                const auto building = std::chrono::steady_clock::now();
+                m.builder.build(mem, m.scene);
+                m.build_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - building).count();
+                ++m.builds;
+            }
             if (o.gpu_time_scale) { // drawn and waited for, not read back; several times, to keep the GPU busy (its clock up)
                 if (m.builder.extend() > 0) m.builder.build(mem, m.scene); // (--wide: its scene opened out)
-                const m3::Real3dScene& timed = m.builder.extend() > 0 ? m.scene : m.real3d.scene();
+                // (the GPU renderer's own scene when it made one: the software renderer's is empty unless it ran)
+                const m3::Real3dScene& timed = o.renderer == R::Gpu || m.builder.extend() > 0 ? m.scene : m.real3d.scene();
                 for (int i = 0; i < kGpuTimeRepeats; ++i) m.gpu->render(mem, timed);
                 SDL_WaitForGPUIdle(m.gpu_device);
                 // And once alone: its CPU parts, and the GPU's time after (from idle).
@@ -2191,8 +2257,17 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                 std::printf("watch-text: board %zu frame %llu: %s%s\n", m.index, static_cast<unsigned long long>(frame),
                             m.text_seen ? "shown: " : "gone", m.text_seen ? seen_line.c_str() : "");
                 std::fflush(stdout);
+                // (our own board, just after our join: the host asked for a report of its own, as the window does)
+                static std::atomic<bool> asked{false};
+                if (m.text_seen && o.netplay && m.index == o.local_seat && g_join_frame && frame <= g_join_frame + 600 && !asked.exchange(true))
+                    o.netplay->session().ask_report(frame, seen_line);
             }
         }
+        // (tests: GAMERUN_TEST_ASK_REPORT=1, a joiner asks the host for its report 30 frames after its join, as if it had seen
+        // the game's error then)
+        static const bool test_ask_report = std::getenv("GAMERUN_TEST_ASK_REPORT") != nullptr;
+        if (test_ask_report && o.netplay && m.index == o.local_seat && g_join_frame && frame == g_join_frame + 30)
+            o.netplay->session().ask_report(frame, "a test's (GAMERUN_TEST_ASK_REPORT)");
         // (--net-replay: each board's line every 3600 frames, as the window logs it in network play (spikeout.cpp), so a
         // replay is checked against a report's log number for number: the network board's packets and interrupts)
         if (o.net_replay && frame % 3600 == 0) {
@@ -2408,9 +2483,9 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         // (at the snapshot point; a shadow's request too: the backups first)
         // (the window's steps, tools/net_frame.hpp)
         const auto board_walk = [&m](m3::State& s) { tools::board_state(s, m.c, m.timing, {}); };
-        const auto backup_now = [&m, &o, board_walk](uint64_t at) {
+        const auto backup_now = [&m, &o, board_walk](uint64_t at, const std::vector<uint8_t>& must = {}) {
             const tools::net_frame::BackupSent sent =
-                tools::net_frame::backup_now(*o.netplay, m.backups, m.backup_bases, o.boards, m.index, g_ring, at, board_walk);
+                tools::net_frame::backup_now(*o.netplay, m.backups, m.backup_bases, o.boards, m.index, g_ring, at, board_walk, must);
             static const bool say = std::getenv("ONEBOARD_BACKUPS") != nullptr; // (tests: their sizes, before packing)
             if (say && sent.taken)
                 std::printf("board %zu frame %llu: backup, %zu KB of changes, %zu KB whole (unpacked)\n", m.index,
@@ -2419,6 +2494,15 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
         if (o.netplay && m.index == o.local_seat && o.real_netboard &&
             tools::net_frame::backup_due(*o.netplay, m.backups, *m.inputs, g_net_rb != nullptr, o.boards, frame))
             m.c.request_snapshot([backup_now, frame](uint32_t) { backup_now(frame); });
+        // (a player joining in progress: every machine's copies of the boards as at its seat's frame, as the window)
+        if (o.netplay && o.real_netboard) {
+            if (m.index == o.local_seat)
+                tools::net_frame::JoinBases::own_frame_end(*o.netplay, o.boards, o.local_seat, frame, *m.inputs, g_net_rb.get(), m.backups,
+                                                           m.backup_bases, m.c, g_ring, board_walk);
+            else
+                tools::net_frame::JoinBases::board_frame_end(*o.netplay, m.index, o.local_seat, frame, *m.inputs, g_net_rb.get(), o.boards,
+                                                             m.c, g_ring, board_walk);
+        }
         // --net-leave-at FRAME: this player leaving after a frame a little ahead, the others told; its board's state then
         // sent to all of them; the goodbye once they have it
         if (o.netplay && m.index == o.local_seat && o.net_leave_at && frame == o.net_leave_at) {
@@ -2474,7 +2558,7 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                         return;
                     }
                     if (!parting && o.real_netboard && !whole_states) {
-                        backup_now(frame);
+                        backup_now(frame, seats);
                         tools::net_frame::board_by_backup(*o.netplay, frame, seats, "net");
                         return;
                     }
@@ -2693,8 +2777,11 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                 tools::board_state(s, m.c, m.timing, sound_state(m, o));
                 {
                     std::lock_guard guard(m.linked->lock);
+                    // (counted once a board: a rollback over the capture's frame runs it again, saved again here (its copy
+                    // replaced). Counted twice, "5 of 4 saved" never equalled the boards, the ring's cut never taken: the
+                    // capture waited for good, that join and every later one stuck, 2026-11-24)
+                    if (m.linked->boards[m.index].empty()) ++m.linked->saved;
                     m.linked->boards[m.index] = std::move(s.data());
-                    ++m.linked->saved;
                 }
                 if (!o.parallel) m.linked->finish(); // (taking turns: the others are waiting)
             });
@@ -2707,6 +2794,20 @@ void set_up(Machine& m, const Options& o, const m3::GameSpec& game, m3::LinkRing
                                 static_cast<unsigned long long>(m.timing.frames()), pc, s.data().size());
                 else
                     std::fprintf(stderr, "gamerun: cannot write %s\n", o.save_state.c_str());
+            });
+        // (--board-state B@FRAME FILE: board B's state as network play sends a board's for a shadow (net_frame::board_whole))
+        if (o.board_state_file && static_cast<int>(m.index) == o.board_state_board && frame == o.board_state_frame)
+            m.c.request_snapshot([&m, &o, board_walk](uint32_t pc) {
+                m3::State s;
+                board_walk(s);
+                const uint64_t taken = g_ring ? g_ring->taken(m.index) : 0, sent = g_ring ? g_ring->sent(m.index) : 0;
+                if (g_ring) g_ring->abandon_cut(m.index); // (one board's state alone: no cut under way)
+                if (tools::write_file(o.board_state_file, tools::one_board::pack_remote(taken, sent, ::net::compress(s.data()))))
+                    std::printf("Saved board %zu's state %s: frame %llu, block %08x (taken %llu, sent %llu)\n", m.index,
+                                o.board_state_file, static_cast<unsigned long long>(m.timing.frames()), pc,
+                                static_cast<unsigned long long>(taken), static_cast<unsigned long long>(sent));
+                else
+                    std::fprintf(stderr, "gamerun: cannot write %s\n", o.board_state_file);
             });
         // (--net-one-board: from the hand-over, only this machine's own board: a shadow of another is exact in what it
         // sends, not in all of its RAM)
@@ -3608,10 +3709,10 @@ void report(Machine& m, const Options& o) {
 
     std::printf("Network board: %s\n", bus.netboard().describe().c_str());
     if (g_direct_room) { // (the run over: a goodbye, so the others end at once, not after their 10 s)
-        const auto c = g_direct_room->counters();
+        const auto counts = g_direct_room->counters();
         std::printf("direct: %llu exchanged, %llu stalled over 1 ms, %.2f s waited (longest %.1f ms), %llu resent\n",
-                    static_cast<unsigned long long>(c.gathers), static_cast<unsigned long long>(c.stalled), c.waited_s,
-                    c.longest_ms, static_cast<unsigned long long>(c.resent));
+                    static_cast<unsigned long long>(counts.gathers), static_cast<unsigned long long>(counts.stalled), counts.waited_s,
+                    counts.longest_ms, static_cast<unsigned long long>(counts.resent));
         g_direct_room->leave();
     }
     if (g_blocking_ring && m.index < 4)
@@ -3679,6 +3780,9 @@ void report(Machine& m, const Options& o) {
                     1000.0 * m.wide_seconds / static_cast<double>(m.wide_frames), 1000.0 * m.wide_worst,
                     static_cast<unsigned long long>(m.wide_worst_frame));
 #ifdef SPIKEOUT_GPU
+    if (m.builds)
+        std::printf("GPU scene: %.3f ms a frame making it from the Real3D's memory on average (%llu frames)\n",
+                    m.build_ms / static_cast<double>(m.builds), static_cast<unsigned long long>(m.builds));
     if (m.profile_frames) {
         const double n = static_cast<double>(m.profile_frames);
         std::printf("A frame drawn alone: the CPU %.2f ms (packing %.2f, uploading %.2f, recording %.2f), then the GPU %.2f "
@@ -3896,6 +4000,51 @@ void report(Machine& m, const Options& o) {
                     u.first_addr);
 }
 
+// --pc-profile: a thread reading a board's PowerPC (the block each `tick` last recorded) every few microseconds, its
+// own clock spun (a sleep is a millisecond at best), counting each address; nothing of the game's touched. The read is
+// a plain one of a word the game's thread writes (a torn or late value only moves a sample).
+class PcSampler {
+public:
+    PcSampler(const uint32_t& pc, unsigned us) : pc_(&pc) {
+        thread_ = std::thread([this, us] {
+            const auto step = std::chrono::microseconds(us);
+            auto next = std::chrono::steady_clock::now() + step;
+            while (!stop_.load(std::memory_order_relaxed)) {
+                while (std::chrono::steady_clock::now() < next) {}
+                next += step;
+                const uint32_t at = *static_cast<const volatile uint32_t*>(pc_);
+                ++counts_[at];
+                ++samples_;
+            }
+        });
+    }
+    ~PcSampler() { stop(); }
+    void finish(const std::string& file) {
+        stop();
+        std::vector<std::pair<uint32_t, uint64_t>> list(counts_.begin(), counts_.end());
+        std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (FILE* f = std::fopen(file.c_str(), "w")) {
+            std::fprintf(f, "# samples %llu, addresses %zu\n", static_cast<unsigned long long>(samples_), list.size());
+            for (const auto& [pc, n] : list) std::fprintf(f, "%08x %llu\n", pc, static_cast<unsigned long long>(n));
+            std::fclose(f);
+            std::printf("PC profile: %llu samples, %zu addresses, in %s\n", static_cast<unsigned long long>(samples_), list.size(),
+                        file.c_str());
+        } else
+            std::fprintf(stderr, "gamerun: can't write %s\n", file.c_str());
+    }
+
+private:
+    void stop() {
+        stop_.store(true, std::memory_order_relaxed);
+        if (thread_.joinable()) thread_.join();
+    }
+    const uint32_t* pc_;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::unordered_map<uint32_t, uint64_t> counts_;
+    uint64_t samples_ = 0;
+};
+
 } // namespace
 
 int main(int argc_given, char** argv_given) {
@@ -4038,6 +4187,24 @@ int main(int argc_given, char** argv_given) {
             o.save_frame = std::strtoull(spec.c_str() + at + 1, nullptr, 0);
         }
         else if (arg == "--load-state" && i + 1 < argc) o.load_state = argv[++i];
+        else if (arg == "--host-profile" && i + 1 < argc) { // FILE[@US][:all]
+            std::string spec = argv[++i];
+            if (spec.size() > 4 && spec.compare(spec.size() - 4, 4, ":all") == 0) { o.host_profile_all = true; spec.resize(spec.size() - 4); }
+            const std::size_t at = spec.rfind('@');
+            o.host_profile = spec.substr(0, at);
+            if (at != std::string::npos) o.host_profile_us = std::max(10u, static_cast<unsigned>(std::strtoul(spec.c_str() + at + 1, nullptr, 10)));
+        }
+        else if (arg == "--pc-profile" && i + 1 < argc) { // FILE[@US[:B]]
+            const std::string spec = argv[++i];
+            const std::size_t at = spec.rfind('@');
+            o.pc_profile = spec.substr(0, at);
+            if (at != std::string::npos) {
+                char* end = nullptr;
+                o.pc_profile_us = static_cast<unsigned>(std::strtoul(spec.c_str() + at + 1, &end, 10));
+                if (*end == ':') o.pc_profile_board = static_cast<unsigned>(std::strtoul(end + 1, nullptr, 10));
+                if (o.pc_profile_us == 0) o.pc_profile_us = 50;
+            }
+        }
         else if (arg == "--watch-write" && i + 1 < argc) { // LO-HI@FRAME[:N], hex addresses
             const std::string spec = argv[++i];
             char* end = nullptr;
@@ -4171,6 +4338,8 @@ int main(int argc_given, char** argv_given) {
         else if (arg == "--net-double-buffer" && i + 1 < argc) o.double_buffer = std::string(argv[++i]) != "off";
         else if (arg == "--net-ring-pass" && i + 1 < argc) o.ring_second_pass = std::string(argv[++i]) != "off";
         else if (arg == "--net-slave-late" && i + 1 < argc) o.slave_table_late = std::string(argv[++i]) != "off";
+        else if (arg == "--net-count-match" && i + 1 < argc) o.count_matched = std::string(argv[++i]) != "off";
+        else if (arg == "--net-cut-through" && i + 1 < argc) o.cut_through = std::string(argv[++i]) != "off";
         else if (arg == "--net-old-link") o.old_link = true;
         else if (arg == "--net-irq5-phase" && i + 1 < argc) o.irq5_phase = std::strtod(argv[++i], nullptr);
         else if (arg == "--net-slave-irq5-per-frame" && i + 1 < argc) o.slave_irq5_per_frame = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
@@ -4273,6 +4442,16 @@ int main(int argc_given, char** argv_given) {
         else if (arg == "--one-board-camera" && i + 1 < argc) o.one_board_camera = argv[++i]; // FILE (a --camera-record of B)
         else if (arg == "--one-board-miss" && i + 1 < argc) o.one_board_missed.push_back(std::strtoull(argv[++i], nullptr, 0));
         else if (arg == "--one-board-shadow" && i + 1 < argc) o.one_board_shadow = std::strtoull(argv[++i], nullptr, 0);
+        else if (arg == "--one-board-shadow-state" && i + 1 < argc) o.one_board_shadow_state = argv[++i];
+        else if (arg == "--board-state" && i + 2 < argc) { // B@FRAME FILE
+            unsigned board = 0;
+            unsigned long long frame = 0;
+            if (std::sscanf(argv[++i], "%u@%llu", &board, &frame) != 2) {
+                std::fprintf(stderr, "gamerun: --board-state B@FRAME FILE\n");
+                return 2;
+            }
+            o.board_state_board = static_cast<int>(board), o.board_state_frame = frame, o.board_state_file = argv[++i];
+        }
         else if (arg == "--one-board-tasks") o.one_board_tasks = true;
         else if (arg == "--one-board-auto") o.one_board_auto = o.one_board_tasks = true;
         else if (arg == "--one-board-lookahead" && i + 1 < argc) o.one_board_lookahead = std::strtoull(argv[++i], nullptr, 0);
@@ -4434,6 +4613,7 @@ int main(int argc_given, char** argv_given) {
         else o.dir = nullptr, i = argc;
     }
     g_input_delay = o.input_delay;
+    g_master_lead = tools::one_board::master_lead(link_options(o));
     if (!o.dir) {
         std::fprintf(stderr, "usage: gamerun <rom_dir> [--blocks N] [--text] [--dump-tile FILE]\n"
                              "               [--netboard sim|real] [--net-trace N] [--net-disasm FILE]\n"
@@ -4594,9 +4774,9 @@ int main(int argc_given, char** argv_given) {
         bool all_in_at = false;
         auto all_in = std::chrono::steady_clock::now();
         while (!direct_room->started()) {
-            const std::string why = direct_room->ended();
-            if (!why.empty()) {
-                std::fprintf(stderr, "gamerun: direct: %s\n", why.c_str());
+            const std::string ended = direct_room->ended();
+            if (!ended.empty()) {
+                std::fprintf(stderr, "gamerun: direct: %s\n", ended.c_str());
                 return 1;
             }
             if (hosting && by_lobby) tools::direct_lobby_pump(direct_lobby, *direct_room);
@@ -4860,7 +5040,9 @@ int main(int argc_given, char** argv_given) {
             std::printf("net: playing seat %u of %u (board %u), clock %lld\n", start->my_seat + 1, start->seats,
                         start->my_seat, static_cast<long long>(start->clock));
         if (start->state_frame) { // a game joined in progress: every board as the host had them
-            auto state = net::decompress(start->state);
+            g_join_frame = *start->state_frame;
+            // (put together from chunks several players sent: as it is; else packed)
+            auto state = start->state_raw ? std::optional<std::vector<uint8_t>>(std::move(start->state)) : net::decompress(start->state);
             if (!state) {
                 std::fprintf(stderr, "gamerun: the host's state doesn't unpack\n");
                 return 1;
@@ -4952,7 +5134,7 @@ int main(int argc_given, char** argv_given) {
         else if (o.link_dump) // each data frame's first part, the sender's own node (comm RAM 0x100-0x9FF)
             ring->on_send([file = std::shared_ptr<std::FILE>(std::fopen(o.link_dump, "wb"), std::fclose),
                            lock = std::make_shared<std::mutex>()](std::size_t from, uint64_t at, const std::vector<uint8_t>& data) {
-                if (!file || data.size() < kNodeBytes || m3::ring_pass(data)) return; // (the small sync frames, second passes)
+                if (!file || data.size() < kNodeBytes || m3::link_extra(data)) return; // (the small sync frames, second passes, relays)
                 const uint32_t head[2] = {static_cast<uint32_t>(from),
                                           static_cast<uint32_t>(at / recomp::FrameTiming().frame_cycles())};
                 std::lock_guard guard(*lock);
@@ -5037,6 +5219,21 @@ int main(int argc_given, char** argv_given) {
                     for (auto& m : machines) m->hashes.pending.erase(m->hashes.pending.upper_bound(back), m->hashes.pending.end());
             }
             if (linked.ring && (!linked.path.empty() || linked.sink)) linked.finish();
+            { // (a capture not finished a second past its frame: said once, what it waits for)
+                static uint64_t said_for = 0;
+                const uint64_t at = linked.capture_frame, now = machines[0]->timing.frames();
+                if (at && now > at + 60 && said_for != at) {
+                    said_for = at;
+                    std::lock_guard guard(linked.lock);
+                    std::string who;
+                    for (std::size_t i = 0; i < linked.boards.size(); ++i) who += linked.boards[i].empty() ? " -" : " saved";
+                    std::printf("net: every board's state at frame %llu not finished at frame %llu: %zu of %zu saved (%s), cut %s, "
+                                "the ring's %s\n",
+                                static_cast<unsigned long long>(at), static_cast<unsigned long long>(now), linked.saved, linked.boards.size(),
+                                who.c_str() + 1, linked.cut.empty() ? "none" : "taken", linked.ring->cut_complete() ? "complete" : "not complete");
+                    std::fflush(stdout);
+                }
+            }
             // (--net-one-board: wanted from its frame on, set up at a meeting as the window does: tools::net_frame)
             if (o.netplay && g_one_board_wanted) {
                 const uint64_t frame = machines[o.local_seat]->timing.frames();
@@ -5220,6 +5417,11 @@ int main(int argc_given, char** argv_given) {
     }
     rollback.boards.clear();
     for (auto& m : machines) rollback.boards.push_back(m.get());
+    std::unique_ptr<m3::HostSampler> host_sampler; // (--host-profile: this thread, the one board 0's game runs on alone)
+    if (!o.host_profile.empty()) host_sampler = std::make_unique<m3::HostSampler>(o.host_profile_us, o.host_profile_all);
+    std::unique_ptr<PcSampler> pc_sampler; // (--pc-profile)
+    if (!o.pc_profile.empty() && o.pc_profile_board < machines.size())
+        pc_sampler = std::make_unique<PcSampler>(machines[o.pc_profile_board]->c.cpu.pc, o.pc_profile_us);
     if (o.boards == 1) {
         const double cpu_before = m3::thread_cpu_seconds();
         run(*machines[0], turns);
@@ -5256,6 +5458,16 @@ int main(int argc_given, char** argv_given) {
                     std::printf("Recorded board %zu's %zu calls to its network board in %s\n", m->index, m->host_log.size(),
                                 o.link_record);
             }
+    }
+    if (pc_sampler) pc_sampler->finish(o.pc_profile);
+    if (host_sampler) {
+        uint64_t samples = 0;
+        std::size_t addresses = 0;
+        if (host_sampler->finish(o.host_profile, samples, addresses))
+            std::printf("Host profile: %llu samples, %zu addresses, in %s\n", static_cast<unsigned long long>(samples), addresses,
+                        o.host_profile.c_str());
+        else
+            std::fprintf(stderr, "gamerun: --host-profile: no samples (Windows only), or %s can't be written\n", o.host_profile.c_str());
     }
     // Network play: our boards out of step with the host's; every board
     // again from its state, the inputs since fed again.

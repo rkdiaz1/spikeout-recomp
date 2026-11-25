@@ -239,6 +239,16 @@ TEST_CASE("security: 315-5881 block cipher matches MAME's") {
     CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x9EF6, 0x0000, 0xFFFF), 0xBE94u);
     CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x9EF6, 0x0001, 0xBEEF), 0xEB34u);
     CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x9EF6, 0x1234, 0xFFFF), 0x63BDu);
+    // (the key schedule kept for the last keys: another sequence key and back give the same answers)
+    const uint16_t other = Crypt315_5881::block_decrypt(0x29236FC8, 0x1234, 0x0001, 0xBEEF);
+    CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x9EF6, 0x0001, 0xBEEF), 0xEB34u);
+    CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x1234, 0x0001, 0xBEEF), other);
+    (void)Crypt315_5881::block_decrypt(0x12345678, 0x9EF6, 0x0001, 0xBEEF); // (another game key, then back)
+    CHECK_EQ(Crypt315_5881::block_decrypt(0x29236FC8, 0x9EF6, 0x0001, 0xBEEF), 0xEB34u);
+}
+
+TEST_CASE("security: 315-5881 rounds by tables match the s-boxes") {
+    CHECK(Crypt315_5881::feistel_tables_match());
 }
 
 TEST_CASE("security: the game's view of the board, plain and compressed streams") {

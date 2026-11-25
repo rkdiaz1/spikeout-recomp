@@ -747,8 +747,9 @@ void run(Context& c, const Fn* f) {
         OPC(Stfiwx): { const uint32_t ea = GA0 + GB; c.write32(ea, static_cast<uint32_t>(FD)); break; }
 
         // ---- Floating-point arithmetic (fmul and the multiply-adds: frC the multiplier) ----
-#define DBL(expr) { FD = ops::bits(expr); ops::set_fprf(s, FD, false); CR1; break; }
-#define SGL(expr) { FD = ops::round_single(expr); ops::set_fprf(s, FD, true); CR1; break; }
+        // (FPRF worked out when looked at: the FPSCR's instructions and fcmp flush it, as lifter.cpp and ppc_ir.cpp)
+#define DBL(expr) { FD = ops::bits(expr); ops::note_fprf(s, FD, false); CR1; break; }
+#define SGL(expr) { FD = ops::round_single(expr); ops::note_fprf(s, FD, true); CR1; break; }
 #define RAW(expr) { FD = (expr); CR1; break; }
 #define fa ops::f64(FA)
 #define fb ops::f64(FB)
@@ -783,20 +784,22 @@ void run(Context& c, const Fn* f) {
         OPC(Fctiwz): RAW(ops::fctiw(s, FB, true))
         OPC(Fcmpu): ops::fcmp(s, o.d, FA, FB); break;
         OPC(Fcmpo): ops::fcmp(s, o.d, FA, FB); break;
-        OPC(Mffs): RAW(0xFFF8000000000000u | s.fpscr)
+        OPC(Mffs): ops::flush_fprf(s); RAW(0xFFF8000000000000u | s.fpscr)
         OPC(Mcrfs): ops::mcrfs(s, o.d, o.a); break;
         OPC(Mtfsf):
+            ops::flush_fprf(s);
             s.fpscr = (s.fpscr & ~o.imm) | (static_cast<uint32_t>(FB) & o.imm);
             ops::fpscr_written(s);
             CR1;
             break;
         OPC(Mtfsfi):
+            ops::flush_fprf(s);
             s.fpscr = (s.fpscr & ~(0xFu << o.x)) | (o.imm << o.x);
             ops::fpscr_written(s);
             CR1;
             break;
-        OPC(Mtfsb0): s.fpscr &= ~o.imm; ops::fpscr_written(s); CR1; break;
-        OPC(Mtfsb1): s.fpscr |= o.imm; ops::fpscr_written(s); CR1; break;
+        OPC(Mtfsb0): ops::flush_fprf(s); s.fpscr &= ~o.imm; ops::fpscr_written(s); CR1; break;
+        OPC(Mtfsb1): ops::flush_fprf(s); s.fpscr |= o.imm; ops::fpscr_written(s); CR1; break;
 
         default:
             // (an instruction the lifter writes as unimplemented: the decoder keeps its raw word nowhere, so look

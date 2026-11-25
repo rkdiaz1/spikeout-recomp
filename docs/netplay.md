@@ -3944,6 +3944,216 @@ guess: a wrong one costs a going back as held last's does, and a release guessed
 Kept: held last (tools/input_guess.hpp stays out of the game). What helps more: fewer frames late (time sync, input
 delay) and cheaper goings back.
 
+## The boards' meetings (2026-11-22, every board)
+
+Every board on a PC (Mode B, gamerun --parallel) runs on its own thread, and they meet every 8 display lines
+(tools::Turns::pass, 53 times a frame; the last to come puts the link's packets on). Profiled with every thread
+sampled (gamerun --host-profile FILE@US:all; the file's head gives each thread's samples and how many were in this
+program, the rest named library+offset): four boards from power-on, each board's thread was in our own code only
+~38% of the time, the rest asleep in ntdll at the meetings; a frame took 4.3 ms of wall time for ~2.2 ms of each
+board's work. Waking a sleeping thread costs more than most of those waits.
+
+Now a board spins at a meeting (the pause instruction, up to 30 us) before it sleeps; where it meets, in what order,
+and the packets' exchange are as before, so nothing the game sees changes. Only where there are at least as many
+cores as boards, and only boards running their frames with every board here (Turns::pass's `spin`): on one board the
+other cabinets' stand-ins wait most of a frame for the staying board, and spinning there, or the staying board
+spinning for them, took CPU from the side runs' workers (two players: own work 4.33-4.47 ms a frame without, 4.43-5.2
+with). SPIKEOUT_BARRIER_SPIN_US=N sets it, 0 as before. Measured on the i7-8700K, four boards, 3,500 frames
+(Z:\Emu\tmp\eb-spin.ps1, eb-rerun.ps1):
+
+| | spin 0 (before) | 20-30 us |
+|---|---|---|
+| wall time, 3,500 frames | 13.2-14.7 s | 7.7-8.8 s |
+| going back 3 every 13: frames run again a second | 274-280 | 459-540 |
+| process CPU | 29-31 s | 24-26 s |
+
+Held to fewer cores (process affinity, one logical CPU of each physical core; Z:\Emu\tmp\eb-cores.ps1): 4 cores,
+16.1 s -> 7.5 s, frames run again 261 -> 400 a second; 6 cores, 12.3 s -> 7.1 s, 270 -> 528.
+
+Each board's RAM every frame the same with spin 0, 20 and 50 (14,000 hashes); rollback-test 0 differed.
+
+Tried and not taken: meeting less often (--slice 16 to 384, Z:\Emu\tmp\eb-slice.ps1): the game reads the link once a
+frame (link_frame), but our network boards' firmware, run by cycles, sees the packets' timing at the link's start:
+each board's RAM differs from frames 307-316, and with the spin in it gained at most ~10% (384 lines: 4x slower).
+Not built: skipping, in a going back, the frames other boards would run the same (a wrong guess reaches them two
+counts later: the records are read by count - 2). The boards run again in parallel, so the wall time is the board
+whose player was guessed wrong running every frame: skipping the others saves CPU, not time, even held to 4 cores.
+
+Not changed:
+the meetings themselves (fewer would move the link's packets: other output) and the wait for the slowest board in
+each slice. Arcade link mode (one cabinet a PC, no other boards in the program) never waits there.
+
+## One board measured as played (2026-11-22)
+
+gamerun processes on one PC joined over localhost, at the arcade's speed (--pace), input delay 2, no rollback (a LAN
+game), from the suites' states (Z:\Emu\tmp\ob-net.ps1; GAMERUN_RB_PROFILE=1 for each machine's own work a frame):
+
+| | own work a frame, every board | one board, others on side runs |
+|---|---|---|
+| two players (mash-5990, 2,000 frames) | 2.9-3.0 ms | 5.2-5.9 ms (side runs on this thread 0.8, their network boards 0.4-0.5, waiting for the worker 0.3-0.4, handing it jobs 0.3) |
+| four players (four-8000, seat 3's coin) | 4.1-4.3 ms | 9.9-15.8 ms (four machines' boards and 12 workers on one 12-thread PC: not a fair number) |
+
+So one board, on a PC with cores to spare, is still more work than every board; it is there for machines without them.
+
+**The room standing still at a coin (FIXED).** The four-player run stood still 78 s at frame 8633-8634, every seat,
+3 of 3 runs, and the same with builds from before today's changes (2026-11-18, -20): the 11-11 "board-state request
+lost". At seat 3's coin every machine on one board wants a shadow of every other cabinet, each at its own frame (8627,
+8630, 8631). A machine answers with "my backup of that frame" (board_by_backup), its backup taken just before
+(backup_now). But backup_now holds a machine's backup back while its last to it is still on its way (issue 30's slow
+lines), and three backups in four frames are: the asker got the answer without the backup, "board N's backup of frame
+F not here", no shadow, and the others waited for its inputs. Now the seats an answer is for (backup_now's `must`) are
+always sent that backup (all the changes since the last they had, after it on the same reliable channel); a backup
+already taken that frame, held from one of them, is sent to it then. Two runs since: no stand-still (longest gap 0.2-
+0.36 s, the shadows loading), 0 hash checks or packets differed. gamerun and the window share the code
+(tools/net_frame.hpp).
+
+## A late joiner on one board going out of step at a hand-back (FIXED 2026-11-22)
+
+Repro: build/t-i22/issue22.ps1 -JoinerOne -NoHistory (a room of three on every board from issue 22's frame-99,000
+state, a fourth player joining late on one board, bots playing, rollback 12; -After 9000). Before: the joiner's own
+board went out of step 5-90 frames after it handed the other cabinets back to side runs, in most runs (made packets
+wrong by the thousand). Five causes, each found from the made packets against the real ones (tools::NodeCheck: its
+offsets are the network board's, each word's bytes reversed) and the decompile's link (asm/link-study.md):
+
+1. A hand-back while the joiner still caught up: its own cabinet not yet in the game, its records an empty cabinet's
+   (link_record_idle clears them), which a made record's body is copied from. Now no hand-back until this machine's
+   seat is its own (one_board Settings::seated: Session::seated and seat_from; its cabinet in the link's players too).
+2. Each cabinet's own bytes of every character's entry (sync_check_build 0x74808: +4..+7 the low bytes of +0x3F02,
+   +0x3F22, +0x34A0, +0x34FC; rob_create 0x1E3D8 clears only 0x3F00 of a character's 0x4000 bytes): +0x3F02, +0x3F22
+   and +0x34FC are a cabinet's own variables now (remote::kCharacterOwn), and a made record takes them as the remote's
+   last link run's checks wrote them (the link copies its record out first, then sync_check_build fills the entries
+   for the next count: Remote::entry_own), or from the shadow's working record at a hand-back.
+3. The made record's character entries (+0x14..+0xA3) from this board's for that count (Cabinets::entries_at_, noted
+   at every meeting): a side run's working record had whichever this board's last link left, a count off at times.
+4. Parts of a record the game writes only on events (+0x0E/+0x0F, +0xA4..+0xD3): each cabinet's own past, kept from
+   the remote's last record unless this board's changed them this count. (Not +0x100 on: the link writes those every
+   count; tried and wrong at once.)
+5. A hand-back coming from the shadow's thread after this board's flow of the cabinet's next count: that count then
+   ran later in a batch without its tasks (no camera update, no view tests), its camera a count behind from there.
+   This board's world is kept at that flow for any cabinet (as it was for a master's only) and the count caught up on
+   it when the hand-back comes. Also: the header's game bytes (game_at) seeded from the shadow at a hand-back.
+
+After: 4 of 4 runs in step through two hand-backs each (29-96 made packets differing briefly, the joiner's own
+player's entry for a few frames; none read wrong). Tests: OWN_LOG=1 (a made entry's own bytes against the record's),
+HANDBACK_LOG=1 (what a hand-back starts its side runs from), ONEBOARD_OWN_LOG=FROM-TO (each side run's camera).
+
+## One board's own work: tried and not taken (2026-11-23)
+
+A one-board machine's own work, two players over localhost: ~4.3-4.5 ms a frame on side runs against ~3.0-3.5 with
+every board whole (side runs here ~0.6, the others' network boards ~0.3-0.4, waiting for the worker ~0.2-0.3, handing
+it jobs ~0.3). The profile (--host-profile :all) is flat; its biggest names were MinGW's clock_gettime (~7% of the
+program's samples: steady_clock::now() around side runs and meetings) and CommBoard::host_view (3%, the comm RAM read a
+byte at a time). Tried: a cheap clock (QueryPerformanceCounter straight) and a comm RAM word path (the part and table
+worked out once a word). In-process (onepc four-seat, three runs each, alternating): 32.5-34.4 s before, 33.0-35.6 s
+after: no gain, both taken back out.
+
+## Empty seats and joins on one board (FIXED 2026-11-22/23)
+
+Repros: Z:\Emu\tmp\check6a.ps1 -RoomSeats 4 -Seats 3 (three one-board machines in a four-seat room, bots, rollback) and
+build/t-i22/issue22.ps1 -OthersOne -JoinerOne -NoHistory -Before 2 (a room on one board, two early players joining one
+at a time, then a late one into the last empty seat).
+
+- An empty seat kept one board from ever handing back: its cabinet stays in attract, and the calm rule wanted every
+  cabinet run whole in the game's mode. 0 hand-backs in 9,000 frames (every board on every machine all game). Now an
+  open seat (Session::SeatView::State::open, or joining: its player still catching up) is left out of that test, and its
+  own cabinet is never handed back (run whole: one_board Settings::seat_open). After: 4 hand-backs each, in step.
+  The cost, a whole board for the empty cabinet on each machine, is left for later (memory note).
+- A player joining a seat whose cabinet was on side runs on the host never got the game: the host, to send every
+  board's state, asked that seat's machine (the joiner itself) for it. Kept whole now (above), never asked.
+- The room stood 30 s at joins: a request for a frame the asked machine had already passed was dropped without a word,
+  and the asker waited wait_board's 30 s. It also deadlocked: the asked machine, 30+ frames ahead, stood waiting for
+  the asker's inputs while the asker stood waiting for the answer. Now a request for a frame gone by is answered at
+  once, from the network side (NetPlay's board_wanted callback, through the backups' sender), with 8 bytes: that
+  machine's frame now. Any build takes fewer than 16 bytes as no state (one_board::unpack_remote); this build asks
+  again past that frame (NetPlay::ask_at, kAskMargin 20), so the next request lands. Before: 30 s stand-stills in 2 of
+  2 runs; after: none (the longest wait 0.2-0.4 s, one run 5 s for a joiner taken anyway at 0.75x speed).
+
+## Joins, big transfers and the link: the round of 2026-11-23/24
+
+Five open items from the one-board work, then the pacing they showed up, then what the players' reports and the
+report games showed. Every claim below was proved by hashes (0 checks differed), the one-board suites, the internet
+cases or the report replays, as each says.
+
+**The node check's unpaired packets (item 5).** The made-vs-real check counted as unpaired the packets of seats no
+machine sends for (an empty seat, a seat still joining, frames before a seat's frame, a machine's own catch-up):
+those count as "unsent" now (tools/node_check.hpp `seats_joining`, `seat_taken`), and a packet made twice is counted
+once. The host's unpaired count went from thousands to 8 and 1.
+
+**A shadow that never handed back (item 2).** A shadow now hands back once its count reaches its stop (`count >=
+stop`, one_board.hpp), not only when it equals it: a shadow whose count passed its stop by a frame (a late load) ran
+whole for good.
+
+**The cabinets' handshake on side runs (item 1).** The game's handshake (0x6F434, mode 5 of the mode dispatch: a
+room waiting for every cabinet) reads the other nodes through this cabinet's node table and header (+0x14). Run on
+the side for another cabinet it read this machine's own. Two hooks (0x6F434 in, 0x6F504 out:
+remote_cabinet.hpp `handshake_hook`) put that cabinet's own table and headers in for the handshake and back after;
+0x140113 (mask 0x01), 0x140114-17 and 0x10009C are kept per cabinet. The JIT's translator version is
+"spikeout-jit 3" (the hooks are in the code).
+
+**The joiner's own first backup (item 3, redone).** A one-board machine keeps a copy of every other board, which the
+board's machine then updates with changes. For a joiner those copies have to be of one exact frame on every machine:
+- The seat's frame S is a multiple of 32 (Session `kSeatFrameEvery`), which rollback always keeps.
+- Each machine copies each other board at S: at the end of S if S is final (all inputs in, none guessed wrong), else
+  read out of rollback once it is (`rollback::Linked::state_at`, `settled`). Ring counts are noted every 32 frames.
+- The joiner takes its own first backup at S the same way, sent to nobody: everyone already has S.
+  First the joiner waited at S for every input of S (the others' inputs, ~13 frames away), a ~220 ms stand-still at
+  its first frame of play in the internet tests; now it reads S out of rollback once final
+  (`m3::Snapshots::adopt`, `backup::Maker::adopt`).
+- A copy not had 300 frames after S: the whole backup asked for, as before.
+Measured on one-board joins: 36 copies at S, 0 fallbacks, 0 changes refused; the joiner's own taken at S or read out
+of rollback 1-2 frames later, both accepted everywhere.
+
+**A joiner's every-board state from several players (item 4).** Every player running every board can take the same
+state at the same frame, so each sends part of it and the host's upload isn't the join's limit. The host asks its
+helpers (kShareAt, also as datagrams) to take every board's state at its frame + 45; the state is cut into chunks per
+board (1 MB), each board's chunks packed against board 0's at the same place (zstd's prefix: 7.4-11.9 MB, 6-12%
+more than the whole state packed at once); the host sends a plan (each chunk's place, reference, hash, size, sender),
+each sender its chunks, a helper whose chunk differs from the plan's hash says so (kShareCant) and the host sends it;
+the joiner asks the host for a quiet helper's chunks after 5 s. `SPIKEOUT_NO_SHARE=1`: the host alone, as before.
+Measured on 2 MB/s test lines (A/B, alternating): the 3rd player 4.7-5.0 s from joining to the state against
+6.5-8.0 s from the host alone; the 4th 4.1 s against 6.3-7.7 s (on this PC: 5 processes, the 4th's runs overloaded).
+
+**The pace of big transfers.** Measuring item 4 showed every big transfer (join states, one-board backups,
+spectators) running at a third of the line:
+- An acknowledgement named only 64 pieces past the first gap, with 256 in flight: one lost piece had the rest sent
+  again and counted lost, the pace halved. It names the whole window now (`Reliable::Sack`, kProtocol 4).
+- On a full line the pace now drops to 0.75 of what the receiver said it had over the last second, never below
+  half (a second only partly busy says little of the line: cut to 0.75 of it, a one-board room's shadows came 6 s
+  late); with too little through to tell, it halves as before (`SPIKEOUT_PACE_EASE` for tests).
+- A pace is cut only when we fill the line (something waited for it this turn, 16+ pieces sent), and goes back to
+  its start when idle: a helper's limit had sunk to 48 KB/s while it sent only inputs.
+- A turn of the network loop reads for at most ~10 ms: a joiner taking a state from two senders read for seconds,
+  acknowledged nothing, and both senders' windows stood full. The socket's buffers: 4 MB in, 1 MB out.
+Host alone, 2 MB/s with 0.5% loss: 10.1 s from joining to the state before, ~6 s after. One-board rooms with backups
+during play: no more frames waiting for inputs than before (old pacing 38/52, 0.75 50, 0.5 61/85 over two runs).
+`SPIKEOUT_PACE_LOG=1` logs each channel's pace, a long network turn and a slow message.
+
+**A capture that never finished.** A rollback over the frame every board's state is taken at had a board save
+twice, "5 of 4 saved": the ring's cut was never taken and every later join waited for good. A board is counted once
+now (gamerun and the window). A capture not finished a second past its frame is logged with what it waits for, and
+a wait for inputs over 5 s is logged every 5 s (tools/input_table.hpp).
+
+**The players' reports (497 fetched 2026-11-24, nearly all preview7).** Crashes: 25 of 29 are the JIT's constants
+out of reach (fixed on main, 62dae7a, not released). Communication error: 20 reports, 13 new report games (below).
+Node 164, slow 131, stall 101, desync 32, hang 16, join 4.
+
+**Report games: the count-matched link proven on real failures (docs/fidelity.md, "The link's table by the
+counts").** A replay counts only while it still follows its recording (its RAM checks): on another link it differs
+from early on, and an error far later, or none, is close to chance (changes first tried on such replays, 2026-11-24, were
+judged again on exact replays below). 8 of the 13 new Communication-error report games replay exactly on preview7's link to the
+error at the reported frame; from each one's state 600 frames before, preview7's link shows the error again in all 8,
+the count-matched link in 4 (a table shown as soon as it is whole stopped 3 more but parted one-board machines from
+the others: not taken, docs/fidelity.md). 2 more come from a joiner whose state already held the room's
+error (the cabinets' counts and modes already apart in it): nothing after the state can change them. For those, a
+joiner that sees the game's Communication error within 600 frames of its join now asks the host for a report of its
+own (Session::ask_report, kWantReport; "comm-error-room"), with the host's recording from the game's start, the room's
+history before the error. `GAMERUN_TEST_ASK_REPORT=1` tests it.
+
+**Open.** A one-board room stood still once after a hand-back (the joiner stopped at frame ~106,250; not seen again
+in 13 runs, now logged). An oneboard-rb internet run had 273 ms gaps: rollback re-running every board while the
+machine still ran them whole "until the game is calm" (~50 s after the set-up), the hand-back sooner the cure (the
+slow-player plan's step 5, docs/slow-players.md).
+
 ## Plan
 
 1. Single board, single player (milestones 1–4).

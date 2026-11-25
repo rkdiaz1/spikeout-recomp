@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 
 namespace m3 {
 
@@ -45,7 +46,65 @@ struct ModelVertex {
     uint16_t u = 0, v = 0;        // texture coordinates as stored
 };
 
+// A polygon as read from a model: its header, its vertices (the shared ones taken from the polygon before), its
+// address; and how many of them it read (n - shared: the vertices it has of its own).
+struct ReadPolygon {
+    uint32_t h[7];
+    std::array<ModelVertex, 4> v;
+    uint32_t addr;
+    int n;
+};
+
+// A model's polygons read from the Real3D's memory, from its first to its last (the header's "last" bit), the end
+// marker (word 6 zero) or kMaxPolygonsPerModel: what decode_model reads before it turns them by the model's matrix.
+void read_model(const Real3d& mem, uint32_t addr, std::vector<ReadPolygon>& out) {
+    out.clear();
+    std::array<ModelVertex, 4> prev{};
+    uint32_t a = addr;
+    for (uint32_t count = 0; count < kMaxPolygonsPerModel; ++count) {
+        ReadPolygon r;
+        uint32_t* h = r.h;
+        for (uint32_t i = 0; i < 7; ++i) h[i] = mem.model(a + i);
+        if (h[6] == 0) break; // end of the model
+        r.addr = a;
+        const int n = (h[0] & 0x40) ? 4 : 3;
+        std::array<ModelVertex, 4> v{};
+        int j = 0;
+        for (int i = 0; i < 4; ++i)
+            if (h[0] & (1u << i)) v[static_cast<size_t>(j++)] = prev[static_cast<size_t>(i)];
+        const int shared = j;
+        uint32_t data = a + 7;
+        for (; j < n; ++j, data += 4) {
+            const uint32_t ix = mem.model(data), iy = mem.model(data + 1), iz = mem.model(data + 2), it = mem.model(data + 3);
+            ModelVertex& w = v[static_cast<size_t>(j)];
+            w.x = static_cast<float>(static_cast<int32_t>(ix) >> 8) / 2048.0f;
+            w.y = static_cast<float>(static_cast<int32_t>(iy) >> 8) / 2048.0f;
+            w.z = static_cast<float>(static_cast<int32_t>(iz) >> 8) / 2048.0f;
+            // Signed bytes as the hardware reads them: (2b + 1) / 255 (Supermodel).
+            auto byte_float = [](uint32_t b) { return (2.0f * static_cast<float>(static_cast<int8_t>(b & 0xFF)) + 1.0f) / 255.0f; };
+            w.nx = byte_float(ix);
+            w.ny = byte_float(iy);
+            w.nz = byte_float(iz);
+            w.shade = static_cast<uint8_t>(ix & 0xFF);
+            w.u = static_cast<uint16_t>(it >> 16);
+            w.v = static_cast<uint16_t>(it);
+        }
+        prev = v;
+        r.v = v;
+        r.n = n;
+        out.push_back(r);
+        a += 7 + static_cast<uint32_t>(n - shared) * 4;
+        if (h[1] & 4) break; // its last polygon
+    }
+}
+
 } // namespace
+
+struct Real3dSceneBuilder::ModelCache {
+    const Real3d* mem = nullptr; // (the memory the models were read from: another, all read again)
+    std::unordered_map<uint32_t, std::vector<ReadPolygon>> models;
+    std::vector<ReadPolygon> scratch; // (a model in polygon RAM, read each time)
+};
 
 Mat4 Mat4::identity() {
     Mat4 r;
@@ -547,40 +606,26 @@ void Real3dSceneBuilder::decode_model(size_t viewport, const ModelRef& model) {
         return n;
     };
 
-    std::array<ModelVertex, 4> prev{};
-    uint32_t a = model.addr;
-    for (uint32_t count = 0; count < kMaxPolygonsPerModel; ++count) {
-        uint32_t h[7];
-        for (uint32_t i = 0; i < 7; ++i) h[i] = mem_->model(a + i);
-        if (h[6] == 0) break; // end of the model
-        const uint32_t polygon_addr = a;
+    // (its polygons as read: a model in the polygon ROM once, kept; one in polygon RAM each time, as it may change)
+    if (!model_cache_.cache) model_cache_.cache = std::make_shared<ModelCache>();
+    ModelCache& cache = *model_cache_.cache;
+    if (cache.mem != mem_) cache.models.clear(), cache.mem = mem_;
+    const std::vector<ReadPolygon>* read;
+    if ((model.addr & 0xFFFFFF) >= 0x100000) {
+        auto [it, fresh] = cache.models.try_emplace(model.addr);
+        if (fresh) read_model(*mem_, model.addr, it->second);
+        read = &it->second;
+    } else {
+        read_model(*mem_, model.addr, cache.scratch);
+        read = &cache.scratch;
+    }
+    for (const ReadPolygon& r : *read) {
+        const uint32_t* h = r.h;
+        const uint32_t polygon_addr = r.addr;
         ++scene_->stats.polygons;
-        const int n = (h[0] & 0x40) ? 4 : 3;
-        std::array<ModelVertex, 4> v{};
-        int j = 0;
-        for (int i = 0; i < 4; ++i)
-            if (h[0] & (1u << i)) v[static_cast<size_t>(j++)] = prev[static_cast<size_t>(i)];
-        const int shared = j;
-        uint32_t data = a + 7;
-        for (; j < n; ++j, data += 4) {
-            const uint32_t ix = mem_->model(data), iy = mem_->model(data + 1), iz = mem_->model(data + 2),
-                           it = mem_->model(data + 3);
-            ModelVertex& w = v[static_cast<size_t>(j)];
-            w.x = static_cast<float>(static_cast<int32_t>(ix) >> 8) / 2048.0f;
-            w.y = static_cast<float>(static_cast<int32_t>(iy) >> 8) / 2048.0f;
-            w.z = static_cast<float>(static_cast<int32_t>(iz) >> 8) / 2048.0f;
-            // Signed bytes as the hardware reads them: (2b + 1) / 255 (Supermodel).
-            auto byte_float = [](uint32_t b) { return (2.0f * static_cast<float>(static_cast<int8_t>(b & 0xFF)) + 1.0f) / 255.0f; };
-            w.nx = byte_float(ix);
-            w.ny = byte_float(iy);
-            w.nz = byte_float(iz);
-            w.shade = static_cast<uint8_t>(ix & 0xFF);
-            w.u = static_cast<uint16_t>(it >> 16);
-            w.v = static_cast<uint16_t>(it);
-        }
-        prev = v;
+        const int n = r.n;
+        const std::array<ModelVertex, 4>& v = r.v;
         const bool last = h[1] & 4;
-        a += 7 + static_cast<uint32_t>(n - shared) * 4;
 
         if ((h[0] & 0x300) != 0x300) { // not discarded
             // Colour: RGB in the header, or an entry of the colour table.

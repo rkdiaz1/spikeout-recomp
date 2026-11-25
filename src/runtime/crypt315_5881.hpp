@@ -38,6 +38,8 @@ public:
 
     // The block cipher alone: one encrypted word at `counter`.
     static uint16_t block_decrypt(uint32_t game_key, uint16_t sequence_key, uint16_t counter, uint16_t data);
+    // (tests) The rounds by tables give the s-boxes' own results: every round, every input byte, many keys.
+    static bool feistel_tables_match();
 
     void state(State& s); // save states (runtime/state.hpp); not the key or the reader
 
@@ -61,6 +63,7 @@ private:
     static const int fn2_middle_result_scheduling[16];
     static const uint8_t trees[9][2][32];
     static int feistel_function(int input, const Sbox* sboxes, uint32_t subkeys);
+    static int feistel_fast(int input, int round, uint32_t subkeys); // (by tables: round 0-3 fn1's, 4-7 fn2's)
 
     uint16_t get_decrypted_16();
     int get_compressed_bit();

@@ -369,6 +369,7 @@ public:
 private:
     friend struct ::recomp::JitAccess;
     uint8_t read_byte(uint32_t addr);
+    uint8_t crom_byte(uint32_t addr) const; // the program ROMs' byte (addr from kBankedCromBase)
     uint16_t read_slow16(uint32_t addr);
     uint32_t read_slow32(uint32_t addr);
     // `value` holds the whole access, `size` bytes, big-endian.

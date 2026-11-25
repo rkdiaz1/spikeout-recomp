@@ -279,6 +279,10 @@ private:
                                "; each board's inputs set up to:";
             for (std::size_t i = 0; i < boards_.size(); ++i)
                 text += " " + (boards_[i].known ? std::to_string(boards_[i].next) : std::string("none")) + (boards_[i].quiet ? " (quiet)" : "");
+            // (said every 5 s past the first 5: a stand-still stopped from outside left no line saying what it waited for,
+            // 2026-11-24, a one-board room standing after a hand-back)
+            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - since).count();
+            if (secs >= 5 && secs % 5 == 0) std::printf("input table: %s\n", text.c_str()), std::fflush(stdout);
             LongWait& l = long_wait();
             std::lock_guard g(l.lock);
             l.text = std::move(text), l.at = std::chrono::steady_clock::now();

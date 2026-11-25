@@ -31,4 +31,32 @@ std::optional<std::vector<uint8_t>> decompress(std::span<const uint8_t> data, st
     return out;
 }
 
+std::vector<uint8_t> compress_against(std::span<const uint8_t> data, std::span<const uint8_t> ref, int level) {
+    if (ref.empty()) return compress(data, level);
+    std::vector<uint8_t> out(ZSTD_compressBound(data.size()));
+    ZSTD_CCtx* c = ZSTD_createCCtx();
+    if (!c) return {};
+    ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, level);
+    ZSTD_CCtx_refPrefix(c, ref.data(), ref.size()); // (this compression only: a reference the other side has)
+    const std::size_t n = ZSTD_compress2(c, out.data(), out.size(), data.data(), data.size());
+    ZSTD_freeCCtx(c);
+    if (ZSTD_isError(n)) return {};
+    out.resize(n);
+    return out;
+}
+
+std::optional<std::vector<uint8_t>> decompress_against(std::span<const uint8_t> data, std::span<const uint8_t> ref, std::size_t max_bytes) {
+    if (ref.empty()) return decompress(data, max_bytes);
+    const unsigned long long size = ZSTD_getFrameContentSize(data.data(), data.size());
+    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN || size > max_bytes) return std::nullopt;
+    std::vector<uint8_t> out(static_cast<std::size_t>(size));
+    ZSTD_DCtx* d = ZSTD_createDCtx();
+    if (!d) return std::nullopt;
+    ZSTD_DCtx_refPrefix(d, ref.data(), ref.size());
+    const std::size_t n = ZSTD_decompressDCtx(d, out.data(), out.size(), data.data(), data.size());
+    ZSTD_freeDCtx(d);
+    if (ZSTD_isError(n) || n != out.size()) return std::nullopt;
+    return out;
+}
+
 } // namespace net

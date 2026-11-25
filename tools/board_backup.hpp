@@ -93,9 +93,48 @@ public:
         base_ = frame_;
         snaps_.save(frame, walk);
         frame_ = frame, taken_ = taken, sent_ = sent;
-        if (snaps_.started()) base_ = 0, owed_.clear(); // (nothing to change from: whole for every machine)
+        if (snaps_.started()) base_ = 0, owed_.clear(), history_.clear(); // (nothing to change from: whole for every machine)
         else
             for (auto& [seat, o] : owed_) snaps_.pages([&](std::size_t r, std::size_t p) { o.pages[r].insert(p); });
+        Taken t{frame, {}};
+        if (base_ != 0) snaps_.pages([&](std::size_t r, std::size_t p) { t.pages[r].insert(p); });
+        history_.push_back(std::move(t));
+        while (history_.size() > kHistory) history_.pop_front();
+    }
+    // A first backup from a copy of this board at `frame` (read out of rollback: m3::Snapshots::adopt), not from the
+    // board now: as take() of that frame, the next take() finding every page written since. False: none taken.
+    bool adopt(uint64_t frame, const std::function<void(m3::State&)>& walk, std::vector<std::vector<uint8_t>> regions,
+               std::vector<uint8_t> small, uint64_t taken, uint64_t sent) {
+        if (!snaps_.adopt(frame, walk, std::move(regions), std::move(small))) return false;
+        frame_ = frame, taken_ = taken, sent_ = sent, base_ = 0;
+        owed_.clear(), history_.clear();
+        history_.push_back(Taken{frame, {}});
+        return true;
+    }
+    // Changes since this board's last backup at or before `frame` (none kept that old: nullopt), for a machine whose
+    // copy of this board is of a frame at or after that one: a player who took its seat at `frame`, running every
+    // board whole there, its copy of this one made then (Keeper::set_base). Every page written since that backup, as
+    // it is now: the board as it is now on any copy from that backup's frame on.
+    std::optional<std::vector<uint8_t>> changes_since(uint64_t frame) const {
+        std::size_t from = history_.size();
+        for (std::size_t i = history_.size(); i-- > 0;)
+            if (history_[i].frame <= frame) {
+                from = i;
+                break;
+            }
+        if (from == history_.size() || frame_ < frame) return std::nullopt;
+        std::map<std::size_t, std::set<std::size_t>> pages;
+        for (std::size_t i = from + 1; i < history_.size(); ++i)
+            for (const auto& [r, ps] : history_[i].pages) pages[r].insert(ps.begin(), ps.end());
+        detail::Out o;
+        header(o, detail::kChanges, history_[from].frame);
+        uint32_t n = 0;
+        for (const auto& [r, ps] : pages) n += static_cast<uint32_t>(ps.size());
+        o.u32(n);
+        for (const auto& [r, ps] : pages)
+            for (const std::size_t page : ps) page_out(o, r, page);
+        small(o);
+        return std::move(o.b);
     }
     uint64_t frame() const { return frame_; }
     bool changes_possible() const { return base_ != 0; }
@@ -156,6 +195,13 @@ private:
         std::map<std::size_t, std::set<std::size_t>> pages; // (by region: changed since)
     };
     std::map<uint8_t, Owed> owed_;
+    // (the last backups taken: each one's frame and the pages written since the one before; changes_since)
+    struct Taken {
+        uint64_t frame = 0;
+        std::map<std::size_t, std::set<std::size_t>> pages;
+    };
+    static constexpr std::size_t kHistory = 64; // (about two minutes of backups)
+    std::deque<Taken> history_;
     void page_out(detail::Out& o, std::size_t region, std::size_t page) const {
         const std::vector<uint8_t>& r = snaps_.region(region);
         const std::size_t at = page * m3::Snapshots::kPageBytes;
@@ -205,7 +251,10 @@ struct Copy {
             if (!read_small(in, sm)) return false;
             regions = std::move(rs), small = std::move(sm);
         } else if (kind == detail::kChanges) {
-            if (!valid() || base != frame || n != regions.size()) return false;
+            // (from this copy's frame, or one before it: every page written since that one, as it is now, makes the
+            // board as it is now from any copy since (Maker::changes_since); never one older than this copy)
+            if (valid() && f < frame && base <= frame) return true; // (older than this copy, made here since: nothing to do)
+            if (!valid() || base > frame || f < frame || n != regions.size()) return false;
             const uint32_t pages = in.u32();
             struct Change {
                 uint8_t* to;
@@ -283,12 +332,60 @@ public:
     explicit Keeper(std::size_t seats) : copies_(seats), older_(seats), history_(seats) {
         for (std::size_t s = 0; s < seats; ++s) logs_.push_back(std::make_unique<PacketLog>());
     }
+    // A copy of seat `seat`'s board to come from this machine's own run of it, whole here at a settled frame at or after
+    // `from` (set_base), not from a whole backup: a player joining in progress (its copies of the other boards, from its
+    // seat's frame; a one-board joiner was sent ~6 MB by each other machine as it took its seat, its inputs waiting
+    // behind them on its line: 11.5 s, 2026-11-23), and every other machine's copy of the joiner's board (it runs a
+    // joining seat's cabinet whole). Until then its backups are kept. (~0ull: none expected any more)
+    void expect_base(std::size_t seat, uint64_t from) {
+        std::lock_guard guard(lock_);
+        if (seat >= copies_.size()) return;
+        if (from != ~0ull) expecting_[seat] = from;
+        else expecting_.erase(seat), pending_.erase(seat);
+    }
+    std::optional<uint64_t> expecting(std::size_t seat) const {
+        std::lock_guard guard(lock_);
+        const auto it = expecting_.find(seat);
+        return it == expecting_.end() ? std::nullopt : std::optional<uint64_t>(it->second);
+    }
+    std::map<std::size_t, uint64_t> expected() const {
+        std::lock_guard guard(lock_);
+        return expecting_;
+    }
+    // Seat `seat`'s board here at the end of `frame` (`regions` and `small` as m3::Snapshots takes them, the packets
+    // its board had taken and sent then): its copy, and the backups held till now put on it.
+    void set_base(std::size_t seat, Copy base) {
+        std::lock_guard guard(lock_);
+        if (seat >= copies_.size()) return;
+        if (copies_[seat].valid() && copies_[seat].frame >= base.frame) { // (one as new from its machine already: kept)
+            expecting_.erase(seat), pending_.erase(seat);
+            return;
+        }
+        copies_[seat] = std::move(base);
+        older_[seat].clear();
+        expecting_.erase(seat);
+        auto held = std::move(pending_[seat]);
+        pending_.erase(seat);
+        for (const auto& p : held) copies_[seat].apply(p); // (one from before this copy: not taken)
+        logs_[seat]->forget_before(copies_[seat].taken);
+        history_.forget_before(seat, copies_[seat].frame);
+    }
     // Seat `seat`'s backup (packed). False: changes from one this hasn't (its whole wanted).
     bool backup(std::size_t seat, std::span<const uint8_t> packed) {
         std::lock_guard guard(lock_);
         if (seat >= copies_.size()) return false;
         Copy before = keep_ > 1 && copies_[seat].valid() ? copies_[seat] : Copy{};
-        if (!copies_[seat].apply(packed)) return false;
+        if (!copies_[seat].apply(packed)) {
+            // (changes that need its copy, still to come: kept for it. Only those: one that applies (a whole backup, or
+            // changes on the copy here) is taken at once. Held too, a whole one sent as a board's answer for a shadow
+            // waited for that copy, the room standing for good (2026-11-23: a seat taken from a frame 1,100 ahead of the
+            // room, a player still catching up))
+            if (!expecting_.count(seat)) return false;
+            auto& held = pending_[seat];
+            held.emplace_back(packed.begin(), packed.end());
+            while (held.size() > 8) held.erase(held.begin());
+            return true;
+        }
         if (before.valid()) { // (kept: a spectator runs behind the players, its backups' frames ahead of it)
             older_[seat].push_back(std::move(before));
             while (older_[seat].size() + 1 > keep_) older_[seat].pop_front();
@@ -347,6 +444,8 @@ private:
     mutable std::mutex lock_;
     std::vector<Copy> copies_;
     std::vector<std::deque<Copy>> older_; // (the ones before the last, set_keep)
+    std::map<std::size_t, uint64_t> expecting_; // (seats whose copy is to come from this machine's own run of them, from that frame on)
+    std::map<std::size_t, std::vector<std::vector<uint8_t>>> pending_; // (their backups meanwhile, packed)
     std::size_t keep_ = 1;
     std::vector<std::unique_ptr<PacketLog>> logs_;
     InputTable history_;

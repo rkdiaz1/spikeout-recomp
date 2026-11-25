@@ -53,6 +53,8 @@ inline uint64_t build_id(const m3::RomSet& roms, std::size_t functions, const m3
         mixd(link->link_cycles_per_byte), mix(link->send_waits_for_receive), mix(link->ring_forwarding);
         mix(link->double_buffer), mixd(link->main_frame_hz), mix(link->main_hz), mix(link->link_status);
         mix(link->ring_second_pass), mix(link->slave_table_late);
+        if (link->count_matched) mix(0xC0C7u); // (2026-11-19: mixed only when on, so builds from before it differ)
+        if (link->cut_through) mix(0xC07u); // (2026-11-25: likewise)
     }
     for (std::size_t r = 0; r < static_cast<std::size_t>(m3::RomRegionId::Count); ++r) {
         const auto& region = roms.region(static_cast<m3::RomRegionId>(r));
@@ -184,8 +186,11 @@ public:
         cb.taken = [this](uint8_t seat, uint64_t frame) { // (a player's again: its board asked of its machine as any)
             table_.hold_until(seat, frame);
             keeper_.hold_until(seat, frame);
+            node_check_.seat_taken(seat, frame);
             std::lock_guard guard(lock_);
             taken_.push_back(seat);
+            seat_taken_at_[seat] = frame;
+            keeper_.expect_base(seat, frame); // (its board run whole here as it joined: our copy from it; not our own: JoinBases)
             if (seat < absent_.size()) absent_[seat] = false;
         };
         cb.state_wanted = [this] { state_wanted_ = true; };
@@ -204,7 +209,26 @@ public:
         cb.log = [this](const std::string& s) {
             if (log_) log_(s);
         };
+        cb.report_wanted = [this](uint8_t seat, uint64_t frame, std::string why) { // (the host: a joiner's error just after joining)
+            const std::string who = seat >= ::net::kMaxSeats ? "a spectator" : "seat " + std::to_string(seat + 1);
+            const std::string what = who + " saw the game's Communication error just after joining, at frame " + std::to_string(frame) +
+                                     " (" + why + "): this room's report, its history before it";
+            if (log_) log_(what);
+            problem("comm-error-room", what, frame);
+        };
         cb.board_wanted = [this](uint8_t seat, uint64_t frame) {
+            board_trace("asked by seat " + std::to_string(seat + 1) + " for frame " + std::to_string(frame) + " (here " + std::to_string(frame_now_.load()) + ")");
+            // (a frame this machine has passed already: told at once, from the backups' sender (with what was queued to it
+            // before), not at the game thread's next frame end: that thread can stand waiting for the asker's inputs while
+            // the asker stands waiting for this answer; the two stood 30 s, 2026-11-22, a player just seated 30+ frames
+            // ahead of the host, which wanted its board whole for the next joiner's state)
+            if (frame < frame_now_.load()) {
+                std::printf("net: seat %u asked for this board's state at frame %llu, gone by here (frame %llu): told so at once\n",
+                            seat + 1u, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame_now_.load()));
+                send_board_after_backups(frame, late_answer(), {seat});
+                start_backup_sender();
+                return;
+            }
             std::lock_guard guard(lock_);
             boards_wanted_.push_back({seat, frame});
         };
@@ -213,6 +237,13 @@ public:
             partings_.push_back({seat, frame});
         };
         cb.board = [this](uint8_t seat, uint64_t frame, std::vector<uint8_t> state) {
+            board_trace("board of seat " + std::to_string(seat + 1) + " for frame " + std::to_string(frame) + " came, " + std::to_string(state.size()) + " bytes");
+            if (state.size() == 8) { // ("too late": the frame that machine was at (late_answer); asked past it next)
+                uint64_t at = 0;
+                for (int k = 0; k < 8; ++k) at |= uint64_t{state[static_cast<std::size_t>(k)]} << (8 * k);
+                std::lock_guard guard(lock_);
+                late_hint_[seat] = std::max(late_hint_[seat], at);
+            }
             // ("my backup of that frame" (one_board::pack_remote with no state: its 16 bytes of counts): that backup came
             // just before it; the copy kept then, as another backup (for another machine's shadow) may follow at once)
             std::optional<backup::Copy> copy;
@@ -276,6 +307,11 @@ public:
     // (`make`: the state, made there too: LinkedState::assemble's 80 MB copy)
     // (each such state as packed, on that thread: the window keeps the newest for its problem bundles; set before play)
     std::function<void(uint64_t frame, const std::vector<uint8_t>& packed)> on_state_packed;
+    // (tests: NET_BOARD_TRACE=1, a board's state asked of this machine and its way out, and those coming here, in the log)
+    void board_trace(const std::string& what) {
+        static const bool on = std::getenv("NET_BOARD_TRACE") != nullptr;
+        if (on && log_) log_("board trace: " + what);
+    }
     void send_state_later(uint64_t frame, std::function<std::vector<uint8_t>()> make) {
         {
             std::lock_guard guard(backup_lock_);
@@ -324,6 +360,30 @@ public:
                         if (b.whole_state) { // (send_state_later: every board's, to the players and spectators asking)
                             const auto started = std::chrono::steady_clock::now();
                             b.raw = b.make();
+                            // (a joiner's state in chunks from several players, item 4: the host's plan and chunks, or a
+                            // helper's; the whole state packed too only for a machine still waiting for it (a spectator))
+                            const uint64_t host_share = session_->share_frame(), helper_share = session_->share_helper_frame();
+                            if (b.frame == host_share || (b.frame == helper_share && !session_->hosting())) {
+                                if (const char* dir = std::getenv("SPIKEOUT_SHARE_DUMP"); dir && *dir) { // (tests: the state chunked)
+                                    const std::string path = std::string(dir) + "/share-" + std::to_string(b.frame) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000) + ".raw";
+                                    if (std::FILE* f = std::fopen(path.c_str(), "wb")) std::fwrite(b.raw.data(), 1, b.raw.size(), f), std::fclose(f);
+                                }
+                                std::vector<net::Session::ShareChunk> chunks = net::Session::share_chunks(b.raw);
+                                std::size_t n = chunks.size(), packed = 0;
+                                for (const auto& c : chunks) packed += c.packed.size();
+                                if (b.frame == host_share)
+                                    session_->share_state(b.frame, static_cast<uint32_t>(b.raw.size()), std::move(chunks));
+                                else
+                                    session_->share_offer(b.frame, std::move(chunks));
+                                std::printf("net: every board's state at frame %llu in %zu chunks, %zu KB packed, %s (in %.0f ms, off the game thread)\n",
+                                            static_cast<unsigned long long>(b.frame), n, packed / 1024, b.frame == host_share ? "the host's plan" : "ours offered",
+                                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                                std::fflush(stdout);
+                                if (b.frame != host_share || !session_->state_wanted()) {
+                                    if (on_state_packed && b.frame == host_share) on_state_packed(b.frame, net::compress(b.raw));
+                                    continue;
+                                }
+                            }
                             std::vector<uint8_t> packed = net::compress(b.raw);
                             std::printf("net: every board's state at frame %llu: %zu KB, %zu KB packed (in %.0f ms, off the game "
                                         "thread)\n",
@@ -336,10 +396,12 @@ public:
                         }
                         if (b.raw.empty()) { // (send_board_after_backups)
                             for (const uint8_t seat : b.seats) session_->send_board(seat, b.frame, b.board);
+                            board_trace("board of frame " + std::to_string(b.frame) + " to the session, " + std::to_string(b.board.size()) + " bytes");
                             continue;
                         }
                         const std::vector<uint8_t> packed = net::compress(b.raw);
                         for (const uint8_t seat : b.seats) session_->send_backup(seat, b.frame, packed);
+                        board_trace("backup of frame " + std::to_string(b.frame) + " to the session, " + std::to_string(packed.size() / 1024) + " KB packed");
                         std::lock_guard guard2(backup_lock_);
                         for (const uint8_t seat : b.seats) --backups_packing_[seat];
                     }
@@ -365,7 +427,8 @@ public:
     // `frame` (taken: answer each with session().send_board); and a seat's board's state at the end of `frame`, as
     // asked with session().want_board, waited for (nothing: the time is up, or the session closed).
     // (each frame's: the backups to be asked for whole are asked for here, not from the session's own thread)
-    std::vector<uint8_t> take_board_requests(uint64_t frame) {
+    std::vector<uint8_t> take_board_requests(uint64_t frame, std::size_t boards = 0) {
+        frame_now_.store(frame); // (the frame this machine's board is at: a request for one before it is late on arrival)
         std::vector<uint8_t> missing;
         {
             std::lock_guard guard(lock_);
@@ -376,19 +439,50 @@ public:
         std::vector<uint8_t> seats;
         for (auto it = boards_wanted_.begin(); it != boards_wanted_.end();)
             if (it->second <= frame) {
-                if (it->second == frame) seats.push_back(it->first); // (one asked for a frame gone by: too late, dropped)
+                if (it->second == frame) seats.push_back(it->first);
+                else late_requests_.push_back(*it); // (one asked for a frame gone by: too late, answered with nothing)
                 it = boards_wanted_.erase(it);
             } else {
                 ++it;
             }
         for (auto it = boards_again_.begin(); it != boards_again_.end();) // (kept while that frame may be run again)
-            if (it->second == frame || it->second + kAgainFrames < frame) {
+            if (it->second == frame || it->second + kAgainFrames < frame ||
+                // (or its frame not to be run again after all: every input up to it in, none guessed wrong back there)
+                (boards && it->second < frame && it->second > 0 && table_.all_set(it->second - 1, boards) &&
+                 table_.wrong_from() > it->second)) {
                 if (it->second == frame) seats.push_back(it->first);
+                // (not run again: answered "too late", the asker asking again for a later frame. Dropped unanswered, it waited
+                // 30 s for it, its game held for it and this machine for its inputs, 2026-11-23)
+                else late_requests_.push_back(*it);
                 it = boards_again_.erase(it);
             } else {
                 ++it;
             }
         return seats;
+    }
+    // Those asked for a frame already gone by here when the asking came (each seat and frame): answered at once with an
+    // empty state, which the asker takes as none (one_board::unpack_remote) and asks again for a later frame. Dropped
+    // without a word, the asker waited wait_board's 30 s, the whole room standing (2026-11-22, a room on one board as
+    // a late player took a seat: one machine 30+ frames ahead of the host when its request came)
+    std::vector<std::pair<uint8_t, uint64_t>> take_late_requests() {
+        std::lock_guard guard(lock_);
+        return std::exchange(late_requests_, {});
+    }
+    // ("too late"'s answer: this machine's frame now, 8 bytes, which one_board::unpack_remote takes as no state (fewer
+    // than its 16), on any build; this build's asker asks past it next, ask_at)
+    std::vector<uint8_t> late_answer() const {
+        std::vector<uint8_t> out(8);
+        const uint64_t at = frame_now_.load();
+        for (int k = 0; k < 8; ++k) out[static_cast<std::size_t>(k)] = static_cast<uint8_t>(at >> (8 * k));
+        return out;
+    }
+    // The frame to ask seat `seat`'s machine for its board's state at, at least `frame`: kAskMargin past where it said it
+    // was when last told "too late" (it goes on meanwhile: the answer's way back and the next request's way there).
+    static constexpr uint64_t kAskMargin = 20;
+    uint64_t ask_at(uint8_t seat, uint64_t frame) {
+        std::lock_guard guard(lock_);
+        const auto h = late_hint_.find(seat);
+        return h == late_hint_.end() ? frame : std::max(frame, h->second + kAskMargin);
     }
     // (rollback: one taken for a frame run on a wrong guess: asked again, for when that frame is run again: kept that
     // long, not dropped as gone by at the next frame)
@@ -406,6 +500,45 @@ public:
     std::vector<std::pair<uint8_t, uint64_t>> take_gone() {
         std::lock_guard guard(lock_);
         return std::exchange(gone_, {});
+    }
+    // The frame seat `seat` became a player's in a game joined in progress (none: a player from the start, or not
+    // heard): its machine runs every board whole there, its copies of this board made from its own
+    // (backup::Maker::changes_since, net_frame::JoinBases).
+    std::optional<uint64_t> seat_taken_at(uint8_t seat) {
+        std::lock_guard guard(lock_);
+        const auto it = seat_taken_at_.find(seat);
+        return it == seat_taken_at_.end() ? std::nullopt : std::optional<uint64_t>(it->second);
+    }
+    // (each board's ring counts at its snapshot point of every 32nd frame (the frames a seat is taken from, and rollback
+    // keeps: a copy of it read out of rollback after that frame needs them, net_frame::JoinBases); run again, noted again)
+    void note_counts(uint8_t seat, uint64_t frame, uint64_t taken, uint64_t sent) {
+        std::lock_guard guard(lock_);
+        auto& at = counts_at_[seat];
+        at[frame] = {taken, sent};
+        while (at.size() > 16) at.erase(at.begin());
+    }
+    std::optional<std::pair<uint64_t, uint64_t>> counts_at(uint8_t seat, uint64_t frame) {
+        std::lock_guard guard(lock_);
+        const auto s = counts_at_.find(seat);
+        if (s == counts_at_.end()) return std::nullopt;
+        const auto it = s->second.find(frame);
+        return it == s->second.end() ? std::nullopt : std::optional<std::pair<uint64_t, uint64_t>>(it->second);
+    }
+    // This machine joined in progress: its own board's first backup, at its seat's frame (net_frame::JoinBases): none
+    // yet, waited for there (the frame known before it was run), taken, or not to be (known too late: the whole sent).
+    enum class OwnBase : uint8_t { none, waiting, taken, whole };
+    std::atomic<OwnBase> own_base{OwnBase::none};
+    // (once: this machine, joined in progress, sets its copies of the others expected: net_frame::JoinBases)
+    bool first_join_bases() { return !join_bases_set_.exchange(true); }
+    void forget_seat_taken(uint8_t seat) {
+        std::lock_guard guard(lock_);
+        seat_taken_at_.erase(seat);
+    }
+    // (a joiner's copy of seat `seat`'s board not made after all: its whole asked for)
+    void base_missed(uint8_t seat) {
+        keeper_.expect_base(seat, ~0ull);
+        std::lock_guard guard(lock_);
+        backup_missing_.push_back(seat);
     }
     // And those taken by a player (a game joined in progress), since the last asked.
     std::vector<uint8_t> take_taken() {
@@ -517,9 +650,15 @@ private:
     std::optional<net::StartInfo> start_, resync_;
     std::vector<std::pair<uint8_t, uint64_t>> boards_wanted_, partings_;     // (seat, frame)
     std::vector<std::pair<uint8_t, uint64_t>> boards_again_;                 // (seat, frame: rollback's, board_request_again)
+    std::vector<std::pair<uint8_t, uint64_t>> late_requests_;                // (seat, frame: asked too late, take_late_requests)
+    std::atomic<uint64_t> frame_now_{0}; // (the frame this machine's board last ended: take_board_requests)
+    std::map<uint8_t, uint64_t> late_hint_; // (each seat's machine's frame, as its last "too late" said)
     static constexpr uint64_t kAgainFrames = 256;                             // (longer than rollback's window)
     std::vector<std::pair<uint8_t, uint64_t>> gone_;
     std::vector<uint8_t> taken_, whole_wanted_, backup_missing_;
+    std::map<uint8_t, uint64_t> seat_taken_at_; // (cb.taken: each seat's frame, taken in progress)
+    std::atomic<bool> join_bases_set_{false};
+    std::map<uint8_t, std::map<uint64_t, std::pair<uint64_t, uint64_t>>> counts_at_; // (note_counts)
     std::array<bool, net::kMaxSeats> absent_{}; // (by seat: its player gone, nobody's since)
     std::map<std::pair<uint8_t, uint64_t>, std::vector<uint8_t>> boards_; // (seat, frame): a board's state, compressed
     std::map<std::pair<uint8_t, uint64_t>, backup::Copy> board_copies_;    // (and "my backup": the copy as it came)

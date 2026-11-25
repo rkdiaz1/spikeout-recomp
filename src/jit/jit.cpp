@@ -41,7 +41,7 @@
 #include <vector>
 
 // Bump when the IR back end or the helpers change what code they make: old caches are then not used.
-static constexpr const char* kTranslatorVersion = "spikeout-jit 1";
+static constexpr const char* kTranslatorVersion = "spikeout-jit 3"; // (2: FPRF worked out when looked at; 3: the handshake's hooks 0x6F434, 0x6F504)
 static constexpr uint32_t kParts = 48; // modules, compiled side by side (independent of the thread count: same objects)
 
 namespace recomp {

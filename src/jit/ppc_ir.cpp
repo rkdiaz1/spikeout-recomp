@@ -946,18 +946,34 @@ private:
         return b.CreateCall(llvm::Intrinsic::getDeclaration(&M, id, {f64}), std::vector<Value*>(args));
     }
     Value* round_single(Value* d) { return bitsof(b.CreateFPExt(b.CreateFPTrunc(d, f32), f64)); }
-    void set_fprf(Value* result, bool single) {
+    // FPRF's five bits for a result (ops::set_fprf), `single` an i1: single's denormal bound.
+    Value* fprf_class(Value* result, Value* single) {
         Value* d = f64of(result);
         Value* neg = b.CreateICmpNE(b.CreateLShr(result, 63), k64(0));
         Value* fabs = fintr(llvm::Intrinsic::fabs, {d});
         auto pick = [&](uint32_t if_neg, uint32_t if_pos) { return b.CreateSelect(neg, k(if_neg), k(if_pos)); };
         Value* c = pick(0x08, 0x04);
-        const double tiny = single ? 1.17549435e-38 : 2.2250738585072014e-308;
-        c = b.CreateSelect(b.CreateFCmpOLT(fabs, llvm::ConstantFP::get(f64, tiny)), pick(0x18, 0x14), c);
+        Value* tiny = b.CreateSelect(single, llvm::ConstantFP::get(f64, 1.17549435e-38), llvm::ConstantFP::get(f64, 2.2250738585072014e-308));
+        c = b.CreateSelect(b.CreateFCmpOLT(fabs, tiny), pick(0x18, 0x14), c);
         c = b.CreateSelect(b.CreateFCmpOEQ(fabs, llvm::ConstantFP::getInfinity(f64)), pick(0x09, 0x05), c);
         c = b.CreateSelect(b.CreateFCmpOEQ(d, llvm::ConstantFP::get(f64, 0.0)), pick(0x12, 0x02), c);
-        c = b.CreateSelect(b.CreateFCmpUNO(d, d), k(0x11), c);
-        set_fpscr(b.CreateOr(b.CreateAnd(fpscr(), ~0x1F000u), b.CreateShl(c, 12)));
+        return b.CreateSelect(b.CreateFCmpUNO(d, d), k(0x11), c);
+    }
+    // An arithmetic result's FPRF, worked out when looked at (ops::note_fprf; keep in step with lifter.cpp and
+    // interp.cpp): the result and its precision noted.
+    void set_fprf(Value* result, bool single) {
+        st(result, cpu(offsetof(CpuState, fprf_value)));
+        set_field(offsetof(CpuState, fprf_pending), k(single ? 2u : 1u));
+    }
+    // ops::flush_fprf: before an instruction reads or changes the FPSCR, the noted result's FPRF put in (none
+    // noted: the FPSCR as it is).
+    void flush_fprf() {
+        Value* pending = field(offsetof(CpuState, fprf_pending));
+        Value* c = fprf_class(ld(i64, cpu(offsetof(CpuState, fprf_value))), b.CreateICmpEQ(pending, k(2)));
+        Value* now = fpscr();
+        Value* updated = b.CreateOr(b.CreateAnd(now, ~0x1F000u), b.CreateShl(c, 12));
+        set_fpscr(b.CreateSelect(b.CreateICmpNE(pending, k(0)), updated, now));
+        set_field(offsetof(CpuState, fprf_pending), k(0));
     }
     Value* single_to_double(Value* w) {
         Value* sign = b.CreateShl(b.CreateZExt(b.CreateLShr(w, 31), i64), 63);
@@ -980,6 +996,7 @@ private:
         return b.CreateSelect(is_plain, plain, small);
     }
     void fcmp(uint32_t field_n, Value* abits, Value* bbits) {
+        flush_fprf(); // (FPCC is FPRF's low four bits: its C bit stays the last result's)
         Value *x = f64of(abits), *y = f64of(bbits);
         Value* c = b.CreateSelect(b.CreateFCmpUNO(x, y), k(1),
                                   b.CreateSelect(b.CreateFCmpOLT(x, y), k(8), b.CreateSelect(b.CreateFCmpOGT(x, y), k(4), k(2))));
@@ -1081,8 +1098,9 @@ private:
         case Op::Fcmpu:
         case Op::Fcmpo:  fcmp(in.crfd(), FR(fa), FR(fb)); return;
 
-        case Op::Mffs: raw(b.CreateOr(k64(0xFFF8000000000000u), b.CreateZExt(fpscr(), i64))); return;
+        case Op::Mffs: flush_fprf(); raw(b.CreateOr(k64(0xFFF8000000000000u), b.CreateZExt(fpscr(), i64))); return;
         case Op::Mcrfs: {
+            flush_fprf();
             const uint32_t shift = 28 - 4 * in.crfs();
             set_crf(in.crfd(), b.CreateAnd(b.CreateLShr(fpscr(), shift), 0xF));
             set_fpscr(b.CreateAnd(fpscr(), ~(0x9FF80700u & (0xFu << shift))));
@@ -1092,6 +1110,7 @@ private:
             uint32_t mask = 0;
             for (uint32_t f = 0; f < 8; ++f)
                 if (in.fm() & (0x80u >> f)) mask |= 0xF0000000u >> (4 * f);
+            flush_fprf();
             set_fpscr(b.CreateOr(b.CreateAnd(fpscr(), ~mask), b.CreateAnd(b.CreateTrunc(FR(fb), i32), mask)));
             call_void("spk_fpscr_written", {});
             cr1();
@@ -1099,17 +1118,20 @@ private:
         }
         case Op::Mtfsfi: {
             const uint32_t shift = 28 - 4 * in.crfd();
+            flush_fprf();
             set_fpscr(b.CreateOr(b.CreateAnd(fpscr(), ~(0xFu << shift)), k(in.fpimm() << shift)));
             call_void("spk_fpscr_written", {});
             cr1();
             return;
         }
         case Op::Mtfsb0:
+            flush_fprf();
             set_fpscr(b.CreateAnd(fpscr(), ~(0x80000000u >> in.rd())));
             call_void("spk_fpscr_written", {});
             cr1();
             return;
         case Op::Mtfsb1:
+            flush_fprf();
             set_fpscr(b.CreateOr(fpscr(), 0x80000000u >> in.rd()));
             call_void("spk_fpscr_written", {});
             cr1();

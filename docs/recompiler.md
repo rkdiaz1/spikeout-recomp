@@ -197,6 +197,22 @@ matter:
   rounded), and `fres`/`frsqrte` return exact values rather than the
   603e's estimates. Built with `-DSPIKEOUT_FP_TRAP=ON`, the game reports
   the first instruction whose result is a NaN (`gamerun` prints it).
+- FPRF worked out when it is looked at (2026-11-19): an arithmetic result
+  only notes itself (`CpuState::fprf_value`, `fprf_pending`: double or
+  single), and `ops::flush_fprf` puts the last one's class in before
+  anything reads or changes the FPSCR (`mffs`, `mcrfs`, the `mtfs*`, and
+  `fcmpu`/`fcmpo`, which keep FPRF's C bit), and before a save state is
+  written (a loaded one has none pending). All three back ends alike
+  (`lifter.cpp`, `ppc_ir.cpp`: the same class in IR at a flush;
+  `interp.cpp`); the JIT's translator version 2. The fields are past
+  `reserve`, so save states keep their bytes, and every copy of a
+  `CpuState` (side runs, one board) carries its own. Proved the same: seg3
+  (50 hashes) and seg2 (189) in the C++, JIT and interpreter builds, a
+  state saved at 65000 byte for byte the old build's. Game logic (seg3,
+  3,000 frames, the old build taking turns, three rounds): the C++ build
+  1.95/1.78/1.78 ms a frame to 1.56/1.59/1.55, the JIT 1.55/1.66/1.60 to
+  1.47/1.46/1.42. (With no FPRF at all, a measuring build only: 18% less,
+  and the game parts from its recording at once: it does read FPRF.)
 
 ## Bus
 
@@ -251,6 +267,87 @@ acknowledges IRQs, and that is the one Spikeout uses.
 The MPC106 (`m3::Mpc106`) follows Supermodel's `MPC10x.cpp`: registers
 little-endian as on PCI, reset values from `CMPC10x::Reset()`, the bridge
 itself at bus 0 / device 0 and nothing else on the bus yet.
+
+## Where a frame's time goes (profiled 2026-11-19)
+
+Two profilers in gamerun, both only reading or pausing, so a run stays the
+same: `--pc-profile FILE[@US[:B]]` counts board B's PowerPC address every
+US microseconds (the block `tick` last recorded: by the game's own
+functions, with the private map); `--host-profile FILE[@US]` (Windows)
+pauses the game's thread every US microseconds and notes where it is in
+our program (`addr2line -a -f -C -i -e gamerun.exe` names it, inlined code
+with its caller). gamerun also prints the GPU scene's making ("GPU
+scene: ... ms a frame"), and `--gpu-time` now draws the GPU renderer's
+own scene (it drew the software renderer's, empty unless that ran).
+
+The bot's seg3 (stage 3, 3,000 frames from `fullrec3/owner-62721.state`),
+the game's thread on the i7-8700K: the game's code ~2.2 ms a frame, the 2D
+~2 ms (drawing 1.5), the GPU scene made from the Real3D's memory ~1.2-1.5,
+handing it to the GPU ~0.6 (packing 0.4); the sound 2.8 more (the
+window's audio thread). The render scale changes only the GPU's own time
+(1.2 ms at 4, 0.6 at 2 on a GTX 1080), not the CPU's.
+
+Made faster then, each proved the same output:
+- The 2D (`TilegenRenderer::draw_line`): a tile row of one pixel value (an
+  empty tile, a plain fill) looked up once, then skipped when transparent
+  or filled; the tile RAM's words read whole. About 20% less (old and new
+  taking turns, three rounds: 1.67/1.52/2.31 ms against 1.38/1.21/1.52);
+  every frame's 2D layers the same (`GAMERUN_2D_HASH=1`, 3,000 frames,
+  4:3 and `--wide 93`). Tried and left: each palette bank's colours made
+  once (no faster).
+- The GPU scene (`Real3dSceneBuilder::decode_model`): a model in the
+  polygon ROM (VROM, from 0x100000) read once (its polygons' headers and
+  vertices, as floats) and kept by the builder; only what depends on the
+  frame (its matrix, the colour table, facing, texture level) done each
+  time; a model in polygon RAM read each time as before. And VROM's words
+  read whole (`Real3d::model`). 1.50 ms a frame to 0.78 (4:3), 1.61 to
+  0.85 (`--wide 93`); every GPU picture the same (`--gpu-hash-frames`,
+  3,000 frames).
+- The game's code (all three back ends): FPRF worked out when looked at
+  ("Floating point" above); a device's region found from a short list of
+  the regions touching its 64 KB block (the system devices', the tile
+  generator's registers', the Real3D's small ports': they searched all 27,
+  and the game's JTAG routine, `0x79C30`, reads and writes the system block
+  for every bit); `Context::find` (an indirect call or return) one look in
+  a table of the first megabyte's words, made once for each function table
+  (it was a binary search over ~10,000 entries). Game logic's profile
+  (seg3, 3,000 frames): `find_region` 3.7% to 1.7%, `find` 1.7% to none, 5%
+  fewer samples in all; every replay hash the same (seg3 50, seg2 189: C++,
+  JIT, interpreter).
+- The bus's slow path: the writes it took a frame (seg3) were the Real3D's
+  culling RAM 7,506, polygon RAM 2,152, texture FIFO 473 (all the Real3D
+  DMA, `dma_kick` copying the display lists from RAM), the tile maps 1,710
+  and the system registers 982 (the JTAG bits). A DMA from work RAM into
+  one of the Real3D's word-written memories now checks once for the copy
+  and gives each word straight to the Real3D, in order (word by word as
+  before while writes are watched or held); a write into the tile
+  generator's RAM (characters, maps, palette: one range) is stored at the
+  top of `write_slow`, as its switch did. Left on the slow path: the JTAG
+  bits. Game logic about 4% less (C++ 1.56/1.56/1.60 ms to 1.55/1.45/1.52,
+  JIT 1.43/1.35/1.41 to 1.47/1.31/1.30).
+- The GPU's packing (`Real3dGpu::build`): the vertex and quad lists kept at
+  their largest frame's size, this frame's bytes counted, a vertex added a
+  copy (they were grown and zeroed a vertex at a time): 0.37/0.39 ms to
+  0.30/0.32 at render scale 4; every GPU picture the same.
+All proved at the end together, against the builds before any of it: every
+2D and GPU picture of the 3,000 frames (4:3 and `--wide 93`), seg3 and
+seg2 in the three back ends, the state at 65000 byte for byte, ctest.
+Network play: none of these changes what the boards compute.
+Tried and left (2026-11-22): the registers kept in the host's registers.
+On the game logic's thread the generated code is ~45% (the bus and devices
+~18%, `tick` ~5%). First, cheaply: the JIT's loads and stores tagged for
+LLVM's alias analysis (TBAA: the CPU state, the Context, the bus's fields,
+the game's RAM and the page marks told apart), so a register loaded once
+stays good across the game's RAM accesses. No difference, at -O1 or -O2
+(three rounds each, within the machine's 6-8%): the state's loads and
+stores aren't what the game's code costs (a store read back at once is
+cheap on these CPUs). The full change (each function's registers in locals,
+written back at calls, exits and slow paths; all three back ends) would
+save less than that, so it wasn't started.
+Candidates left: the protection chip's decryption (`Crypt315_5881`, ~2% of
+the game's thread: a stream decoder whose state is in save states); the
+JTAG bits (the system registers, a write and a read a bit); `Context::tick`
+(~5%, once a block); the 2D's polygon-pass loops in the packing (<0.1 ms).
 
 ## The interpreter (no JIT: iOS)
 

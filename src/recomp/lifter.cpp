@@ -504,13 +504,15 @@ private:
         };
         // RECOMP_FP_CHECK: nothing unless built with SPIKEOUT_FP_TRAP (finds where NaNs start).
         const std::string check = " RECOMP_FP_CHECK(" + hex(pc) + ", " + std::to_string(in.rd()) + ");";
-        // Arithmetic results set FPSCR[FPRF].
+        // Arithmetic results set FPSCR[FPRF], worked out when it is looked at (ops::note_fprf; the FPSCR's
+        // instructions and fcmp flush it first; keep in step with ppc_ir.cpp and interp.cpp).
         auto dbl = [&](const std::string& expr) {
-            return FD + " = ops::bits(" + expr + "); ops::set_fprf(s, " + FD + ", false);" + check + cr1;
+            return FD + " = ops::bits(" + expr + "); ops::note_fprf(s, " + FD + ", false);" + check + cr1;
         };
         auto sgl = [&](const std::string& expr) {
-            return FD + " = ops::round_single(" + expr + "); ops::set_fprf(s, " + FD + ", true);" + check + cr1;
+            return FD + " = ops::round_single(" + expr + "); ops::note_fprf(s, " + FD + ", true);" + check + cr1;
         };
+        const std::string flush = "ops::flush_fprf(s); ";
         auto raw = [&](const std::string& expr) { return FD + " = " + expr + ";" + cr1; };
         const std::string lfs = FD + " = ops::single_to_double(c.read32(ea));";
         const std::string lfd = FD + " = c.read64(ea);";
@@ -574,24 +576,24 @@ private:
         case Op::Fcmpo:  return "ops::fcmp(s, " + std::to_string(in.crfd()) + ", " + FA + ", " + FB + ");";
 
         // FPSCR
-        case Op::Mffs:   return raw("0xFFF8000000000000u | s.fpscr");
+        case Op::Mffs:   return flush + raw("0xFFF8000000000000u | s.fpscr");
         case Op::Mcrfs:  return "ops::mcrfs(s, " + std::to_string(in.crfd()) + ", " + std::to_string(in.crfs()) + ");";
         case Op::Mtfsf: {
             uint32_t mask = 0;
             for (uint32_t f = 0; f < 8; ++f)
                 if (in.fm() & (0x80u >> f)) mask |= 0xF0000000u >> (4 * f);
-            return "s.fpscr = (s.fpscr & " + hex(~mask) + ") | (static_cast<uint32_t>(" + FB + ") & " + hex(mask) +
+            return flush + "s.fpscr = (s.fpscr & " + hex(~mask) + ") | (static_cast<uint32_t>(" + FB + ") & " + hex(mask) +
                    "); ops::fpscr_written(s);" + cr1;
         }
         case Op::Mtfsfi: {
             const uint32_t shift = 28 - 4 * in.crfd();
-            return "s.fpscr = (s.fpscr & " + hex(~(0xFu << shift)) + ") | " + hex(in.fpimm() << shift) +
+            return flush + "s.fpscr = (s.fpscr & " + hex(~(0xFu << shift)) + ") | " + hex(in.fpimm() << shift) +
                    "; ops::fpscr_written(s);" + cr1;
         }
         case Op::Mtfsb0:
-            return "s.fpscr &= " + hex(~(0x80000000u >> in.rd())) + "; ops::fpscr_written(s);" + cr1;
+            return flush + "s.fpscr &= " + hex(~(0x80000000u >> in.rd())) + "; ops::fpscr_written(s);" + cr1;
         case Op::Mtfsb1:
-            return "s.fpscr |= " + hex(0x80000000u >> in.rd()) + "; ops::fpscr_written(s);" + cr1;
+            return flush + "s.fpscr |= " + hex(0x80000000u >> in.rd()) + "; ops::fpscr_written(s);" + cr1;
 
         // External control (eciwx/ecowx): not used by Model 3 games.
         default:

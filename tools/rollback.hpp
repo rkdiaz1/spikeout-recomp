@@ -184,6 +184,18 @@ public:
         p.pins_seen = 0; // (its new history takes them all again)
     }
     bool active(std::size_t board) const { return parts_[board].active; }
+    // A board's state as it saved it at kept frame `frame` (m3::Snapshots::state_at), read out; from that board's own
+    // thread (its saves are). False: not a part (on side runs), or that frame not kept. (Every kAlways-th frame is saved
+    // and never thinned out within the window: a joiner's seat frame is one, tools::net_frame::JoinBases)
+    bool state_at(std::size_t board, uint64_t frame, std::vector<std::vector<uint8_t>>& regions, std::vector<uint8_t>& small) const {
+        const Part& p = parts_[board];
+        return p.active && p.snaps && p.snaps->state_at(frame, regions, small);
+    }
+    // Whether `frame` is final here: every input of it in, no guess wrong at or before it, and not still as run on
+    // guesses while going back (redoing).
+    bool settled(uint64_t frame) const {
+        return table_.all_set(frame, parts_.size()) && table_.wrong_from() > frame && !redoing(frame);
+    }
     // (a board on side runs, its turns taken frame by frame: the frame gone back to since last asked, 0 none; its
     // turns then go on from the frame after it)
     uint64_t rewound_to(std::size_t board) { return std::exchange(parts_[board].back_to, 0); }

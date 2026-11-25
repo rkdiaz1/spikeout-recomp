@@ -137,7 +137,9 @@ TEST_CASE("net session: a host alone, a player joining the game in progress and 
     guest.local_input(101, {0x00, 0x00, 0x00, 0x00}); // (not its cabinet yet: dropped)
     guest.take_seat();
     CHECK(guest_seen.wait([&] { return taken_at != 0; }));
-    CHECK_EQ(taken_at, 109u + 8u); // the host's next frame for it (8 past its own), and a margin
+    // the host's next frame for it (8 past its own) and a margin, 117, then the next multiple of 32 (a seat is taken from
+    // one: rollback keeps those frames, session.cpp kSeatFrameEvery)
+    CHECK_EQ(taken_at, 128u);
     for (uint64_t f = 101; f <= 130; ++f) {
         host.local_input(f, {static_cast<uint8_t>(f), 0xFF, 0xFF, 0xFF});
         guest.local_input(f, {0x10, 0xFF, 0xFE, 0xFF});
@@ -179,19 +181,22 @@ static uint64_t taken_when_asked(uint64_t asked, uint64_t at = 0, double rate = 
     return taken_at;
 }
 
+// (a seat is taken from a multiple of 32: rollback keeps those frames, session.cpp kSeatFrameEvery)
+static constexpr uint64_t seat_frame(uint64_t f) { return (f + 31) / 32 * 32; }
+
 TEST_CASE("net session: a joiner catching up asks for its cabinet from a later frame") {
-    CHECK_EQ(taken_when_asked(0), 117u);          // (none asked: the host's own choice, 109 + 8)
-    CHECK_EQ(taken_when_asked(2000), 2000u);      // (where it will have caught up)
-    CHECK_EQ(taken_when_asked(50), 117u);         // (never before the host's own choice)
-    CHECK_EQ(taken_when_asked(99999), 117u + 3600u); // (a minute ahead at most)
+    CHECK_EQ(taken_when_asked(0), seat_frame(117));            // (none asked: the host's own choice, 109 + 8)
+    CHECK_EQ(taken_when_asked(2000), seat_frame(2000));        // (where it will have caught up)
+    CHECK_EQ(taken_when_asked(50), seat_frame(117));           // (never before the host's own choice)
+    CHECK_EQ(taken_when_asked(99999), seat_frame(117 + 3600)); // (a minute ahead at most)
 }
 
 TEST_CASE("net session: the meeting worked out where the room really is, from the joiner's frame and speed") {
     // (the host at 101; a joiner at 50 running twice the game's speed: 51 frames to gain at 57.52 a second, 0.89 s,
     // half again and a second's margin: 101 + 134. Its own guess (120) was too early: the room would have waited)
-    CHECK_EQ(taken_when_asked(120, 50, 2 * 57.52), 235u);
-    CHECK_EQ(taken_when_asked(2000, 50, 2 * 57.52), 2000u);       // (its own guess later: that one)
-    CHECK_EQ(taken_when_asked(120, 50, 1.02 * 57.52), 117u + 3600u); // (not gaining on the room: as late as allowed)
+    CHECK_EQ(taken_when_asked(120, 50, 2 * 57.52), seat_frame(235));
+    CHECK_EQ(taken_when_asked(2000, 50, 2 * 57.52), seat_frame(2000));        // (its own guess later: that one)
+    CHECK_EQ(taken_when_asked(120, 50, 1.02 * 57.52), seat_frame(117 + 3600)); // (not gaining on the room: as late as allowed)
 }
 
 TEST_CASE("net session: two machines on this one, inputs each frame, a hash, a goodbye") {

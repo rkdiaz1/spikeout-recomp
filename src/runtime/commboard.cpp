@@ -114,7 +114,10 @@ private:
 
 CommBoard::CommBoard(std::unique_ptr<NetLink> link, const Options& options)
     : options_(options), link_(link ? std::move(link) : std::make_unique<LoopbackLink>()),
-      cpu_(std::make_unique<Cpu>(*this)), ram_(0x10000, 0), comm_(0x20000, 0), late_(kLateTable, 0) {}
+      cpu_(std::make_unique<Cpu>(*this)), ram_(0x10000, 0), comm_(0x20000, 0), late_(kLateTable, 0),
+      tables_(kTables * kMaxNodes * kPart, 0) {
+    if (options_.cut_through) options_.ring_second_pass = options_.slave_table_late = options_.count_matched = false;
+}
 
 CommBoard::~CommBoard() = default;
 
@@ -131,15 +134,18 @@ std::string CommBoard::disassemble(uint32_t addr, uint32_t* length) const {
 }
 
 std::string CommBoard::describe() const {
-    char buf[260];
+    char buf[400];
     std::snprintf(buf, sizeof buf,
                   "68000 board, %s, PC %06x, %llu cycles; status0 %04x, status1 %04x; IRQs 2:%llu 4:%llu 5:%llu "
-                  "6:%llu; packets %llu out, %llu in, %llu second passes; set up as %s",
+                  "6:%llu; packets %llu out, %llu in, %llu second passes; table reads %llu of the count, %llu earlier, "
+                  "%llu as came; set up as %s",
                   in_reset_ ? "held in reset" : "running", pc(), static_cast<unsigned long long>(cpu_cycles()),
                   io_[kIoStatus0], io_[kIoStatus0 + 1], static_cast<unsigned long long>(irqs_taken[2]),
                   static_cast<unsigned long long>(irqs_taken[4]), static_cast<unsigned long long>(irqs_taken[5]),
                   static_cast<unsigned long long>(irqs_taken[6]), static_cast<unsigned long long>(packets_sent),
-                  static_cast<unsigned long long>(packets_received), static_cast<unsigned long long>(ring_passes), ram_[0x400] == 0 && ram_[0x401] == 0 ? "master" : "slave");
+                  static_cast<unsigned long long>(packets_received), static_cast<unsigned long long>(ring_passes),
+                  static_cast<unsigned long long>(table_reads_exact), static_cast<unsigned long long>(table_reads_earlier),
+                  static_cast<unsigned long long>(table_reads_as_came), ram_[0x400] == 0 && ram_[0x401] == 0 ? "master" : "slave");
     return buf;
 }
 
@@ -248,7 +254,11 @@ void CommBoard::take_passes() {
         const std::vector<uint8_t>* next = link_->peek();
         if (!next || !ring_pass(*next)) return;
         const std::vector<uint8_t> pass = link_->receive();
-        if (!slave()) continue;
+        if (!slave()) { // (its own pass come back, a node on at each cabinet: the ring's cabinets)
+            nodes_ = pass[8] <= kMaxNodes ? pass[8] : 0, hop_ = 0;
+            view_dirty_ = true;
+            continue;
+        }
         auto field = [&](std::size_t k) { return static_cast<std::size_t>(pass[9 + 2 * k] | pass[10 + 2 * k] << 8); };
         const std::size_t hop = pass[8], offset = field(0), size = field(1), part = field(2);
         const std::size_t stream = pass.size() - kRingPassHeader;
@@ -256,10 +266,33 @@ void CommBoard::take_passes() {
         const uint8_t* in = pass.data() + kRingPassHeader;
         uint8_t* comm = options_.double_buffer ? bank(true) : bank(false);
         const std::size_t from = hop * part, to = std::min({stream, size, 0x10000u - offset});
-        if (options_.slave_table_late && late_size_) { // (into the table being built: shown at the next data frame)
+        if (options_.slave_table_late && !options_.count_matched && late_size_) { // (into the table being built: shown
+                                                                                  // at the next data frame)
             const std::size_t end = std::min<std::size_t>(to, late_size_);
             if (from < end) std::memcpy(late_.data() + from, in + from, end - from);
         } else if (from < to) std::memcpy(comm + offset + from, in + from, to - from);
+        if (options_.count_matched) {
+            // (the parts after this cabinet's own, positions hop to the ring's last, from the master's data frame come
+            // back: into the newest table if it is this exchange's (the master's count), the parts before them came in
+            // the data frame)
+            const uint8_t n = pass[kRingPassNodes] <= kMaxNodes ? pass[kRingPassNodes] : 0;
+            if (n != nodes_ || hop != hop_) view_dirty_ = true;
+            nodes_ = n, hop_ = static_cast<uint8_t>(hop);
+            const uint32_t count = static_cast<uint32_t>(pass[kRingPassCount]) | uint32_t{pass[kRingPassCount + 1]} << 8 |
+                                   uint32_t{pass[kRingPassCount + 2]} << 16 | uint32_t{pass[kRingPassCount + 3]} << 24;
+            int newest = -1;
+            for (int t = 0; t < static_cast<int>(kTables); ++t)
+                if (table_seq_[t] && (newest < 0 || table_seq_[t] > table_seq_[newest])) newest = t;
+            if (newest >= 0 && table_count_[newest] == count && n > hop && part <= kPart) {
+                for (std::size_t j = hop; j + 1 < n; ++j) { // (j = n - 1 is this cabinet's own, in already)
+                    if (j * part + kBlock > stream) break;
+                    const std::size_t at = hop + n - 1 - j;
+                    table_put(newest, at, in + j * part, std::min(part, stream - j * part));
+                    table_have_[newest] = static_cast<uint8_t>(table_have_[newest] | 1u << at);
+                }
+                view_dirty_ = true;
+            }
+        }
         // (on, as a slave's data frame: its own part first, then what came, a node's part on)
         std::vector<uint8_t> on(pass.begin(), pass.begin() + static_cast<std::ptrdiff_t>(kRingPassHeader));
         on[8] = static_cast<uint8_t>(hop + 1);
@@ -271,8 +304,88 @@ void CommBoard::take_passes() {
     }
 }
 
+// ---- Options::cut_through ----
+
+void CommBoard::send_at(uint64_t cycle, const uint8_t* data, std::size_t size) {
+    link_->set_time(rescale(cycle, options_.cpu_hz, options_.main_hz));
+    link_->send(data, size);
+    ++packets_sent;
+}
+
+// What has come in of the data frame now going out, passed on behind this node's own part, up to the frame's length.
+// Each byte leaves no sooner than the wire allows from the frame's start, nor before it came in.
+void CommBoard::stream_relay() {
+    if (!tx_stream_) return;
+    const std::size_t out = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
+    const std::size_t part = std::size_t{recv_offset_} - send_offset_;
+    const std::size_t have = std::min<std::size_t>(out, part + rx_got_);
+    if (have > tx_sent_) {
+        const uint64_t at = std::max(cpu_cycles(), tx_start_ + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(have)));
+        std::vector<uint8_t> p(kStreamHeader);
+        std::copy(std::begin(kStreamMagic), std::end(kStreamMagic), p.begin());
+        for (int k = 0; k < 4; ++k) p[8 + k] = static_cast<uint8_t>(tx_sent_ >> (8 * k));
+        const uint8_t* from = bank(false) + send_offset_;
+        p.insert(p.end(), from + tx_sent_, from + have);
+        send_at(at, p.data(), p.size());
+        tx_sent_ = static_cast<uint32_t>(have);
+        if (tx_sent_ >= out) tx_stream_ = false, send_done_ = at; // (all gone: transmit complete from then)
+    }
+}
+
+// A data frame's bytes from `offset` on: into the receive area of the bank the 68000 has selected (the main board sees
+// them after the next bank flip), passed on, and receive complete once its length is in.
+void CommBoard::stream_take(const uint8_t* data, std::size_t size, std::size_t offset) {
+    const std::size_t len = std::min<std::size_t>(recv_size_ & 0x7FFFu, 0x10000u - recv_offset_);
+    if (offset < len) std::memcpy(bank(false) + recv_offset_ + offset, data, std::min(size, len - offset));
+    rx_got_ = static_cast<uint32_t>(std::max<std::size_t>(rx_got_, std::min(offset + size, len)));
+    stream_relay();
+    if (rx_got_ >= len) {
+        rx_stream_ = false;
+        receive_armed_ = false;
+        send_waiting_ = false;
+        set_irq(6, true); // receive complete
+    }
+}
+
+void CommBoard::stream_receive() {
+    for (;;) {
+        const std::vector<uint8_t>* next = link_->peek();
+        if (!next) return;
+        if (ring_pass(*next)) { // (another link model's, from a state saved with it: not this one's)
+            link_->receive();
+            continue;
+        }
+        if (m3::stream_relay(*next)) {
+            const std::vector<uint8_t> p = link_->receive();
+            if (!rx_stream_) continue; // (the rest of a frame already whole here, or one given up on)
+            const std::size_t offset = p[8] | std::size_t{p[9]} << 8 | std::size_t{p[10]} << 16 | std::size_t{p[11]} << 24;
+            stream_take(p.data() + kStreamHeader, p.size() - kStreamHeader, offset);
+            continue;
+        }
+        // (a plain packet: a data frame's start, or a frame of its own: the sync)
+        if (!receive_enabled_ || !receive_armed_) return;
+        std::vector<uint8_t> packet = link_->receive();
+        if (packet.empty()) return; // (the link is down)
+        ++packets_received;
+        if (data_descriptor()) {
+            rx_stream_ = true, rx_got_ = 0;
+            stream_take(packet.data(), packet.size(), 0);
+            continue;
+        }
+        const std::size_t size = std::min<std::size_t>({packet.size(), recv_size_ & 0x7FFFu, 0x10000u - recv_offset_});
+        receive_armed_ = false;
+        send_waiting_ = false;
+        std::memcpy(bank(false) + recv_offset_, packet.data(), size);
+        set_irq(6, true); // receive complete
+    }
+}
+
 void CommBoard::deliver_receive() {
     link_->set_time(rescale(cpu_cycles(), options_.cpu_hz, options_.main_hz));
+    if (cut()) {
+        stream_receive();
+        return;
+    }
     take_passes();
     if (!receive_enabled_ || !receive_armed_) return;
     std::vector<uint8_t> packet = link_->receive();
@@ -284,6 +397,13 @@ void CommBoard::deliver_receive() {
     const std::size_t size = std::min<std::size_t>({packet.size(), recv_size_ & 0x7FFFu, 0x10000u - recv_offset_});
     receive_armed_ = false;
     send_waiting_ = false;
+    const std::size_t part = recv_offset_ > send_offset_ ? std::size_t{recv_offset_} - send_offset_ : 0;
+    if (data_frame && part && part <= kPart) { // (Options::count_matched: where the main board reads the nodes)
+        if (view_base_ != recv_offset_ || view_send_ != send_offset_ || part_ != part) view_dirty_ = true;
+        view_base_ = recv_offset_, view_send_ = send_offset_, part_ = static_cast<uint16_t>(part);
+    }
+    const bool tables = options_.count_matched && data_frame && part && part <= kPart && nodes_ >= 2 && nodes_ <= kMaxNodes &&
+                        size >= (std::size_t{nodes_} - 1) * part + kBlock;
     if (send_done_ == kForwarding) { // a slave's frame, with what came in where it lands: on to the next
         const std::size_t out = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
         std::vector<uint8_t> frame(bank(false) + send_offset_, bank(false) + send_offset_ + out);
@@ -292,7 +412,17 @@ void CommBoard::deliver_receive() {
         if (at < out) std::memcpy(frame.data() + at, packet.data(), std::min(size, out - at));
         send_done_ = cpu_cycles() + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(at));
         transmit(frame.data(), out);
-        if (options_.slave_table_late && options_.ring_second_pass && data_frame && size <= kLateTable) {
+        if (tables && hop_ >= 1 && hop_ < nodes_ && at == part && out >= part) {
+            // (count_matched: this exchange's table begun: the parts before this cabinet's (the master's and the
+            // slaves' between, this exchange's: each put in front as it passed on) and its own as it goes out; the
+            // ones after it come with the second pass)
+            const std::size_t h = hop_;
+            const int t = new_table(part_count(packet.data() + (h - 1) * part));
+            for (std::size_t j = 0; j < h; ++j) table_put(t, h - 1 - j, packet.data() + j * part, std::min(part, size - j * part));
+            table_put(t, h, frame.data(), part);
+            table_have_[t] = static_cast<uint8_t>((1u << (h + 1)) - 1);
+        }
+        if (options_.slave_table_late && !options_.count_matched && options_.ring_second_pass && data_frame && size <= kLateTable) {
             // (slave_table_late: the main board shown the table of the exchange before, the one built since; this
             // exchange's built in its place, from this frame and its second pass; the first one: as it came)
             const bool had = late_size_ != 0;
@@ -308,18 +438,27 @@ void CommBoard::deliver_receive() {
         // The master's data frame come back round, every node's part of this exchange in it: on once more
         // (ring_second_pass), for the slaves' parts after their own.
         const std::size_t out = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
-        const std::size_t part = std::size_t{recv_offset_} - send_offset_;
         std::vector<uint8_t> pass(kRingPassHeader);
         std::copy(std::begin(kRingPassMagic), std::end(kRingPassMagic), pass.begin());
         pass[8] = 1;
         const uint16_t fields[3] = {recv_offset_, static_cast<uint16_t>(recv_size_ & 0x7FFFu), static_cast<uint16_t>(part)};
         for (int k = 0; k < 3; ++k) pass[9 + 2 * k] = static_cast<uint8_t>(fields[k]), pass[10 + 2 * k] = static_cast<uint8_t>(fields[k] >> 8);
+        pass[kRingPassNodes] = nodes_;
+        const uint32_t count = part >= kNodeCount + 4 ? part_count(bank(false) + send_offset_) : 0; // (its own part's)
+        for (int k = 0; k < 4; ++k) pass[kRingPassCount + k] = static_cast<uint8_t>(count >> (8 * k));
+        if (tables) { // (count_matched: the whole table of this exchange, positions from the ring's last back to itself)
+            const int t = new_table(count);
+            for (std::size_t j = 0; j < nodes_; ++j)
+                table_put(t, nodes_ - 1u - j, packet.data() + j * part, std::min(part, size - j * part));
+            table_have_[t] = static_cast<uint8_t>((1u << nodes_) - 1);
+        }
         pass.insert(pass.end(), bank(false) + send_offset_, bank(false) + send_offset_ + part);
         pass.insert(pass.end(), packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(std::min(packet.size(), out - part)));
         link_->set_time(rescale(cpu_cycles(), options_.cpu_hz, options_.main_hz));
         link_->send(pass.data(), pass.size());
         ++ring_passes;
     }
+    if (options_.count_matched && data_frame) show_whole_tables(); // (the exchanges' tables whole by now: shown from here)
     std::memcpy(comm + recv_offset_, packet.data(), size);
     set_irq(6, true); // receive complete
 }
@@ -336,6 +475,67 @@ void CommBoard::transmit(const uint8_t* data, std::size_t size) {
     link_->set_time(rescale(send_done_, options_.cpu_hz, options_.main_hz));
     link_->send(data, size);
     ++packets_sent;
+}
+
+// ---- Options::count_matched ----
+
+// (the PowerPC's 32-bit word, its bytes where the main board reads them: comm RAM byte n is its byte n ^ comm_ram_xor;
+// a part starts on a word)
+uint32_t CommBoard::part_count(const uint8_t* part) const {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < 4; ++i) v = v << 8 | part[(kNodeCount + i) ^ options_.comm_ram_xor];
+    return v;
+}
+
+int CommBoard::new_table(uint32_t count) {
+    int t = 0;
+    for (int k = 1; k < static_cast<int>(kTables); ++k)
+        if (table_seq_[k] < table_seq_[t]) t = k;
+    table_count_[t] = count, table_seq_[t] = ++table_seq_next_, table_have_[t] = 0, table_shown_[t] = 0;
+    std::fill_n(table_len_.begin() + t * static_cast<int>(kMaxNodes), kMaxNodes, uint16_t{0});
+    view_dirty_ = true;
+    return t;
+}
+
+void CommBoard::show_whole_tables() {
+    const uint8_t whole = static_cast<uint8_t>(nodes_ >= 2 && nodes_ <= kMaxNodes ? (1u << nodes_) - 1 : 0xFF);
+    for (std::size_t t = 0; t < kTables; ++t)
+        if (table_seq_[t] && !table_shown_[t] && (table_have_[t] & whole) == whole) table_shown_[t] = 1, view_dirty_ = true;
+}
+
+// The newest whole table of the count this cabinet last wrote; none: the newest whole one of the latest count before
+// it (never a later one); none: -1.
+int CommBoard::chosen_table() {
+    if (!view_dirty_) return view_;
+    view_dirty_ = false, view_ = -1;
+    if (own_known_ != 0xF || nodes_ < 2 || nodes_ > kMaxNodes || part_ == 0) return view_;
+    const uint32_t own = own_count();
+    const uint8_t whole = static_cast<uint8_t>((1u << nodes_) - 1);
+    int32_t best_d = 0;
+    for (int t = 0; t < static_cast<int>(kTables); ++t) {
+        if (!table_seq_[t] || !table_shown_[t] || (table_have_[t] & whole) != whole) continue;
+        const auto d = static_cast<int32_t>(table_count_[t] - own); // (0: its count; below: an earlier one)
+        if (d > 0) continue;
+        if (view_ < 0 || d > best_d || (d == best_d && table_seq_[t] > table_seq_[view_])) view_ = t, best_d = d;
+    }
+    return view_;
+}
+
+uint8_t CommBoard::host_view(uint32_t at, bool count) {
+    at &= 0xFFFF;
+    if (options_.count_matched && part_ && at >= view_base_ && at < view_base_ + std::size_t{nodes_} * part_) {
+        const uint32_t j = (at - view_base_) / part_, off = (at - view_base_) % part_;
+        const int t = chosen_table();
+        // (once a read of the table, at the first node's count; "earlier" and "as came" also while the cabinets aren't
+        // linked in play: each its own active node, their counts apart)
+        if (count && j == 0 && off == (kNodeCount ^ options_.comm_ram_xor))
+            ++(t < 0 ? table_reads_as_came : table_count_[t] == own_count() ? table_reads_exact : table_reads_earlier);
+        // (position j: the node j + 1 back up the ring from this one; the whole part from the one exchange, the area
+        // state past the records too: it goes with the header's flags that ask for it)
+        const uint32_t node = (hop_ + 2u * nodes_ - 1u - j) % nodes_;
+        if (t >= 0 && off < table_len_[std::size_t(t) * kMaxNodes + node]) return table_part(t, node)[off];
+    }
+    return bank(true)[at];
 }
 
 // ---- 68000 side ----
@@ -395,12 +595,25 @@ void CommBoard::io_write(uint32_t index, uint16_t v, uint16_t mask, bool from_ho
         break;
     case kIoRxIrq:
         receive_armed_ = low == 0x8C;
+        if (cut() && receive_armed_) rx_stream_ = false, rx_got_ = 0; // (armed anew: a frame from its start)
         deliver_receive();
         break;
     case kIoTxEnable:
         if (low == 0x80) { // data transfer enable: send now; it arrives once all of it has gone
             const std::size_t size = std::min<std::size_t>(send_size_ & 0x7FFFu, 0x10000u - send_offset_);
             send_waiting_ = options_.send_waits_for_receive;
+            if (cut() && data_descriptor()) { // (its own part now, then what comes in as it comes: stream_relay)
+                const std::size_t part = std::size_t{recv_offset_} - send_offset_;
+                if (!rx_stream_) rx_got_ = 0; // (nothing of this exchange in yet)
+                tx_stream_ = true, tx_start_ = cpu_cycles(), tx_sent_ = static_cast<uint32_t>(std::min(part, size));
+                send_done_ = kForwarding;
+                send_at(tx_start_ + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(tx_sent_)),
+                        bank(false) + send_offset_, tx_sent_);
+                if (tx_sent_ >= size) tx_stream_ = false, send_done_ = tx_start_ + static_cast<uint64_t>(options_.link_cycles_per_byte * static_cast<double>(tx_sent_));
+                stream_relay();
+                deliver_receive();
+                break;
+            }
             if (forwards(size)) { // passed on as it comes in (deliver_receive)
                 send_done_ = kForwarding;
                 deliver_receive();
@@ -526,8 +739,7 @@ void CommBoard::host_note(uint32_t addr, bool write, uint32_t value) {
 // (read8 of each, without its trace)
 bool CommBoard::host_comm_view(uint8_t* out, uint32_t bytes) {
     if (host_tracing || bytes > 0x10000) return false;
-    const uint8_t* comm = bank(true);
-    for (uint32_t i = 0; i < bytes; ++i) out[i] = comm[(i ^ options_.comm_ram_xor) & 0xFFFF];
+    for (uint32_t i = 0; i < bytes; ++i) out[i] = host_view(i ^ options_.comm_ram_xor, false);
     return true;
 }
 
@@ -542,7 +754,7 @@ void CommBoard::bank_view(bool host_bank, uint8_t* out) const {
 uint8_t CommBoard::read8(uint32_t addr) {
     host_note(addr, false, 0);
     switch (host_region(addr)) {
-    case kHostComm: return host_comm(addr);
+    case kHostComm: return host_view(addr ^ options_.comm_ram_xor, true);
     case kHostIo: {
         const uint16_t v = io_read(host_io_index(addr));
         const uint32_t k = addr & 3; // the register is the upper half of the word, byte-swapped
@@ -565,7 +777,17 @@ uint32_t CommBoard::read32(uint32_t addr) {
 void CommBoard::write8(uint32_t addr, uint8_t data) {
     host_note(addr, true, data);
     switch (host_region(addr)) {
-    case kHostComm: host_comm(addr) = data; break;
+    case kHostComm: {
+        host_comm(addr) = data;
+        // (count_matched: the count this cabinet writes into its part's header, a byte at a time, the PowerPC's order)
+        const uint32_t a = addr & 0xFFFF;
+        if (view_send_ && a >= view_send_ + kNodeCount && a < view_send_ + kNodeCount + 4) {
+            own_count_[a - view_send_ - kNodeCount] = data;
+            own_known_ = static_cast<uint8_t>(own_known_ | 1u << (a - view_send_ - kNodeCount));
+            view_dirty_ = true;
+        }
+        break;
+    }
     case kHostIo: {
         const uint32_t k = addr & 3;
         if (k == 0) io_write(host_io_index(addr), data, 0x00FF, true);
@@ -610,15 +832,43 @@ void CommBoard::state(State& s) {
     s.io(frame_irq5_left_), s.io(recv_offset_), s.io(recv_size_), s.io(send_offset_), s.io(send_size_);
     s.io(receive_enabled_), s.io(receive_armed_), s.io(send_done_), s.io(send_irq_armed_), s.io(send_waiting_);
     s.io(irqs_taken), s.io(packets_sent), s.io(packets_received);
+    // (Options::cut_through's data frames in and out, 2026-11-25: a state from before has none; saved first, so a state
+    // of the tables' format with this section can't be read by a build from before it (kStateFormat 5))
+    if (s.loading() && !s.tagged("commboard stream")) {
+        rx_stream_ = tx_stream_ = false, rx_got_ = tx_sent_ = 0, tx_start_ = 0;
+    } else {
+        if (!s.loading()) s.tag("commboard stream");
+        s.io(rx_stream_), s.io(rx_got_), s.io(tx_stream_), s.io(tx_sent_), s.io(tx_start_);
+        if (rx_got_ > 0x10000 || tx_sent_ > 0x10000) rx_stream_ = tx_stream_ = false, rx_got_ = tx_sent_ = 0; // (safe loading)
+    }
     // (Options::slave_table_late's table, 2026-11-16: a state from before has none, the next data frame shown as it
     // comes, the table built from there)
+    view_dirty_ = true;
+    auto no_tables = [&] {
+        table_seq_.fill(0), table_have_.fill(0), table_count_.fill(0), table_len_.fill(0), table_shown_.fill(0);
+        table_seq_next_ = 0, nodes_ = 0, hop_ = 0, view_base_ = 0, view_send_ = 0, part_ = 0, own_known_ = 0;
+        own_count_.fill(0);
+    };
     if (s.loading() && !s.tagged("commboard late")) {
         late_size_ = 0;
+        no_tables();
         return;
     }
     if (!s.loading()) s.tag("commboard late");
     s.fixed(late_), s.io(late_size_);
     if (late_size_ > kLateTable) late_size_ = 0; // (safe loading)
+    // (Options::count_matched's tables, 2026-11-19: a state from before has none, the main board shown the data as it
+    // came until the ring's cabinets are known again (the next second pass) and a whole table is in)
+    if (s.loading() && !s.tagged("commboard tables")) {
+        no_tables();
+        return;
+    }
+    if (!s.loading()) s.tag("commboard tables");
+    s.fixed(tables_), s.io(table_count_), s.io(table_seq_), s.io(table_have_), s.io(table_seq_next_);
+    s.io(nodes_), s.io(hop_), s.io(view_base_), s.io(view_send_), s.io(part_), s.io(own_count_), s.io(own_known_);
+    s.io(table_len_), s.io(table_shown_);
+    if (nodes_ > kMaxNodes || hop_ >= kMaxNodes || part_ > kPart) no_tables(); // (safe loading)
+    for (uint16_t& n : table_len_) n = static_cast<uint16_t>(std::min<std::size_t>(n, kPart));
 }
 
 } // namespace m3

@@ -71,13 +71,41 @@ const std::array<uint8_t, 0x10000> kBlocks = [] {
     }
     return blocks;
 }();
+
+// A mixed block's regions (those touching it, index + 1; 0 ends the list): the system devices' block, the tile
+// generator's registers', the Real3D's small ports'. Searched instead of all of them (2026-11-19: the JTAG port's
+// bits, a write and a read each, went through the whole list). More than kTouching: all searched, as before.
+constexpr std::size_t kTouching = 4;
+const std::array<std::array<uint8_t, kTouching>, 0x10000> kMixedRegions = [] {
+    std::array<std::array<uint8_t, kTouching>, 0x10000> lists{};
+    for (uint32_t b = 0; b < 0x10000; ++b) {
+        if (kBlocks[b] != kMixed) continue;
+        const uint32_t lo = b << 16, hi = lo | 0xFFFF;
+        std::size_t n = 0;
+        bool too_many = false;
+        for (std::size_t i = 0; i < kRegions.size(); ++i) {
+            const Region& r = kRegions[i];
+            if ((hi & ~r.mirror) < r.start || (lo & ~r.mirror) > r.end) continue;
+            if (n == kTouching) too_many = true;
+            else lists[b][n++] = static_cast<uint8_t>(i + 1);
+        }
+        if (too_many) lists[b] = {}; // (an empty list: searched whole)
+    }
+    return lists;
+}();
 } // namespace
 
 const Region* find_region(uint32_t addr) {
     const uint8_t at = kBlocks[addr >> 16];
     if (at == kNone) return nullptr;
     if (at != kMixed) return &kRegions[at - 1u];
-    return search(addr);
+    const auto& list = kMixedRegions[addr >> 16];
+    if (list[0] == 0) return search(addr);
+    for (const uint8_t i : list) {
+        if (i == 0) break;
+        if (kRegions[i - 1u].contains(addr)) return &kRegions[i - 1u];
+    }
+    return nullptr; // (none of the regions touching the block has it)
 }
 
 } // namespace m3

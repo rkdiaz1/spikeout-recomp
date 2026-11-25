@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace m3 {
 
@@ -481,24 +482,34 @@ uint16_t Crypt315_5881::block_decrypt(uint32_t game_key, uint16_t sequence_key, 
     uint32_t fn1_subkeys[4] = {}, fn2_subkeys[4] = {};
     const auto set = [](uint32_t* subkeys, int pos) { subkeys[pos / 24] ^= 1u << (pos % 24); };
 
-    // Game-key scheduling.
-    for (const auto& s : fn1_game_key_scheduling)
-        if (bit(game_key, s[0])) set(fn1_subkeys, s[1]);
-    for (const auto& s : fn2_game_key_scheduling)
-        if (bit(game_key, s[0])) set(fn2_subkeys, s[1]);
-    // Sequence-key scheduling.
-    for (const auto& s : fn1_sequence_key_scheduling)
-        if (bit(sequence_key, s[0])) set(fn1_subkeys, s[1]);
-    for (int j = 0; j < 16; ++j)
-        if (bit(sequence_key, j)) set(fn2_subkeys, fn2_sequence_key_scheduling[j]);
+    // Game-key and sequence-key scheduling: the same for the same keys, kept for the last ones (each thread its own:
+    // boards on threads decrypt at once).
+    thread_local uint32_t kept_game = 0;
+    thread_local uint16_t kept_sequence = 0;
+    thread_local bool kept = false;
+    thread_local uint32_t kept_fn1[4], kept_fn2[4];
+    if (!kept || kept_game != game_key || kept_sequence != sequence_key) {
+        for (const auto& s : fn1_game_key_scheduling)
+            if (bit(game_key, s[0])) set(fn1_subkeys, s[1]);
+        for (const auto& s : fn2_game_key_scheduling)
+            if (bit(game_key, s[0])) set(fn2_subkeys, s[1]);
+        for (const auto& s : fn1_sequence_key_scheduling)
+            if (bit(sequence_key, s[0])) set(fn1_subkeys, s[1]);
+        for (int j = 0; j < 16; ++j)
+            if (bit(sequence_key, j)) set(fn2_subkeys, fn2_sequence_key_scheduling[j]);
+        std::copy_n(fn1_subkeys, 4, kept_fn1), std::copy_n(fn2_subkeys, 4, kept_fn2);
+        kept_game = game_key, kept_sequence = sequence_key, kept = true;
+    } else {
+        std::copy_n(kept_fn1, 4, fn1_subkeys), std::copy_n(kept_fn2, 4, fn2_subkeys);
+    }
 
     // First Feistel network: the counter.
     int aux = bitswap16(counter, {5, 12, 14, 13, 9, 3, 6, 4, 8, 1, 15, 11, 0, 7, 10, 2});
     int b = aux >> 8;
-    int a = (aux & 0xFF) ^ feistel_function(b, fn1_sboxes[0], fn1_subkeys[0]);
-    b ^= feistel_function(a, fn1_sboxes[1], fn1_subkeys[1]);
-    a ^= feistel_function(b, fn1_sboxes[2], fn1_subkeys[2]);
-    b ^= feistel_function(a, fn1_sboxes[3], fn1_subkeys[3]);
+    int a = (aux & 0xFF) ^ feistel_fast(b, 0, fn1_subkeys[0]);
+    b ^= feistel_fast(a, 1, fn1_subkeys[1]);
+    a ^= feistel_fast(b, 2, fn1_subkeys[2]);
+    b ^= feistel_fast(a, 3, fn1_subkeys[3]);
     const uint32_t middle_result = static_cast<uint32_t>(b << 8 | a);
 
     // Middle-result scheduling.
@@ -508,13 +519,67 @@ uint16_t Crypt315_5881::block_decrypt(uint32_t game_key, uint16_t sequence_key, 
     // Second Feistel network: the data.
     aux = bitswap16(data, {14, 3, 8, 12, 13, 7, 15, 4, 6, 2, 9, 5, 11, 0, 1, 10});
     b = aux >> 8;
-    a = (aux & 0xFF) ^ feistel_function(b, fn2_sboxes[0], fn2_subkeys[0]);
-    b ^= feistel_function(a, fn2_sboxes[1], fn2_subkeys[1]);
-    a ^= feistel_function(b, fn2_sboxes[2], fn2_subkeys[2]);
-    b ^= feistel_function(a, fn2_sboxes[3], fn2_subkeys[3]);
+    a = (aux & 0xFF) ^ feistel_fast(b, 4, fn2_subkeys[0]);
+    b ^= feistel_fast(a, 5, fn2_subkeys[1]);
+    a ^= feistel_fast(b, 6, fn2_subkeys[2]);
+    b ^= feistel_fast(a, 7, fn2_subkeys[3]);
     aux = b << 8 | a;
     return static_cast<uint16_t>(
         bitswap16(static_cast<uint32_t>(aux), {15, 7, 6, 14, 13, 12, 5, 4, 3, 2, 11, 10, 9, 1, 0, 8}));
+}
+
+bool Crypt315_5881::feistel_tables_match() {
+    std::vector<uint32_t> keys = {0, 0xFFFFFF};
+    uint32_t x = 12345;
+    for (int i = 0; i < 64; ++i) keys.push_back((x = x * 1103515245u + 12345u) & 0xFFFFFF);
+    for (int r = 0; r < 8; ++r)
+        for (int in = 0; in < 256; ++in)
+            for (uint32_t k : keys)
+                if (feistel_fast(in, r, k) != feistel_function(in, r < 4 ? fn1_sboxes[r] : fn2_sboxes[r - 4], k)) return false;
+    return true;
+}
+
+// feistel_function by tables (the same results): for each of the eight rounds' s-box sets (fn1's four, fn2's four),
+// each input byte's four s-box indexes before the key (6 bits each, packed), and each s-box's output bits placed
+// for each table value. Made once from the s-boxes above. An input past a byte (never: the rounds' halves are
+// bytes): feistel_function itself.
+int Crypt315_5881::feistel_fast(int input, int round, uint32_t subkeys) {
+    struct Tables {
+        uint32_t index[8][256];
+        uint8_t out[8][4][64];
+    };
+    static const Tables t = [] {
+        Tables x{};
+        for (int r = 0; r < 8; ++r) {
+            const Sbox* s = r < 4 ? fn1_sboxes[r] : fn2_sboxes[r - 4];
+            for (uint32_t in = 0; in < 256; ++in) {
+                uint32_t packed = 0;
+                for (int m = 0; m < 4; ++m) {
+                    uint32_t aux = 0;
+                    for (int k = 0; k < 6; ++k)
+                        if (s[m].inputs[k] != -1) aux |= static_cast<uint32_t>(bit(in, s[m].inputs[k])) << k;
+                    packed |= aux << (6 * m);
+                }
+                x.index[r][in] = packed;
+            }
+            for (int m = 0; m < 4; ++m)
+                for (uint32_t i = 0; i < 64; ++i) {
+                    const uint32_t v = s[m].table[i];
+                    uint32_t result = 0;
+                    for (int k = 0; k < 2; ++k) result |= static_cast<uint32_t>(bit(v, k)) << s[m].outputs[k];
+                    x.out[r][m][i] = static_cast<uint8_t>(result);
+                }
+        }
+        return x;
+    }();
+    if (input < 0 || input > 255) return feistel_function(input, round < 4 ? fn1_sboxes[round] : fn2_sboxes[round - 4], subkeys);
+    const uint32_t packed = t.index[round][input];
+    int result = 0;
+    for (int m = 0; m < 4; ++m) {
+        result |= t.out[round][m][((packed >> (6 * m)) ^ subkeys) & 0x3F];
+        subkeys >>= 6;
+    }
+    return result;
 }
 
 void Crypt315_5881::reset() {

@@ -162,8 +162,12 @@ div { display: block; }
 #sf { position: absolute; left: 0; top: 0; }
 @keyframes ping { 0% { left: 0%; } 50% { left: 100%; } 100% { left: 0%; } }
 .rfx { position: absolute; height: 0dp; transform-origin: 0% 50%; }
-.rping { position: absolute; top: -5dp; left: 0%; width: 10dp; height: 10dp; margin-left: -5dp; border-radius: 5dp;
-	background-color: #ffffff; border: 1dp #000000; animation: 1.6s cubic-in-out infinite ping; }
+/* (the dot: the lit line's thickness, no border, a little see-through, with a glow (the owner's choice from a mockup,
+   2026-11-22: 80%, a 6dp glow at 60%); the glow two fainter dots behind it, which every renderer draws, not box-shadow) */
+.rping { position: absolute; top: 0dp; left: 0%; width: 0dp; height: 0dp; animation: 1.6s cubic-in-out infinite ping; }
+.rglow2 { position: absolute; left: -8dp; top: -8dp; width: 16dp; height: 16dp; border-radius: 8dp; background-color: #ffffff1a; }
+.rglow1 { position: absolute; left: -5dp; top: -5dp; width: 10dp; height: 10dp; border-radius: 5dp; background-color: #ffffff40; }
+.rcore { position: absolute; left: -2dp; top: -2dp; width: 4dp; height: 4dp; border-radius: 2dp; background-color: #ffffffcc; }
 .rbadge.o { background-color: transparent; color: #ff9a3c; border: 2dp #ff6a1f; }
 .row.selected .rbadge.o { color: #1a0705; border-color: #1a0705; }
 .rbadge { flex: 0 0 auto; width: 76dp; height: 20dp; line-height: 20dp; margin: 4dp 0 0 10dp; text-align: center; font-size: 15dp;

@@ -852,6 +852,152 @@ What the firmware's handlers settle (`hardware-notes.md` has the detail):
   The cabinets' counts keep the ring model's relation (the master a count
   ahead), so one board a PC's hand-backs (`tools/one_board.hpp`, `ahead`)
   are unchanged. Part of the build's id for network play.
+- **The link's table by the counts (2026-11-19;
+  `CommBoardOptions::count_matched`, on by default; `gamerun
+  --net-count-match off` for the slave table above).** Preview7 still
+  showed the Communication error (report 5139, two cabinets: at frame
+  65455, code 1, Gpos). Cause: the master's count lost its lead. The
+  game's per-frame vblank wait is in its 2D scroll update (`0x50834`,
+  at `0x5099C`): it waits only if no video interrupt has come since its
+  last call, and only that wait clears the interrupt count, so once a
+  frame's work before it runs past the vblank, the wait is skipped for
+  good and the frame is paced by the main loop's other wait
+  (`0x36EAC`): one vblank lost. In report 5139 the master's player was
+  out at 59267 (its frames' work grew); from then the counts were equal,
+  and the slave table (always one exchange late) showed the slave each
+  mode change a count late. It's a race built into the game (tolerated:
+  the link's wait rule allows a count of gap), so real cabinets can lose
+  a vblank too; the link has to be right whatever the gap.
+  The model now: each board keeps the last 6 exchanges' whole tables
+  (every node's part of one exchange: the master's from its data frame
+  come back round, a slave's from its data frame and the second pass,
+  whose header now carries the ring's cabinets and the master's count),
+  each marked with the master's count; the main board, reading the other
+  nodes (`0xC0000D00` on), is shown the newest whole table whose master
+  count is the count this cabinet last wrote (its part's header `+0x1C`),
+  else the newest whole one with an earlier count, else what came. Two
+  cabinets at one count see one table, the master a count ahead or not;
+  3 and 4 cabinets alike (a middle cabinet's later nodes from the second
+  pass). Measured on report 5139: from its state at 65200 the slave
+  table gives the error at 65460 on both cabinets, the counts' table
+  none (the master's 259 reads all of its count, the slave's 258 of
+  259); the whole game (65,457 frames) runs to its end with no error.
+  Every report game replayed (144, 132 of them four cabinets): no
+  Communication error (the slave table: 5139's alone).
+  Each part is shown whole from its table, not only its header and
+  records (the 576 words `link_frame` takes each frame): the part's last
+  0x300 bytes carry the area state a joining cabinet copies (`0x6E7C4`,
+  from the master's part at `+0x900` into `0x365000`) when the master's
+  header asks for it. Shown from the bank as it came, the first try's
+  middle cabinet of three (power-on, the third player in at 4,600) saw the
+  request at its count and the area state of a later exchange, already
+  cleared: it copied zeros, and the next area start stopped on "Area init
+  not complete." (`0x59E0C`, frame 6,270; the slave table and the old
+  link both delay the whole part, so neither shows it). The tables keep
+  how much of each part came (a four-cabinet ring's come-back is a byte
+  short of four parts: that byte from the bank).
+  While the cabinets aren't linked in play (each its own only active
+  node, `0x14002C`) their counts drift apart freely (59 at frame 26000)
+  and a slave's reads find no table of its count: then what came, or the
+  newest table, as the game doesn't compare the cabinets there. In save
+  states (`kStateFormat` 4; format 3's load with no tables, the data as
+  it came until the next whole table) and rollback's snapshots. Part of
+  the build's id for network play.
+  How to judge it (2026-11-25): a report game's replay checks itself
+  against the RAM hashes in its recording ("N RAM checks as recorded, M
+  differed"). On a link other than the one it was played on it differs
+  from early on (often frame 720), and from then the recorded inputs
+  drive a different game: an error thousands of frames later, or none,
+  says little (the "144 games, no error" above was such evidence). The test
+  that counts: games that replay exactly on the link they were played
+  on up to the error, the state saved 600 frames before it, the last
+  stretch run on each link. 8 of the 13 Communication-error reports of
+  2026-11-18..24 replay exactly on preview7's link (every RAM check the
+  same, the error at the reported frame); from their states preview7's
+  link shows the error again in all 8, this link in 4. Tried then
+  (2026-11-25), judged the same way: a table shown as soon as it is
+  whole (not from the next data frame) stops 3 more (7 of 8), but what it
+  shows then depends on when within a frame a table's last part comes,
+  which a one-board machine's made cabinets send at other moments than a
+  real cabinet: a three-player game with a player gone parted between
+  machines (tools/onepc-net-tests.ps1 leave3, vanish3). Not taken; the
+  open problem for this link: a showing point as early, independent of
+  that timing. Two others changed nothing (the area state at power-on as
+  it came; the table kept from the main board's copy of the parts to the
+  frame's end): 4 of 8 either way.
+- **The link as the hardware does it (2026-11-25;
+  `CommBoardOptions::cut_through`, on by default; `gamerun
+  --net-cut-through off` for the count-matched link above).** The
+  second pass, the slave table and the tables by the counts were all our
+  own, each found from replays, each fixing some games and breaking
+  others. The firmware says what the chip does (the private link study):
+  the data frame's receive area lies inside its send area (out from
+  `0x100`, `0x3200` bytes; in at `0xD00`, `0x2FFF` bytes: right after
+  the node's own part), so the chip passes on what it receives as it
+  receives it (cut-through), each node putting its own part in front.
+  The master relays too: after its own part, the stream come back round.
+  So every cabinet gets every node's part of the same exchange within one
+  tick, and nothing needs a second pass. What comes in lands in the bank
+  the 68000 has selected, and the main board sees it after the next
+  tick's bank flip (the firmware's IRQ 5 handler, every tick once the
+  link is up), so what it reads changes only at the ticks: when within a
+  tick a part arrived doesn't matter (a one-board machine's made cabinets
+  send at other moments than a real one, and see the same).
+  Emulated a part at a time: a node's own part as a plain packet (a data
+  frame's start), the relay as packets of the emulation's own
+  (`m3::kStreamMagic`, their offset in the stream), each sent once it has
+  come in and the wire allows; transmit complete once the frame's whole
+  length has gone, receive complete once its length is in.
+  With it the cabinets run at the same count (the game reads each node's
+  record for `frame_count - 2` and waits when a node's header is further
+  behind: built for exactly this two-tick latency); the old model's
+  master ran a count ahead because data frames were shown at once.
+  Judged on the 8 exact near-error replays (above): preview7's link 8
+  errors, the count-matched link 4 (cabinets stalling in the link's wait
+  before it: 191705's slave ran 576 of 900 frames, 38 waits on another),
+  this link none, including 192615, which every earlier link failed;
+  every board's logic ran ~896 of the 900 frames, one wait each where the
+  link model changed under the loaded state. In save states
+  (`kStateFormat` 5; format 4's load with no stream on its way) and
+  rollback's snapshots; part of the build's id.
+  One board a PC had the old lead built in (a made master a count ahead
+  of the staying board, a made slave a count behind: side runs' counts,
+  where a shadow stops, the offline shadow started a frame after the
+  staying board's state): now `tools::one_board::master_lead(link)`, 0
+  on this link, 1 on the one before. The offline shadow (gamerun
+  `--one-board-shadow`, from the staying board's own state) starts in the
+  same frame as that state, mid-frame (the waiting board looks for it
+  after each meeting and skips the one meeting it already passed:
+  `Board::skip_meeting`), with the made cabinet's link of the count made
+  then (`Cabinets::shadow_now`: a block shows only at the next tick, so
+  made sooner in the frame it is the same). The camera recording the
+  offline tests use (`build/onepc/cam3.rec`) is made again on this link
+  (`--camera-record 1:FILE` over the reference run).
+  Found on the way, both the made cabinets' own (any link): a cabinet's
+  vblank count (`0x100038`, which decides whether its 2D scroll update
+  waits for the vblank or has skipped the wait for good) was the staying
+  board's in side runs; now one of a made cabinet's own variables, one
+  vblank a frame (taken by its tasks' wait, else added at the frame's
+  end, for every cabinet whose own variables run, made yet or not; a
+  seed counting on gets the vblank it is still to see). And an offline
+  shadow keeps its own board's time base (each board's runs at its own
+  offset; the game keeps readings of it), its decrementer moved with it.
+  What an offline shadow can't have is the other board's CPU timing
+  within a frame (it goes on from the staying board's instruction
+  boundaries, 2-7 cycles off; the old link's passed by luck, 3 off), so
+  `slave-apart` takes its shadow from the real board's state instead, as
+  network play does (`gamerun --board-state B@FRAME FILE` in the
+  reference run, `--one-board-shadow-state FILE`: loaded by the network
+  path, `load_remote_shadow`); the other offline shadow tests keep the
+  approximation, which they pass.
+  Tests on this link (2026-11-25): tools/onepc-tests.ps1 18/18 (the four
+  four-cabinet ones run apart: started with the rest they run out of
+  memory), onepc-net-tests.ps1 all, -LeaverFirst leave3/vanish3,
+  spectate-tests.ps1 6/6, the 12 internet cases (every case the same; the
+  one-board cases smoother than the count-matched link's: oneboard-rb's
+  gaps 166/285/90 ms down to 99/91/65), the link's own cost none
+  measurable (two and four boards, old against new, back to back: within
+  the machine's spread).
 - **How late a packet may arrive (measured 2026-10-25, with IRQ 5 once a
   frame and the wire at 4 MB/s: the limit is to measure again).** The real link is
   a cable, so a packet takes next to no time; ours adds a delay in game

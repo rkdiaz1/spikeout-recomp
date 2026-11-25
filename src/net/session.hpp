@@ -55,7 +55,7 @@
 namespace net {
 
 constexpr uint16_t kDiscoveryPort = 47326;
-constexpr uint8_t kProtocol = 3; // (2: spectators; 3: selective acknowledgements, the state's size, catch-up in the status)
+constexpr uint8_t kProtocol = 5; // (2: spectators; 3: selective acknowledgements, the state's size, catch-up in the status; 4: acknowledgements over the whole window, a joiner's state in chunks from several players; 5: the link as the hardware does it (m3::CommBoardOptions::cut_through): the cabinets run level, so games and their states aren't another build's)
 constexpr std::size_t kMaxSeats = 4;
 constexpr std::chrono::milliseconds kDropAfter{3000};
 // A player in a game going on, heard nothing from for this long, is let go (its cabinet idle from the furthest of
@@ -114,6 +114,7 @@ struct StartInfo {
     // zstd-compressed), to run on from; the inputs from then on come as usual.
     std::optional<uint64_t> state_frame;
     std::vector<uint8_t> state;
+    bool state_raw = false; // (`state` not packed: put together from chunks several players sent, Session's share)
     std::vector<std::string> names; // by seat
 };
 
@@ -152,6 +153,9 @@ public:
         std::function<void(uint8_t seat)> backup_wanted;
         // Seat `seat`'s own board's part of its link packet `seq` (send_node: packed as the sender chose).
         std::function<void(uint8_t seat, uint64_t seq, std::vector<uint8_t> node)> node;
+        // The host: a joiner (or a spectator, kWatcherBase + its number) saw the game's Communication error just after its
+        // join and asks for a report of ours (ask_report): its frame and what it saw
+        std::function<void(uint8_t seat, uint64_t frame, std::string why)> report_wanted;
         std::function<void(const std::string&)> log; // what happened, for the frontend
     };
 
@@ -207,8 +211,44 @@ public:
     // The host, asked (Callbacks::state_wanted): every board's state at
     // the end of `frame` (compressed), for the machines waiting for it.
     void send_state(uint64_t frame, std::vector<uint8_t> state);
+    // A player joining's state in chunks from several players (item 4, 2026-11-24; docs/netplay.md "A joiner's state
+    // from every player"): every player running every board takes the same state at the same frame, so each can send
+    // a part of it, the host's upload no longer the join's limit. The host: those players (connected, playing, every
+    // board) asked to take every board's state at `frame` (ahead of where they are), when a player waits for it; their
+    // seats (none: the state sent whole as before).
+    std::vector<uint8_t> share_capture(uint64_t frame);
+    uint64_t share_frame() const; // (the host: the frame its helpers take; 0 none)
+    // A chunk of a state: where it is in it, its raw bytes' hash, packed against the chunk `ref` (the first board's at
+    // the same place in its board, the boards much alike: net::compress_against; -1 alone).
+    struct ShareChunk {
+        uint32_t offset = 0, size = 0;
+        int32_t ref = -1;
+        uint64_t hash = 0;
+        std::vector<uint8_t> packed;
+    };
+    // The chunks of a state (`raw`, as assembled): each board's state (from its tag) in 1 MB chunks, those of the 2nd
+    // board on against the 1st's; what comes before the first board alone. The same on every machine with the same state.
+    static std::vector<ShareChunk> share_chunks(const std::vector<uint8_t>& raw);
+    static uint64_t chunk_hash(const uint8_t* data, std::size_t size);
+    // The host: its state of that frame in chunks: the plan (each chunk's place, reference, hash, packed size and sender:
+    // the host and its helpers in turn) to the players waiting and to the helpers, the host's own chunks sent, all kept
+    // for those a joiner asks for again (kShareWant).
+    void share_state(uint64_t frame, uint32_t raw_size, std::vector<ShareChunk> chunks);
+    // Whether a machine still waits for every board's state (a spectator: sent whole).
+    bool state_wanted() const;
+    // A helper: the frame the host asked for every board's state at (0 none; once).
+    uint64_t take_share_capture();
+    uint64_t share_helper_frame() const; // (the frame asked for, still: share_offer's)
+    // A helper: its own chunks of that frame's state; those the plan gives it and whose hashes are the plan's sent to
+    // the joiner (once the plan is here), the others said it can't (kShareCant: the host sends them).
+    void share_offer(uint64_t frame, std::vector<ShareChunk> chunks);
     // One board a PC: ask seat `seat` for its own board's state at the end of `frame` (Callbacks::board); and send ours,
     // asked (Callbacks::board_wanted; compressed).
+    // A joiner or spectator that saw the game's Communication error just after its join: the host asked to save a
+    // problem report of its own (Callbacks::report_wanted), with its recording from the game's start: the error came
+    // with the state, so the room's history before it is the joiner's report's missing half (reports 6919 and 7307,
+    // 2026-11-24: neither could be replayed to a cause from the joiner's bundle alone). Once is enough: the caller's.
+    void ask_report(uint64_t frame, const std::string& why);
     void want_board(uint8_t seat, uint64_t frame);
     void send_board(uint8_t seat, uint64_t frame, std::vector<uint8_t> state);
     // Leaving a game in progress: this machine's board's state at the end of `frame` will go to every other (send_board),

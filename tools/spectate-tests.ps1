@@ -29,7 +29,7 @@ $oneboard = @('--net-one-board', '100', '--one-board-auto', '--one-board-held')
 # the players' frames (the spectator's 400 fewer) and more presses for every process.
 $tests = @(
     @('before', 0, @(), 0, @(), @(0, 1), 4200, @()),
-    @('late', 15000, @(), 0, @(), @(0, 1), 4200, @()),
+    @('late', 15000, @(), 0, @(), @(0, 1), 4200, @('--pace')), # (at the arcade's pace: unpaced, a fast PC was 3,300 frames in after 15 s, under 1,000 left to compare, 2026-11-24)
     @('migrate', 0, @('--net-vanish-at', '2500'), 1, @(), @(0, 1), 4200, @()),
     @('leave', 0, @('--net-leave-at', '2500'), 1, @(), @(0, 1), 4200, @()),
     @('oneboard', 0, @(), 0, $oneboard, @(0), 8000, @('--pace', '--press', '1:coin@6100')),

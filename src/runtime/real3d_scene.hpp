@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace m3 {
@@ -217,6 +218,18 @@ private:
     void reset_rotation();
     float culling_float(uint32_t addr) const;
     void decode_model(size_t viewport, const ModelRef& model); // its polygons into the scene
+
+    // The models in the polygon ROM (VROM, from 0x100000), read once: each polygon's header and vertices as decoded
+    // (real3d_scene.cpp). A copy of the builder starts its own (one each, so builders on different threads share
+    // nothing).
+    struct ModelCache;
+    struct ModelCacheSlot {
+        std::shared_ptr<ModelCache> cache;
+        ModelCacheSlot() = default;
+        ModelCacheSlot(const ModelCacheSlot&) {}
+        ModelCacheSlot& operator=(const ModelCacheSlot&) { cache.reset(); return *this; }
+    };
+    ModelCacheSlot model_cache_;
 
     const Real3d* mem_ = nullptr;
     Real3dScene* scene_ = nullptr;

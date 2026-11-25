@@ -47,6 +47,18 @@ public:
         making_ = making;
     }
     void set_session(net::Session* session) { session_ = session; }
+    // A seat taken by a player joining in progress, from `frame` (Session's taken): before it the cabinet isn't that
+    // player's, its machine still catching up, the nodes it sends meanwhile not the room's (made ones then not counted).
+    void seat_taken(std::size_t seat, uint64_t frame) {
+        std::lock_guard guard(lock_);
+        seat_from_[seat] = frame;
+    }
+    // And each seat's state now (once a frame): open or a player still joining (its real nodes, of the frames it catches up
+    // on, come long after the made ones of them were let go: not counted)
+    void seats_joining(std::vector<bool> joining) {
+        std::lock_guard guard(lock_);
+        joining_ = std::move(joining);
+    }
     // A made packet found different from its real one: told (what, the frame it left in), with the check's lock held:
     // quick, and nothing calling back in (tools::NetPlay::problem: a problem bundle queued).
     void set_problem(std::function<void(const std::string& what, uint64_t frame)> fn) {
@@ -71,7 +83,7 @@ public:
 
     // The ring's on_patch: a packet board `from` sends (number `seq` on its link), before it leaves.
     void patch(std::size_t from, uint64_t seq, std::vector<uint8_t>& data) {
-        if (data.size() < kNodeBytes || m3::ring_pass(data)) return;
+        if (data.size() < kNodeBytes || m3::link_extra(data)) return;
         std::lock_guard guard(lock_);
         if (!run_again_ || from == local_) return;
         const auto s = real_.find(from);
@@ -89,8 +101,8 @@ public:
         const std::size_t from = (to + boards_ - 1) % boards_;
         (void)at;
         // (else a small sync frame or the ring's second pass (m3::ring_pass): its hash alone)
-        const bool data_frame = data.size() >= kNodeBytes && !m3::ring_pass(data);
-        const Whole whole_packet{static_cast<uint32_t>(data.size()), hash(data)};
+        const bool data_frame = data.size() >= kNodeBytes && !m3::link_extra(data);
+        const Whole whole_packet{static_cast<uint32_t>(data.size()), hash(data), data_frame};
         if (from == local_) { // (our own board's: to the others, once settled)
             Outgoing& out = outgoing_[seq]; // (a frame run again: its packet anew)
             out.frame = frame_cycles_ ? at / frame_cycles_ : 0, out.data_frame = data_frame, out.whole = whole_packet;
@@ -120,7 +132,7 @@ public:
         if (!making_) return;
         if (frame_now_) made_frame_[from][seq] = frame_now_(); // (the staying board's frame as it leaves)
         // (+2: a cabinet a frame ahead made it from its own next frame's inputs, maybe still guessed here then)
-        if (frame_cycles_) made_at_[from][seq] = at / frame_cycles_ + 2, trim(made_at_[from], seq);
+        if (frame_cycles_) made_at_[from][seq] = at / frame_cycles_ + 2, trim(made_at_[from], seq > kKept ? seq - kKept : 0); // (kept twice as long: trim_made says the frames of those it drops)
         sweep(); // (those waiting for their frames to settle)
         made_whole_[from][seq] = whole_packet;
         compare_whole(from, seq);
@@ -130,7 +142,7 @@ public:
             std::copy(data.begin(), data.begin() + kNodeBytes, node.begin());
             made_[from][seq] = node;
             compare(from, seq);
-            trim(made_[from], seq);
+            trim_made(from, seq);
         }
         trim(made_frame_[from], seq);
         go_back(guard);
@@ -147,7 +159,7 @@ public:
         {
             std::unique_lock guard(lock_);
             if (making_) {
-                real_whole_[seat][seq] = Whole{whole_size, whole_hash};
+                real_whole_[seat][seq] = Whole{whole_size, whole_hash, packed[0] != 2};
                 if (settled_) sweep();
                 compare_whole(seat, seq);
                 trim(real_whole_[seat], seq);
@@ -179,7 +191,7 @@ public:
         }
         real_[seat][seq] = node;
         compare(seat, seq);
-        trim(real_[seat], seq);
+        trim_real(seat, seq);
         go_back(guard);
     }
 
@@ -291,15 +303,17 @@ public:
     // The bytes that differed most often (offset in the node: count), for the report.
     std::string report(std::size_t most = 12) const {
         std::lock_guard guard(lock_);
-        char buf[320];
+        char buf[512];
         std::snprintf(buf, sizeof buf,
                       "%llu packets compared, %llu differed; %llu bytes of made records taken from real ones; %llu made packets "
                       "sent as their real ones, %llu times gone back for one, %llu real ones sent again changed",
                       (unsigned long long)totals_.compared, (unsigned long long)totals_.differed, (unsigned long long)fixed_,
                       (unsigned long long)patched_, (unsigned long long)backs_, (unsigned long long)replaced_);
         std::string out = buf;
-        std::snprintf(buf, sizeof buf, "; whole packets: %llu compared, %llu differed", (unsigned long long)whole_compared_,
-                      (unsigned long long)whole_differed_);
+        std::snprintf(buf, sizeof buf, "; whole packets: %llu compared, %llu differed; %llu compared by count (numbered apart); %llu bytes of sums no game reads left out; %llu made with no real one of their count (%llu: none of their number came; %llu: it had another count); %llu of seats no machine sent for; %llu made twice",
+                      (unsigned long long)whole_compared_, (unsigned long long)whole_differed_, (unsigned long long)repaired_,
+                      (unsigned long long)unread_sums_, (unsigned long long)unpaired_, (unsigned long long)unpaired_none_,
+                      (unsigned long long)unpaired_other_, (unsigned long long)unsent_, (unsigned long long)duplicates_);
         out += buf;
         std::vector<std::pair<uint64_t, std::size_t>> by;
         for (std::size_t i = 0; i < kNodeBytes; ++i)
@@ -327,6 +341,7 @@ private:
     struct Whole { // (a whole packet, data frame or sync frame: its size and a hash of every byte)
         uint32_t size = 0;
         uint64_t hash = 0;
+        bool data = false; // (a data frame: compared with its node's partner (compare), not by number)
         bool operator==(const Whole&) const = default;
     };
     static uint64_t hash(const std::vector<uint8_t>& data) {
@@ -361,6 +376,7 @@ private:
         const auto m = made_whole_[seat].find(seq);
         const auto r = real_whole_[seat].find(seq);
         if (m == made_whole_[seat].end() || r == real_whole_[seat].end()) return;
+        if (m->second.data || r->second.data) return; // (a data frame's: with its node, compare)
         ++whole_compared_;
         if (!(m->second == r->second) && ++whole_differed_ <= log_limit())
             std::printf("node check: seat %zu packet %llu: the whole packet differs (%u bytes real, %u made)\n", seat + 1,
@@ -374,16 +390,113 @@ private:
         std::array<Node, 3> recent{};
         uint64_t n = 0;
     };
+    // A byte of a character entry's sum (+8..+11, sync_check_build 0x74808) that no game reads: the one reader is the
+    // link's sync check (0x7435C, from 0x74284 only with two option bits of the link's control block set; a sum that
+    // differs stops the game there for good), and it compares a character's sums only if either record has it in play
+    // (its flags word's bit 0). A character out of play on both keeps its object's leftovers in its sum, each cabinet
+    // its own (kSumFields): thousands of "node" problems in every one-board game, the made boards in step all along.
+    static bool unread_sum(const Node& a, const Node& b, std::size_t i) {
+        if (i < 0x100) return false;
+        const std::size_t base = i - (i - 0x100) % 0x200, x = (i - 0x100) % 0x200;
+        if (x < 0x14 || x >= 0x14 + 12 * 12 || (x - 0x14) % 12 < 8) return false;
+        const std::size_t flags = base + 0x14 + (x - 0x14) / 12 * 12; // (the flags word's low byte: the node's words byte-reversed)
+        return ((a[flags] | b[flags]) & 1) == 0;
+    }
+    // A node's link count (its header's +0x1C; the node's words byte-reversed).
+    static uint32_t count_of(const Node& n) {
+        return uint32_t(n[0x1C]) | uint32_t(n[0x1D]) << 8 | uint32_t(n[0x1E]) << 16 | uint32_t(n[0x1F]) << 24;
+    }
+    // (a node's packet as the game numbers it: its link count and its header's first word, a frame counter)
+    static uint64_t key_of(const Node& n) {
+        return uint64_t{count_of(n)} << 32 | (uint32_t(n[0]) | uint32_t(n[1]) << 8 | uint32_t(n[2]) << 16 | uint32_t(n[3]) << 24);
+    }
+    // (and with its header's +0x58, the sequence link_header_make bumps for every packet: two packets of one frame and
+    // count told apart)
+    static uint32_t seq_word(const Node& n) {
+        return uint32_t(n[0x58]) | uint32_t(n[0x59]) << 8 | uint32_t(n[0x5A]) << 16 | uint32_t(n[0x5B]) << 24;
+    }
+    // (the partner in `side` of `node` (number `seq`) by the game's numbers: the one of the same number first, if its
+    // numbers agree; then one whose sequence agrees too; then any of its count and frame word. Several packets can carry
+    // one frame's numbers (copies of a node), and the first of them found was taken: those of the same number left
+    // over, 6,000-12,000 made packets a game never paired, 2026-11-23)
+    template <class Skip>
+    static std::map<uint64_t, Node>::iterator partner(std::map<uint64_t, Node>& side, const Node& node, uint64_t seq, Skip skip) {
+        const uint64_t want = key_of(node);
+        if (const auto same = side.find(seq); same != side.end() && !skip(seq) && key_of(same->second) == want) return same;
+        auto loose = side.end();
+        for (auto it = side.begin(); it != side.end(); ++it) {
+            if (skip(it->first) || key_of(it->second) != want) continue;
+            if (seq_word(it->second) == seq_word(node)) return it;
+            if (loose == side.end()) loose = it;
+        }
+        return loose;
+    }
+    // A made node and its real one compared, `seq` either's number (the one just come, or one whose frame settled):
+    // paired by the game's numbers (key_of), not the ring's. A machine's packets to a cabinet and this one's to its copy
+    // of it can come to be numbered apart (seen after a player joined in progress, the streams 2 packets apart, then 66):
+    // compared by number, every byte that moves each frame differed, thousands of "node" problems in a game with every
+    // board in step, 2026-11-23; paired only when the numbers disagreed, the made one wanted had been used already (2026-
+    // 11-23, issue22.ps1 -OthersOne -JoinerOne: 821 problems, the made one 2 counts ahead). Either side kept until its
+    // partner comes (trim: those left over counted, unpaired_); one with the same number and count, but not the same
+    // frame word, compared as it is.
     void compare(std::size_t seat, uint64_t seq) { // (the lock held)
-        if (waits(seat, seq)) return;
-        const auto m = made_[seat].find(seq);
-        const auto r = real_[seat].find(seq);
-        if (m == made_[seat].end() || r == real_[seat].end()) return;
+        auto& made = made_[seat];
+        auto& real = real_[seat];
+        auto& done = done_real_[seat];
+        auto m = made.end();
+        auto r = real.end();
+        if (const auto here = real.find(seq); here != real.end() && !done.count(seq)) { // (a real one come: its made one)
+            if (const auto it = partner(made, here->second, seq, [](uint64_t) { return false; }); it != made.end()) m = it, r = here;
+            if (m == made.end()) // (the same number and count, come before it: compared as it is, whichever came last)
+                if (const auto same = made.find(seq); same != made.end() && count_of(same->second) == count_of(here->second))
+                    m = same, r = here;
+        }
+        if (m == made.end())
+            if (const auto here = made.find(seq); here != made.end()) { // (a made one: its real one, not yet compared)
+                if (const auto it = partner(real, here->second, seq, [&](uint64_t s) { return done.count(s) != 0; }); it != real.end())
+                    m = here, r = it;
+                if (m == made.end()) // (the same number and count: compared as it is)
+                    if (const auto same = real.find(seq);
+                        same != real.end() && !done.count(seq) && count_of(same->second) == count_of(here->second))
+                        m = here, r = same;
+                // (a second copy of a packet made already: the real one of its number compared with the first, its game
+                // numbers the same (count, frame word, sequence). Left, it counted as never paired, 2026-11-23)
+                if (m == made.end())
+                    if (const auto same = real.find(seq); same != real.end() && done.count(seq) && key_of(same->second) == key_of(here->second) &&
+                                                            seq_word(same->second) == seq_word(here->second)) {
+                        ++duplicates_;
+                        made.erase(here);
+                        return;
+                    }
+            }
+        if (m == made.end()) return; // (its partner not here yet)
+        if (waits(seat, m->first)) return;
+        const uint64_t made_seq = m->first;
+        if (made_seq != r->first && repaired_++ == 0)
+            std::printf("node check: seat %zu's packets numbered apart (real %llu, made %llu, count %u): paired by count\n", seat + 1,
+                        (unsigned long long)r->first, (unsigned long long)made_seq, count_of(r->second));
+        done.insert(r->first);
+        { // (the whole packets of the two, paired with them)
+            auto& made_whole = made_whole_[seat];
+            const auto mw = made_whole.find(made_seq);
+            const auto rw = real_whole_[seat].find(r->first);
+            if (mw != made_whole.end() && rw != real_whole_[seat].end()) {
+                ++whole_compared_;
+                if (!(mw->second == rw->second) && ++whole_differed_ <= log_limit())
+                    std::printf("node check: seat %zu packet %llu: the whole packet differs (%u bytes real, %u made)\n", seat + 1,
+                                (unsigned long long)r->first, rw->second.size, mw->second.size);
+                made_whole.erase(mw);
+            }
+        }
         ++totals_.compared;
         std::string bytes;
         std::size_t n = 0;
         for (std::size_t i = 0; i < kNodeBytes; ++i)
             if (m->second[i] != r->second[i]) {
+                if (unread_sum(m->second, r->second, i)) {
+                    ++unread_sums_;
+                    continue;
+                }
                 ++counts_[i];
                 if (i >= 0x100) { // (a record's byte: learned, as a big-endian offset in it)
                     const std::size_t x = (i - 0x100) % 0x200;
@@ -397,23 +510,23 @@ private:
                 }
             }
         if (n && ++totals_.differed <= log_limit()) {
-            const auto at = made_at_[seat].find(seq); // (the frame it left in, +2)
+            const auto at = made_at_[seat].find(made_seq); // (the frame it left in, +2)
             std::printf("node check: seat %zu packet %llu (frame %lld): %zu bytes differ (real/made):%s\n", seat + 1,
-                        (unsigned long long)seq, at == made_at_[seat].end() ? -1ll : static_cast<long long>(at->second) - 2, n,
+                        (unsigned long long)made_seq, at == made_at_[seat].end() ? -1ll : static_cast<long long>(at->second) - 2, n,
                         bytes.c_str());
         }
         if (n && problem_) { // (a problem bundle: tools/problem_report.hpp, one a minute at most)
-            const auto at = made_at_[seat].find(seq);
+            const auto at = made_at_[seat].find(made_seq);
             const uint64_t frame = at == made_at_[seat].end() || at->second < 2 ? 0 : at->second - 2;
-            problem_("seat " + std::to_string(seat + 1) + "'s made packet " + std::to_string(seq) + ": " + std::to_string(n) +
+            problem_("seat " + std::to_string(seat + 1) + "'s made packet " + std::to_string(made_seq) + ": " + std::to_string(n) +
                          " bytes differ from its real one (real/made):" + bytes,
                      frame);
         }
         if (n && run_again_) { // (step 3: back to the frame it left in; the real one kept, put in as it's sent again)
-            const auto f = made_frame_[seat].find(seq);
+            const auto f = made_frame_[seat].find(made_seq);
             if (f != made_frame_[seat].end()) back_to_ = std::min(back_to_, f->second ? f->second - 1 : 0); // (a frame more: to be sure)
         }
-        made_[seat].erase(m); // (the real one kept: patch puts it in when this packet is sent again)
+        made.erase(m); // (the real one kept: patch puts it in when this packet is sent again)
     }
     // (the lock held: a going back asked, called with it let go)
     void go_back(std::unique_lock<std::mutex>& guard) {
@@ -429,6 +542,58 @@ private:
     }
     template <class T> static void trim(std::map<uint64_t, T>& kept, uint64_t seq) {
         while (!kept.empty() && kept.begin()->first + kKept < seq) kept.erase(kept.begin());
+    }
+    // (the lock held: made nodes kept until compared, those never paired counted as they go)
+    void trim_made(std::size_t seat, uint64_t seq) {
+        auto& kept = made_[seat];
+        while (!kept.empty() && kept.begin()->first + kKept < seq) {
+            const auto& [s, node] = *kept.begin();
+            const auto r = real_[seat].find(s);
+            const bool none = r == real_[seat].end();
+            const auto made_frame = made_at_[seat].find(s);
+            const auto from = seat_from_.find(seat);
+            const bool before_seat = from != seat_from_.end() && made_frame != made_at_[seat].end() && made_frame->second < from->second + 2;
+            const bool joining = seat < joining_.size() && joining_[seat];
+            // (and this machine still catching up, or the packet from before its own seat's frame: the real ones of those
+            // frames went by before it made them)
+            const auto own = seat_from_.find(local_);
+            const bool own_before = (local_ < joining_.size() && joining_[local_]) ||
+                                    (own != seat_from_.end() && made_frame != made_at_[seat].end() && made_frame->second < own->second + 2);
+            if ((none && real_[seat].empty()) || before_seat || own_before || (none && joining)) { // (no machine sending that seat's nodes: an empty seat, or one still
+                // joining; or made before its player's seat frame, its machine catching up)
+                ++unsent_;
+                kept.erase(kept.begin());
+                continue;
+            }
+            ++unpaired_, ++(none ? unpaired_none_ : unpaired_other_);
+            if ((none ? unpaired_none_ : unpaired_other_) <= log_limit()) {
+                const auto at = made_at_[seat].find(s);
+                std::printf("node check: seat %zu's made packet %llu (count %u, frame %lld) never paired: %s\n", seat + 1,
+                            (unsigned long long)s, count_of(node), at == made_at_[seat].end() ? -1ll : static_cast<long long>(at->second) - 2,
+                            none ? "no real one of its number came"
+                                 : ("the real one of its number has count " + std::to_string(count_of(r->second)) +
+                                    (done_real_[seat].count(s) ? ", paired with another made one" : ", never compared")).c_str());
+                // (and their frame words and sequences, and the made one of the real one's count, if kept: pairs that
+                // the game's numbers should have made, what in them differs)
+                if (!none) {
+                    const auto w = [](const Node& n) { return uint32_t(n[0]) | uint32_t(n[1]) << 8 | uint32_t(n[2]) << 16 | uint32_t(n[3]) << 24; };
+                    std::printf("  made: frame word %08x, sequence %08x; real: frame word %08x, sequence %08x", w(node), seq_word(node),
+                                w(r->second), seq_word(r->second));
+                    for (const auto& [ms, mn] : kept)
+                        if (count_of(mn) == count_of(r->second)) {
+                            std::printf("; made %llu of its count: frame word %08x, sequence %08x", (unsigned long long)ms, w(mn), seq_word(mn));
+                            break;
+                        }
+                    std::printf("\n");
+                }
+            }
+            kept.erase(kept.begin());
+        }
+    }
+    void trim_real(std::size_t seat, uint64_t seq) {
+        trim(real_[seat], seq);
+        auto& done = done_real_[seat];
+        while (!done.empty() && *done.begin() + 2 * kKept < seq) done.erase(done.begin()); // (twice as long: trim_made asks)
     }
 
     mutable std::mutex lock_;
@@ -479,6 +644,14 @@ private:
     std::function<void(const std::string&, uint64_t)> problem_;
     std::function<uint64_t()> frame_now_;
     uint64_t back_to_ = ~0ull, backs_ = 0, patched_ = 0, replaced_ = 0;
+    uint64_t repaired_ = 0; // (compared by count: numbered apart)
+    uint64_t unread_sums_ = 0; // (bytes of sums no game reads: unread_sum)
+    uint64_t unpaired_ = 0;    // (made nodes gone with no real one of their numbers: trim_made)
+    uint64_t unpaired_none_ = 0, unpaired_other_ = 0; // (of those: no real node of that number at all; one of another count)
+    uint64_t unsent_ = 0, duplicates_ = 0; // (made nodes of seats no machine sends for: empty or joining; second copies)
+    std::map<std::size_t, uint64_t> seat_from_; // (seat_taken)
+    std::vector<bool> joining_; // (seats_joining)
+    std::map<std::size_t, std::set<uint64_t>> done_real_; // (seat: the real nodes compared already)
     std::array<uint64_t, kNodeBytes> counts_{};
     Totals totals_;
     // (step 2: the bytes of a record taken from the real ones when lasting; keep_: those known to be each cabinet's own,

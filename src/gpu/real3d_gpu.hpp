@@ -129,6 +129,9 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> changed_rows_;
 
     std::vector<uint8_t> vertices_, polygons_, viewports_, quads_; // this frame's, as uploaded
+    // (vertices_ and quads_ kept at the largest frame's size: this frame's the first vertex_bytes_, quad_bytes_;
+    // a vertex added is a copy, not the list grown and zeroed)
+    std::size_t vertex_bytes_ = 0, quad_bytes_ = 0;
     Cost cost_;
     std::vector<Group> groups_;
 };

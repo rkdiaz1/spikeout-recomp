@@ -2,6 +2,8 @@
 #include "runtime/state.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <stdexcept>
 
 namespace m3 {
@@ -43,6 +45,11 @@ uint32_t Real3d::model(uint32_t addr) const {
     const size_t at = size_t{addr} * 4;
     if (at + 3 >= vrom_.size()) return 0;
     // VROM as the ROM set loader lays it out (as Supermodel does): 32-bit words, little-endian.
+    if constexpr (std::endian::native == std::endian::little) {
+        uint32_t w;
+        std::memcpy(&w, vrom_.data() + at, 4);
+        return w;
+    }
     return uint32_t{vrom_[at]} | uint32_t{vrom_[at + 1]} << 8 | uint32_t{vrom_[at + 2]} << 16 | uint32_t{vrom_[at + 3]} << 24;
 }
 

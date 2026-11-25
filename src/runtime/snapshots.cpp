@@ -229,4 +229,43 @@ void Snapshots::restore(uint64_t frame, const std::function<void(State&)>& walk)
     }
 }
 
+bool Snapshots::adopt(uint64_t frame, const std::function<void(State&)>& walk, std::vector<std::vector<uint8_t>> regions,
+                      std::vector<uint8_t> small) {
+    std::vector<uint8_t> now_small;
+    const auto found = walk_regions(walk, now_small);
+    if (found.size() != regions.size()) return false;
+    for (std::size_t i = 0; i < found.size(); ++i)
+        if (found[i].second != regions[i].size()) return false;
+    frames_.clear();
+    regions_.clear();
+    watched_ = watched::available() && !compare_only_;
+    started_ = true, pages_last_ = 0;
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        if (watched_) watched::forget_written(found[i].first, found[i].second);
+        pages_last_ += (found[i].second + kPage - 1) / kPage;
+        regions_.push_back({found[i].first, found[i].second, std::move(regions[i])});
+    }
+    frames_.push_back(Frame{frame, std::move(small), {}});
+    return true;
+}
+
+bool Snapshots::state_at(uint64_t frame, std::vector<std::vector<uint8_t>>& regions, std::vector<uint8_t>& small) const {
+    std::size_t k = frames_.size();
+    for (std::size_t i = 0; i < frames_.size(); ++i)
+        if (frames_[i].frame == frame) k = i;
+    if (k == frames_.size()) return false;
+    // (the copies as at the last save, then every frame after `frame` undone, the newest first: each one's pages as they
+    // were before it)
+    regions.clear();
+    for (const Region& r : regions_) regions.push_back(r.copy);
+    for (std::size_t i = frames_.size(); i-- > k + 1;)
+        for (const Page& pg : frames_[i].pages) {
+            std::vector<uint8_t>& r = regions[pg.region];
+            std::memcpy(r.data() + static_cast<std::size_t>(pg.page) * kPage, pg.before.data(), pg.before.size());
+        }
+    small = frames_[k].small;
+    return true;
+}
+
+
 } // namespace m3

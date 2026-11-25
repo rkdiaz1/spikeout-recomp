@@ -99,6 +99,7 @@ inline std::optional<InputTable::Inputs> read_inputs(InputTable& table, std::siz
 inline bool backup_due(NetPlay& net, const backup::Maker& backups, const InputTable& inputs, bool rollback, std::size_t boards,
                        uint64_t frame) {
     return frame >= backups.frame() + backup::kEvery && net.session().seated() && // (a machine still joining sends none)
+           frame >= net.session().seat_from() && net.own_base != NetPlay::OwnBase::waiting && // (nor before its seat's first, JoinBases)
            (!rollback || (inputs.all_set(frame, boards) && inputs.wrong_from() > frame));
 }
 
@@ -107,29 +108,60 @@ struct BackupSent {
     std::size_t changes = 0, whole = 0; // (the sizes sent, unpacked)
 };
 
+// `must`: the seats this frame's backup is the answer to (board_by_backup: they asked for this board's state), sent it
+// even with their last still on its way. Held from them, the answer named a backup they never had: "backup of frame N
+// not here", their shadow not loaded, the whole room standing still (four one-board machines asking each other at a
+// coin, at neighbouring frames: Z:\Emu\tmp\ob-net.ps1 four-one, 78 s, 3 of 3; open since 2026-11-11). The order on
+// the way is the session's, so it goes after the last all the same.
 inline BackupSent backup_now(NetPlay& net, backup::Maker& backups, std::set<uint8_t>& bases, std::size_t boards, std::size_t index,
-                             m3::LinkRing* ring, uint64_t at, const std::function<void(m3::State&)>& walk) {
+                             m3::LinkRing* ring, uint64_t at, const std::function<void(m3::State&)>& walk,
+                             const std::vector<uint8_t>& must = {}) {
     BackupSent sent;
-    if (backups.frame() == at) return sent; // (taken already: the backups' turn this frame)
-    for (const uint8_t s : net.take_whole_wanted()) bases.erase(s);
+    if (backups.frame() == at) { // (taken already: the backups' turn this frame; one held then from a seat that asks
+        // now sent it, all the changes it hasn't had)
+        for (const uint8_t s : must)
+            if (backups.owes(s)) net.send_backup(at, backups.changes_for(s), {s});
+        return sent;
+    }
+    for (const uint8_t s : net.take_whole_wanted()) bases.erase(s), net.forget_seat_taken(s); // (its copy not made: the whole)
     backups.take(at, walk, ring ? ring->taken(index) : 0, ring ? ring->sent(index) : 0);
     if (ring) ring->abandon_cut(index); // (one board's state alone: no cut under way)
     sent.taken = true;
     std::vector<uint8_t> to_changes, to_whole;
     std::vector<uint8_t> to = net.session().backup_watchers(); // (spectators on one board too)
+    // (an open seat: none, and no base kept for it. Counted as sent one, a player who took it and caught up between two
+    // backups (never "joining" at one) had changes only, "not from one here", and asked for the whole board; a board
+    // request answered as "my backup" then waited behind those 6 MB, the room standing 10 s, 2026-11-23, issue22.ps1
+    // -OthersOne -JoinerOne -NoHistory, the early players' boards at frame 102,040)
+    const auto seats = net.session().seats();
     for (uint8_t s = 0; s < boards; ++s) // (a player still joining: none yet, Session::joining)
         if (s == index) continue;
-        else if (net.session().joining(s)) bases.erase(s); // (whole once seated)
+        else if (net.session().joining(s) || (s < seats.size() && seats[s].state == ::net::Session::SeatView::State::open))
+            bases.erase(s); // (whole once seated)
         else to.push_back(s);
     std::vector<uint8_t> owed; // (held back before: all the changes since the last it was sent, each its own)
     for (const uint8_t s : to) {
         if (!backups.changes_possible() || !bases.count(s)) {
+            // (a player who took its seat in a game in progress at frame S: its copy of this board is its own, run
+            // whole there (JoinBases), so not the whole board (~6 MB from each machine on its line at once, its inputs
+            // behind them: 11.5 s, 2026-11-23): nothing before S, then every page written since this board's last backup
+            // at or before S. None that old kept: whole as before; its machine asks for the whole if its copy wasn't made)
+            if (s < boards && backups.changes_possible())
+                if (const auto from = net.seat_taken_at(s)) {
+                    if (at < *from) continue; // (not yet)
+                    if (auto changes = backups.changes_since(*from)) {
+                        sent.changes += changes->size();
+                        net.send_backup(at, std::move(*changes), {s});
+                        backups.forget(s), bases.insert(s);
+                        continue;
+                    }
+                }
             backups.forget(s), to_whole.push_back(s), bases.insert(s);
             continue;
         }
         // (its last still on its way: none this time, the pages kept for its next; issue 30, a far player's line
         // at its slowest took a backup in more than the 2 s between them, and the rest to it waited behind them)
-        if (!net.backup_through(s)) backups.hold(s);
+        if (!net.backup_through(s) && std::find(must.begin(), must.end(), s) == must.end()) backups.hold(s);
         else (backups.owes(s) ? owed : to_changes).push_back(s);
     }
     for (const uint8_t s : owed) {
@@ -153,7 +185,12 @@ inline BackupSent backup_now(NetPlay& net, backup::Maker& backups, std::set<uint
 // One board a PC: the seats whose shadow of this board wants its state at the end of `frame`; leaving (`parting`, its
 // frame): every other one. One state for all of them, taken at the snapshot point (board_state_now).
 inline std::vector<uint8_t> board_requests(NetPlay& net, std::size_t boards, std::size_t index, uint64_t frame, bool parting) {
-    std::vector<uint8_t> seats = net.take_board_requests(frame);
+    std::vector<uint8_t> seats = net.take_board_requests(frame, boards);
+    for (const auto& [seat, at] : net.take_late_requests()) { // (too late: told at once, it asks again for a later frame)
+        std::printf("net: seat %u asked for this board's state at frame %llu, gone by here (frame %llu): told so\n", seat + 1u,
+                    static_cast<unsigned long long>(at), static_cast<unsigned long long>(frame));
+        net.session().send_board(seat, at, net.late_answer());
+    }
     if (parting)
         for (uint8_t s = 0; s < boards; ++s)
             if (s != index && std::find(seats.begin(), seats.end(), s) == seats.end()) seats.push_back(s);
@@ -208,6 +245,153 @@ inline void board_whole(NetPlay& net, m3::LinkRing* ring, std::size_t index, uin
 // One board here (from the hand-over): players leaving after a frame (their boards' states to come), players gone,
 // seats taken. `late` (gamerun's test NET_PARTINGS_LATE): each parting taken only once its frame has passed, as one held
 // up on the way.
+// A player joining a game in progress, its seat from frame S (the authority chooses a multiple of 32: rollback keeps those
+// frames, rollback::kAlways): every machine's copy of a board made as that board was at exactly S, not sent whole (~6 MB
+// from each machine on a line at once, the inputs behind them: 11.5 s, 2026-11-23). Both ways: the joiner's copies of the
+// other players' boards (their machines send every page written since their last backup at or before S: backup_now,
+// Maker::changes_since) and every other machine's copy of the joiner's board (the joiner's first backup is taken at S
+// itself, sent to none; its next are changes from it). A copy is made at the end of S if S is final there (every input of
+// it in, no guess wrong at or before it, not being run again: delay-based play always); else read out of rollback's kept
+// frame S once S is final, on that board's own thread (rollback::Linked::state_at, the same walk as the backups'), with
+// its ring counts as noted there. The joiner's own first backup at the end of S, after waiting there for every input of
+// S (the others, ahead of it, have sent them): taken then, or as S is run again after a wrong guess. Not had (the board not
+// run whole here at S, no rollback and S gone by when it was heard of, out of rollback's window): given up 300 frames
+// after S, its whole asked for (Session::want_backup) or sent, as before.
+// (Replaced 2026-11-23: copies at the first frame each machine had settled after S, which differ between machines: a
+// joiner's base after another's copy, its changes refused; and a joiner's frames settle last: given up on, 6 MB sent)
+struct JoinBases {
+    static constexpr uint64_t kEvery = 32;   // (ring counts noted at these frames: a seat's frame is one)
+    static constexpr uint64_t kGiveUp = 300; // (frames after S: past rollback's window, rollback::kWindow)
+
+    // Whether `frame`, run now (its end here, its first run or again after a wrong guess), is final: every input of it in,
+    // none guessed wrong at or before it. (Not rollback::Linked::settled: that asks of a frame run before, and while going
+    // back calls the frames run again not final till the catch-up ends, a run of S again with the right inputs among them)
+    static bool final_now(const rollback::Linked* rb, InputTable& inputs, std::size_t boards, uint64_t frame) {
+        return !rb || (inputs.all_set(frame, boards) && inputs.wrong_from() > frame);
+    }
+    static backup::Copy copy_of(uint64_t frame, uint64_t taken, uint64_t sent, std::vector<std::vector<uint8_t>> regions,
+                                std::vector<uint8_t> small) {
+        backup::Copy copy;
+        copy.frame = frame, copy.taken = taken, copy.sent = sent;
+        copy.regions = std::move(regions), copy.small = std::move(small);
+        return copy;
+    }
+
+    // This machine's own board's frame end (its thread): the copies expected, those not had given up on, its own first
+    // backup (`backups`, `bases`: backup_now's).
+    static void own_frame_end(NetPlay& net, std::size_t boards, std::size_t local, uint64_t frame, InputTable& inputs,
+                              const rollback::Linked* rb, backup::Maker& backups, std::set<uint8_t>& bases, recomp::Context& c,
+                              m3::LinkRing* ring, std::function<void(m3::State&)> walk) {
+        auto& keeper = net.keeper();
+        if (keeper.expecting(local)) keeper.expect_base(local, ~0ull); // (our own board: no copy of it here)
+        { // (the node check: which seats are open or still joining, now)
+            const auto seats = net.session().seats();
+            std::vector<bool> joining(seats.size());
+            for (std::size_t s = 0; s < seats.size(); ++s)
+                joining[s] = seats[s].state == ::net::Session::SeatView::State::open ||
+                             seats[s].state == ::net::Session::SeatView::State::joining ||
+                             (s == local && !net.session().seated()); // (ours: still catching up)
+            net.node_check().seats_joining(std::move(joining));
+        }
+        const uint64_t from = net.session().seat_from();
+        if (from && net.first_join_bases()) { // (joined in progress: our seat's frame known)
+            const auto seats = net.session().seats();
+            for (std::size_t s = 0; s < boards && s < seats.size(); ++s)
+                if (s != local && seats[s].state == ::net::Session::SeatView::State::playing) keeper.expect_base(s, from);
+            net.own_base = frame < from ? NetPlay::OwnBase::waiting : NetPlay::OwnBase::whole;
+            if (frame >= from)
+                std::printf("net: our seat's frame %llu heard of at frame %llu: our first backup whole, as before\n",
+                            static_cast<unsigned long long>(from), static_cast<unsigned long long>(frame));
+        }
+        // (our first backup at S, as the others' copies of our board: taken at the end of S if S is final when run, else
+        // read out of rollback once it is (S a multiple of kEvery: kept). Not waited for: waiting there for every input
+        // of S held the joiner's first frames of play ~220 ms, 2026-11-24's internet tests)
+        const auto own_taken = [&net, &bases, boards, local, from]() {
+            const auto seats = net.session().seats();
+            for (uint8_t s = 0; s < boards && s < seats.size(); ++s)
+                if (s != local && seats[s].state == ::net::Session::SeatView::State::playing) bases.insert(s);
+            net.own_base = NetPlay::OwnBase::taken;
+        };
+        if (frame % kEvery == 0) // (our counts, as each other board's: for a copy read out of rollback)
+            c.request_snapshot([&net, local, frame, ring](uint32_t) {
+                net.note_counts(static_cast<uint8_t>(local), frame, ring ? ring->taken(local) : 0, ring ? ring->sent(local) : 0);
+            });
+        if (from && frame == from && net.own_base == NetPlay::OwnBase::waiting && final_now(rb, inputs, boards, frame))
+            c.request_snapshot([&backups, from, local, ring, walk, own_taken](uint32_t) {
+                backups.take(from, walk, ring ? ring->taken(local) : 0, ring ? ring->sent(local) : 0);
+                if (ring) ring->abandon_cut(local); // (one board's state alone: no cut under way)
+                own_taken();
+                std::printf("net: our first backup at our seat's frame %llu, sent to none: each machine makes its own copy\n",
+                            static_cast<unsigned long long>(from));
+            });
+        else if (from && frame > from && net.own_base == NetPlay::OwnBase::waiting && rb && rb->settled(from)) {
+            std::vector<std::vector<uint8_t>> regions;
+            std::vector<uint8_t> small;
+            const auto counts = net.counts_at(static_cast<uint8_t>(local), from);
+            if (counts && rb->state_at(local, from, regions, small)) {
+                c.request_snapshot([&backups, from, frame, walk, own_taken, counts, regions = std::move(regions),
+                                    small = std::move(small)](uint32_t) mutable {
+                    if (!backups.adopt(from, walk, std::move(regions), std::move(small), counts->first, counts->second)) return;
+                    own_taken();
+                    std::printf("net: our first backup at our seat's frame %llu, from rollback's at frame %llu, sent to none: each "
+                                "machine makes its own copy\n",
+                                static_cast<unsigned long long>(from), static_cast<unsigned long long>(frame));
+                });
+            } else {
+                std::printf("net: our seat's frame %llu not kept here (%s): our first backup whole, as before\n",
+                            static_cast<unsigned long long>(from), counts ? "rollback's frames" : "its counts");
+                net.own_base = NetPlay::OwnBase::whole;
+            }
+        }
+        if (from && frame > from + kGiveUp && net.own_base == NetPlay::OwnBase::waiting) net.own_base = NetPlay::OwnBase::whole;
+        for (const auto& [s, at] : keeper.expected())
+            if (frame > at + kGiveUp) {
+                std::printf("net: board %zu: no copy of it made here at frame %llu: its whole asked for\n", s,
+                            static_cast<unsigned long long>(at));
+                net.base_missed(static_cast<uint8_t>(s));
+            }
+    }
+
+    // Each other board's frame end (its thread): its ring counts noted every kEvery frames; its copy, expected from frame
+    // S, made at the end of S if final there, else read out of rollback once S is final.
+    static void board_frame_end(NetPlay& net, std::size_t index, std::size_t local, uint64_t frame, InputTable& inputs,
+                                const rollback::Linked* rb, std::size_t boards, recomp::Context& c, m3::LinkRing* ring,
+                                std::function<void(m3::State&)> walk) {
+        if (index == local) return;
+        const auto from = net.keeper().expecting(index);
+        const bool at_from = from && frame == *from && final_now(rb, inputs, boards, frame);
+        if (frame % kEvery == 0 || at_from)
+            c.request_snapshot([&net, index, frame, ring, at_from, walk = std::move(walk)](uint32_t) {
+                const uint64_t taken = ring ? ring->taken(index) : 0, sent = ring ? ring->sent(index) : 0;
+                net.note_counts(static_cast<uint8_t>(index), frame, taken, sent);
+                if (!at_from || net.keeper().expecting(index) != frame) return;
+                m3::Snapshots snaps{0};
+                snaps.compare_only(true); // (as Maker: no write record of the OS taken from rollback)
+                snaps.save(frame, walk);
+                std::vector<std::vector<uint8_t>> regions;
+                for (std::size_t r = 0; r < snaps.regions(); ++r) regions.push_back(snaps.region(r));
+                net.keeper().set_base(index, copy_of(frame, taken, sent, std::move(regions), snaps.small()));
+                std::printf("net: board %zu: its copy made here at frame %llu (its machine sends changes, not the whole)\n", index,
+                            static_cast<unsigned long long>(frame));
+            });
+        else if (from && frame > *from && rb && rb->settled(*from)) { // (S final now: read out of rollback)
+            std::vector<std::vector<uint8_t>> regions;
+            std::vector<uint8_t> small;
+            const auto counts = net.counts_at(static_cast<uint8_t>(index), *from);
+            if (counts && rb->state_at(index, *from, regions, small)) {
+                net.keeper().set_base(index, copy_of(*from, counts->first, counts->second, std::move(regions), std::move(small)));
+                std::printf("net: board %zu: its copy made here at frame %llu from rollback's, at frame %llu (its machine sends "
+                            "changes, not the whole)\n",
+                            index, static_cast<unsigned long long>(*from), static_cast<unsigned long long>(frame));
+            } else {
+                std::printf("net: board %zu: frame %llu not kept here (%s): its whole asked for\n", index,
+                            static_cast<unsigned long long>(*from), counts ? "rollback's frames" : "its counts");
+                net.base_missed(static_cast<uint8_t>(index));
+            }
+        }
+    }
+};
+
 struct SeatNews {
     std::vector<std::pair<uint8_t, uint64_t>> held; // (late: the partings not taken yet)
 
@@ -256,8 +440,26 @@ struct Capture {
             capture_frame = frame + 2;
             armed = false;
         }
+        // (a joiner's state in chunks from several players, item 4: a helper takes every board's state at the host's frame,
+        // if not past it already (then the host sends those chunks too); one board here: none to give)
+        if (const uint64_t at = net.session().take_share_capture(); at && capture_frame == 0 && !armed && !alone && at > frame + 1)
+            capture_frame = at;
         if (capture_frame == 0 && !armed && net.take_state_request()) {
-            if (!alone || alone->all_whole()) {
+            // (every board here, a player waiting and others running every board: taken a little ahead, at a frame they
+            // take it too, each sending part of it (Session::share_capture: kShareAhead frames, time to hear of it))
+            if (!alone && net.session().hosting()) {
+                constexpr uint64_t kShareAhead = 45;
+                if (!net.session().share_capture(frame + kShareAhead).empty()) {
+                    capture_frame = frame + kShareAhead;
+                    return false;
+                }
+            }
+            // (every board whole here now: kept so until its state is taken. Not so, one was handed back to side runs before
+            // the capture's frame (asked 0.9 s after the request), never saved its part there: the capture never done, no
+            // state asked for after it taken, the next two joiners waiting for good, 2026-11-23, issue22.ps1 -OthersOne
+            // -JoinerOne; and one being handed back isn't whole for long)
+            if (!alone || (alone->all_whole() && !alone->handing_back())) {
+                if (alone) alone->want_whole(true), whole_until = frame + 10;
                 capture_at(frame + 2);
             } else if (alone->can_be_whole()) {
                 std::printf("%s: every board's state asked for at frame %llu: every board whole here first\n", tag,
@@ -271,12 +473,13 @@ struct Capture {
             }
         }
         bool saved = false;
-        if (alone && state_pending && capture_frame == 0 && alone->all_whole()) {
+        if (alone && state_pending && capture_frame == 0 && alone->all_whole() && !alone->handing_back()) {
             capture_at(frame + 2);
             state_pending = false, whole_until = frame + 10;
             saved = true;
         }
-        if (alone && whole_until && frame >= whole_until) alone->want_whole(false), whole_until = 0;
+        if (alone && whole_until && frame >= whole_until && capture_frame == 0 && !armed) // (once the state is taken)
+            alone->want_whole(false), whole_until = 0;
         return saved;
     }
 };
@@ -666,11 +869,26 @@ inline uint64_t set_up_one_board(one_board::Game& game, const OneBoardSetUp& u) 
     s.frame = stays.timing.frames();
     s.tasks = s.rules = true;
     s.slice = u.slice;
+    s.master_lead = one_board::master_lead(u.link);
     s.net = true;
     // (a shadow from the other machine's real board, asked of it: docs/netplay.md)
     NetPlay* net = &u.net;
     const char* tag = u.tag;
     s.ask_board = [net](std::size_t seat, uint64_t frame) { net->session().want_board(static_cast<uint8_t>(seat), frame); };
+    s.ask_at = [net](std::size_t seat, uint64_t frame) { return net->ask_at(static_cast<uint8_t>(seat), frame); };
+    s.seat_open = [net](std::size_t seat, uint64_t frame) { // (open, or a player joining it still catching up: nobody's cabinet yet, whose
+        // machine can't answer for it: one handed back then, its shadow asked of the joiner, the room stood 30 s, 2026-11-22)
+        using State = ::net::Session::SeatView::State;
+        const auto seats = net->session().seats();
+        return seat < seats.size() && (seats[seat].state == State::open || seats[seat].state == State::joining ||
+                                       // (taken from a frame not reached yet (a player still catching up, its cabinet the one it will
+                                       // be at): not its until then; treated as a player's, handed back and its machine asked for it, it
+                                       // answered with its whole board (6.4 MB) before its first backup, the room waiting 17 s, 2026-11-23)
+                                       [&] { const auto from = net->seat_taken_at(static_cast<uint8_t>(seat)); return from && frame < *from; }());
+    };
+    s.seated = [net, spectating = u.spectating](uint64_t frame) {
+        return spectating || (net->session().seated() && frame >= net->session().seat_from());
+    };
     s.wait_board = [net, tag](std::size_t seat, uint64_t frame) -> std::optional<one_board::RemoteBoard> {
         const auto t0 = std::chrono::steady_clock::now();
         auto packed = net->wait_board(static_cast<uint8_t>(seat), frame, std::chrono::seconds(30));
@@ -824,7 +1042,7 @@ inline uint64_t set_up_one_board(one_board::Game& game, const OneBoardSetUp& u) 
                 std::printf("%s: one board: the other cabinets' real packets put in as they come (the safety net)\n", tag);
             }
             u.ring->on_patch([net, local = u.local, at = &stays](std::size_t from, uint64_t seq, std::vector<uint8_t>& data) {
-                if (spoil && from != local && data.size() >= NodeCheck::kNodeBytes && !m3::ring_pass(data)) {
+                if (spoil && from != local && data.size() >= NodeCheck::kNodeBytes && !m3::link_extra(data)) {
                     if (spoiled.seq.load() == 0 && at->timing.frames() >= spoil) spoiled.from = from, spoiled.seq = seq;
                     const uint64_t first = spoiled.seq.load();
                     // (a link's data frames: every third number, between a sync frame and the ring's second pass)

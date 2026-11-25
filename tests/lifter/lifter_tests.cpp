@@ -5,6 +5,7 @@
 #include "lifter/program.hpp"
 #include "recomp/context.hpp"
 #include "recomp/frame_timing.hpp"
+#include "recomp/guest.hpp"
 #include "runtime/bus.hpp"
 #include "runtime/rom.hpp"
 
@@ -243,6 +244,7 @@ TEST_CASE("lifter: floating point") {
     CHECK_EQ(m.s.fpr[20], 0x7FF0000020000000u);               // lfs keeps the NaN signaling
     CHECK_EQ(m.bus.read32(kBuffer + 60), 0x7F800001u);        // and stfs gives it back unchanged
     CHECK_EQ(m.s.gpr[5] & 0x0F000000u, 0x08000000u);          // fcmpu cr1: 1.5 < 2.25
+    recomp::ops::flush_fprf(m.s);                             // (FPRF worked out when looked at: from outside, flushed)
     CHECK_EQ((m.s.fpscr >> 12) & 0x1Fu, 0x04u);               // FPRF: the last arithmetic (fadds f19), + normal
 }
 

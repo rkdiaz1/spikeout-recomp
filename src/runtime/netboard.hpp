@@ -41,9 +41,12 @@ class State;
 
 // The ring's second pass (CommBoard, CommBoardOptions::ring_second_pass): a packet of the emulation's own, not the
 // firmware's, starting with these 8 bytes, then the hop from the master (1 byte), the data frame's receive offset,
-// receive size and a node's part (2 bytes each, little-endian), then the stream as the sender passes it on.
-inline constexpr uint8_t kRingPassMagic[8] = {'M', '3', 'R', 'I', 'N', 'G', 'P', '2'};
-inline constexpr std::size_t kRingPassHeader = 15;
+// receive size and a node's part (2 bytes each, little-endian), the ring's cabinets (1 byte, 0 not known yet), the
+// master's logic count in its part of the exchange (4 bytes, little-endian; CommBoardOptions::count_matched), then the
+// stream as the sender passes it on.
+inline constexpr uint8_t kRingPassMagic[8] = {'M', '3', 'R', 'I', 'N', 'G', 'P', '3'};
+inline constexpr std::size_t kRingPassHeader = 20;
+inline constexpr std::size_t kRingPassNodes = 15, kRingPassCount = 16;
 inline bool ring_pass(const uint8_t* data, std::size_t size) {
     if (size < kRingPassHeader) return false;
     for (std::size_t i = 0; i < 8; ++i)
@@ -51,6 +54,21 @@ inline bool ring_pass(const uint8_t* data, std::size_t size) {
     return true;
 }
 inline bool ring_pass(const std::vector<uint8_t>& p) { return ring_pass(p.data(), p.size()); }
+
+// A cut-through ring's relay (CommBoardOptions::cut_through): the rest of a node's data frame after its own part, a
+// part at a time: these 8 bytes, the offset in the sender's stream (4 bytes, little-endian), then the bytes. (A node's
+// own part, the stream's start, goes as a plain packet.)
+inline constexpr uint8_t kStreamMagic[8] = {'M', '3', 'R', 'I', 'N', 'G', 'S', '1'};
+inline constexpr std::size_t kStreamHeader = 12;
+inline bool stream_relay(const uint8_t* data, std::size_t size) {
+    if (size < kStreamHeader) return false;
+    for (std::size_t i = 0; i < 8; ++i)
+        if (data[i] != kStreamMagic[i]) return false;
+    return true;
+}
+inline bool stream_relay(const std::vector<uint8_t>& p) { return stream_relay(p.data(), p.size()); }
+// Either: a packet of the emulation's own, not a node's data frame as the firmware sent it (tools skip these).
+inline bool link_extra(const std::vector<uint8_t>& p) { return ring_pass(p) || stream_relay(p); }
 
 // What the board sends its segments over: the next cabinet in the ring,
 // receiving from the previous one.
