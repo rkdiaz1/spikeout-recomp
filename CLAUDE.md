@@ -8,6 +8,53 @@
 - Build and test: `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`.
   CI builds with warnings as errors on Linux and macOS.
 
+## Smooth motion hand-off (2026-11-21, branch claude/smooth-camera)
+
+Read docs/smooth-motion.md first: the plan, every step's state, measurements and what was fixed. In short:
+- WHAT IT IS: pictures between the game's frames (the game itself stays at 57.524 Hz; drawing only, no effect on
+  network play, sync, saves or replays). Off by default: the menu's Display > Smooth motion (settings.ini
+  smooth_motion), or `spikeout --smooth`. It adds up to one frame of delay (the menu says so).
+- CODE: src/runtime/real3d_interp.* (m3::CameraBlend: prepare once a pair of frames, draw for each picture;
+  interpolate_camera is both; the old guessing m3::interpolate kept for comparison), src/games/spikeofe_camera.*
+  (the game's camera, its shake, cuts, the bodies placed in one jump, the bodies' RAM bone matrices; all read after
+  each frame, never written), src/games/spikeofe_models.* (model names from the player's ROM at start: which
+  models are one animation; the RAM table of each model's culling node), Real3dSceneBuilder::set_model_nodes (each
+  scene model gets the game's model number), tools/spikeout.cpp (the window: the pair cached, a picture each
+  refresh, the menu item), tools/gamerun.cpp (--interp, --interp-camera-only, --interp-guess, --interp-trace
+  FROM:TO prints each frame's camera, cuts and every class count).
+- LAYERS: (1) the camera from the game's own view matrix (cuts: driver change, a win pose's new shot, eye jump > 1,
+  turn > 20 degrees; the shake taken out and put back; some areas draw with the frame before's camera: both kept);
+  (2) other models by address + place within 3 units, flipbooks by animation (the ROM's names, never written in
+  our code), copies alike drawn as the newer frame, still floor models never moved; (3) characters: each limb tied
+  to (body, bone, model) by its turn equalling a RAM bone's, blended THROUGH THE SKELETON (turns relative to the
+  parent, chain rebuilt), skins with their bone plus their shape blended by vertex, shadows (many flat 5-polygon
+  models per body) moved with their bone across the ground, bodies put down in one jump drawn as the newer frame.
+- PROOF RULES (the owner's): smooth off must stay identical to main by GPU picture hashes (gamerun --load-state
+  build\bot\run2\bot-19700.state --frames 20700 --no-sound --renderer gpu --gpu-scale 2 --gpu-hash-frames
+  --screenshot X.png -> 03276d057442b487; bot-5600 --frames 6200 -> 3f89cabdb940a58a; main's own build gives the
+  same on 2026-11-23: the 2026-11-21 values, 6802950d37b121a4 and 5e596bef0a25394f, changed with this PC, likely its
+  GPU driver; check main's build when they differ). Halfway pictures:
+  gamerun --interp --renderer gpu --gpu-scale 1 --screenshot X.png --shot-every 1 [--shot-from N] writes
+  X-N-before/-mid/N.png (scale 1 only). LOOK AT CHARACTERS ENLARGED: a halfway picture at full size hid a broken White.
+  Ghosts: Z:\Emu\tmp\ghostscore.ps1 -Dir D -From A -To B scores each halfway picture by its pixels outside both
+  neighbours' range and lists the spikes (outside the repository). The owner's play, recorded (spikeout --record F)
+  and replayed (gamerun --replay F), reproduces what they saw exactly.
+- EFFECTS (2026-11-23): rebuilt as the game draws them from its effect records (docs/smooth-motion.md "EFFECTS,
+  REBUILT"); SPIKEOUT_INTERP_DEBUG=1 prints each one's match and the "effect check" (rebuilt for the frame before
+  against where the game drew it: all within 0.001 on stage 1, stage 3 and the owner's recording).
+- TEST STATES (git-ignored, the main checkout's build/): build\bot\run2\bot-19700 (docks), -22700 (Phoenix's
+  deck), -20600 (helicopter), run1\bot-12800 (coast car park), gate2\bot-15500, bot-5600 (stage 1, shakes at
+  5803 and 8323), fullrec3\owner-62721.state + build\linkstudy\seg3\inputs.bin (seg3 replayed exactly: a crowd of
+  identical enemies at 63575-63930, enemy made 63581), fullrec4\bot-189691 (the ending's shots), fullrec4
+  103303-152340 (stage 4). The owner's state with a fight: Z:\Emu\tmp\smooth\owner\o-20745.state.
+- PRIVATE (never commit): the decompile's answers Z:\Emu\spikeout-private\asm\SMOOTH-MOTION-ANSWERS.md (questions
+  in SMOOTH-MOTION-ASKS.md, rounds 1-3; the decompile session answers there).
+- OPEN: the owner's window test of this latest build (characters through the skeleton, skin shapes); the
+  merry-go-round never on screen in the bot's run; VRR pacing (115/230 a second) and present-time weights need a
+  VRR screen and a present timer SDL doesn't give; no 240 Hz screen here; step 5 (true in-between poses from the
+  motion curves) not started. DON'T merge with the speed work (another session's, unfinished): the owner says
+  when; both touch real3d_scene.*, gamerun.cpp, spikeout.cpp.
+
 ## Hand-off (2026-11-08): read docs/handoff.md FIRST
 
 The current state, the owner's plan (1. internet case `mixed`, 2. one shared network set-up for gamerun and the
@@ -610,8 +657,9 @@ a frame at scale 4), the settings menu and widescreen all work.
   ~4100-4450 on main's link model). gamerun --dump-layers also writes the
   tile generator's own sides (-sideabove/-sidebelow, -ownabove/-ownbelow,
   marked rows red).
-- Smooth motion is no longer read from or saved to settings.ini (only
-  `--smooth`), as it's still being tested.
+- Smooth motion (rebuilt 2026-11-20/21 on branch claude/smooth-camera, docs/smooth-motion.md: the game's camera,
+  models by place, flipbooks by the ROM's names, characters by their RAM bones, shadows, skins, a picture each
+  refresh) is in the menu again: Display > Smooth motion, off by default, kept in settings.ini (smooth_motion).
 - Main is the LAN branch's line since 2026-10-28 (claude/lan-play-f60b31
   fast-forwarded onto main after the host-change fixes; single-player
   checked the same: sound, tile RAM and backup RAM byte for byte over

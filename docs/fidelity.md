@@ -392,6 +392,27 @@ the clear changes the 16:9 pictures from the ranking on only, the fade the
 ranking's only, the 4:3 pictures none; the linking screen's pictures the
 same as before, both cabinets'.
 
+### Checked: the parked van's wheels change texture (owner, 2026-11-21)
+
+Stage 1: after the dock gate is broken, on the stairs looking back at the
+car park, the parked truck's wheels change their texture as the camera
+moves (a striped gold look, or dark tyres). Seen with smooth motion off
+too. **Supermodel shows the same: the game's own look, left as it is.**
+Compared with the 3D frame dumps (docs/frame-dump.md), both ways:
+- Our scene in Supermodel: the owner's state at frame 18328, dumped every
+  3 frames over 18330-18420 (31 dumps) as the camera turns, drawn at 4x by
+  our GPU renderer and by Supermodel 77d28ee: the same models (568), and
+  in the truck's area under 0.01% of the pixels differ by more than 24
+  (edges only); the wheels change alike in both.
+- Supermodel's own scene: the owner played to the same place in the
+  patched Supermodel (SUPERMODEL_DUMP_3D=1, three Alt+S dumps): its own
+  game shows the striped wheel in two shots and dark tyres in the third,
+  as ours does; each dump drawn by both renderers alike (the same 471,
+  462, 464 models).
+Only a real Model 3 could still differ, where the two emulators agree.
+The dumps hold the ROM's models and textures: kept outside the repository
+(Z:\Emu\tmp\van), never committed.
+
 ## Sound board
 
 `m3::SoundBoard` and `m3::Scsp` are adapted from Supermodel's SCSP (ElSemi's,

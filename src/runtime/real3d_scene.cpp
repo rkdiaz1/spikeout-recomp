@@ -209,9 +209,17 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
     scene.stats = {};
     scene.block_culled = mem.block_culling();
     scene.fog_over_nothing = fog_over_nothing_;
+    scene.game_camera = {};
+    scene.game_camera_before = {};
+    scene.placed.clear();
+    scene.bodies.clear();
+    scene.bodies_before.clear();
+    scene.effects.clear();
+    scene.effects_before.clear();
     models_.clear();
     viewport_models_.clear();
     visits_ = 0;
+    model_number_ = Real3dScene::kNoModel;
     if (scene.block_culled) return; // no 3D: Supermodel clears to white, over the layers below
     walk_viewports(0x800000);
     // The polygons, priority by priority.
@@ -227,6 +235,7 @@ void Real3dSceneBuilder::build(const Real3d& mem, Real3dScene& scene) {
                     model.matrix = ref.matrix;
                     model.ancestors = ref.ancestors;
                     model.depth = ref.depth;
+                    model.number = ref.number;
                     model.first_polygon = static_cast<uint32_t>(scene.polygons.size());
                     decode_model(v, ref);
                     model.polygon_count = static_cast<uint32_t>(scene.polygons.size()) - model.first_polygon;
@@ -366,6 +375,19 @@ void Real3dSceneBuilder::walk_viewports(uint32_t addr) {
         coord_sys_.m[12] = coord_sys_.m[13] = coord_sys_.m[14] = 0;
         coord_sys_.m[15] = 1;
 
+        // Smooth motion: the first node's matrix, the viewport's camera (read
+        // only: the walk below takes it again as it goes).
+        if (const uint32_t first = node[0x02]; (first & 0xFFFFFF) != 0 && ((first >> 24) & 5) == 0)
+            if (const uint32_t* top = mem_->culling_ptr(first & 0xFFFFFF); top && (top[0] & 3) != 0 && !(top[0] & 0x10))
+                if (const uint32_t index = top[3] & 0xFFF; index != 0) {
+                    const Mat4 saved = matrix_;
+                    multiply_matrix(index);
+                    vp.camera = matrix_;
+                    matrix_ = saved;
+                    vp.camera_index = static_cast<int>(index);
+                    for (uint32_t i = 0; i < 12; ++i) vp.camera_words[i] = mem_->culling(matrix_base_ + index * 12 + i);
+                }
+
         path_ = (2166136261u ^ addr) * 16777619u; // each viewport's tree its own
         ancestors_.assign(1, path_);
         if (!(node[0] & 0x20) && vp.width > 0 && vp.height > 0 && cv != 0 && cw != 0) walk_pointer(node[0x02], 0);
@@ -440,6 +462,9 @@ void Real3dSceneBuilder::draw_node(uint32_t addr, const uint32_t* node, int dept
     const Attribs saved_attribs = attribs_;
     const Mat4 saved_matrix = matrix_;
     const uint32_t saved_path = path_;
+    const uint32_t saved_number = model_number_;
+    if (model_nodes_)
+        if (const auto it = model_nodes_->find(addr & 0xFFFFFF); it != model_nodes_->end()) model_number_ = it->second;
     path_ = (path_ ^ addr) * 16777619u;
     ancestors_.push_back(path_);
     if (node[2] & 0x8000) {
@@ -521,6 +546,7 @@ void Real3dSceneBuilder::draw_node(uint32_t addr, const uint32_t* node, int dept
     matrix_ = saved_matrix;
     attribs_ = saved_attribs;
     path_ = saved_path;
+    model_number_ = saved_number;
     ancestors_.pop_back();
 }
 
@@ -532,6 +558,7 @@ void Real3dSceneBuilder::add_model(uint32_t addr) {
     ModelRef m;
     m.matrix = matrix_;
     m.addr = addr;
+    m.number = model_number_;
     m.path = path_;
     m.depth = static_cast<uint8_t>(std::min<size_t>(ancestors_.size(), Real3dScene::kAncestors));
     std::copy_n(ancestors_.begin(), m.depth, m.ancestors.begin());

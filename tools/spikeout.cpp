@@ -64,8 +64,10 @@
 // --load-state FILE runs on from it); F10 doesn't load those.
 //
 // Smooth motion (the menu, or --smooth; the GPU 3D only): a picture each
-// refresh of the display (at most 120 a second, timed as the game's frames
-// are), its 3D placed between the last two frames (m3::interpolate) by an
+// refresh of the display (whatever its rate, timed as the game's frames
+// are), its 3D placed between the last two frames (m3::interpolate_camera:
+// the game's camera blended, docs/smooth-motion.md; SPIKEOUT_SMOOTH_GUESS=1
+// the models matched between frames, m3::interpolate) by an
 // even display clock a frame behind the game's, pulled a tenth of the way to
 // it each picture (after vf3-recomp's: the pictures drawn when a pass
 // happened to run would show the motion unevenly). The 2D is the newest
@@ -84,6 +86,8 @@
 // Built only when CMake's SPIKEOUT_ROM_DIR is set (it links the recompiled
 // game).
 #include "games/games.hpp"
+#include "games/spikeofe_camera.hpp"
+#include "games/spikeofe_models.hpp"
 #include "recomp/context.hpp"
 #include "recomp/frame_timing.hpp"
 #include "runtime/bus.hpp"
@@ -164,6 +168,120 @@ namespace {
 constexpr int kWidth = m3::TilegenRenderer::kWidth, kHeight = m3::TilegenRenderer::kHeight;
 constexpr std::size_t kMaxBoards = 4;
 constexpr uint32_t kTurnLines = 8; // display lines a linked board runs before passing the turn on
+
+// The calling thread's name, for debuggers, crash dumps and per-thread measurements (Windows 10 1607 and later:
+// looked up at run time; elsewhere nothing).
+void name_this_thread([[maybe_unused]] const wchar_t* name) {
+#ifdef _WIN32
+    using Set = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const Set set = [] {
+        HMODULE k = GetModuleHandleW(L"kernel32.dll");
+        return k ? reinterpret_cast<Set>(reinterpret_cast<void*>(GetProcAddress(k, "SetThreadDescription"))) : nullptr;
+    }();
+    if (set) set(GetCurrentThread(), name);
+#endif
+}
+
+// Smooth motion's matching (m3::CameraBlend::prepare: which model in one frame is which in the next) on a thread of
+// its own, so no picture holds it (~1.7 ms in a fight: at 240 a second, a picture has 4.2). The window hands each new
+// frame's 3D scene over (`submit`, a copy, as it kept one before); the thread keeps the frame before, matches the pair
+// and publishes both frames with their match (a Pair: the match points into its own two scenes). A picture takes the
+// newest published (`take`) and blends from it only if it's for the frames on screen; until then the newer frame is
+// drawn as it is. The window never waits for it.
+class SmoothMatcher {
+public:
+    struct Pair {
+        m3::Real3dScene a, b;
+        m3::CameraBlend blend;
+        bool on = false;                       // blends (false: a cut, or no frame before)
+        uint64_t before = ~0ull, number = ~0ull, version = ~0ull; // the frames' numbers and the newer's version
+        double seconds = 0;                    // the matching's time
+    };
+    SmoothMatcher() : thread_([this] { run(); }) {}
+    ~SmoothMatcher() {
+        {
+            std::lock_guard guard(lock_);
+            quit_ = true;
+        }
+        wake_.notify_one();
+        thread_.join();
+    }
+    SmoothMatcher(const SmoothMatcher&) = delete;
+    SmoothMatcher& operator=(const SmoothMatcher&) = delete;
+    // A new frame (`models`: models matched too, not only the camera). A frame not yet taken is replaced: only the
+    // newest is matched.
+    void submit(const m3::Real3dScene& scene, uint64_t number, uint64_t version, bool models) {
+        auto job = std::make_unique<Job>();
+        job->scene = scene;
+        job->number = number, job->version = version, job->models = models;
+        {
+            std::lock_guard guard(lock_);
+            job_ = std::move(job);
+        }
+        wake_.notify_one();
+    }
+    // The newest published pair, if one came since the last take (the one before is given back to be reused).
+    void take(std::unique_ptr<Pair>& current) {
+        std::lock_guard guard(lock_);
+        if (!ready_) return;
+        spare_ = std::move(current);
+        current = std::move(ready_);
+    }
+    // The matching's time for the frames since asked (s), and how many
+    double take_seconds(uint64_t& pairs) {
+        std::lock_guard guard(lock_);
+        const double s = seconds_;
+        pairs = pairs_;
+        seconds_ = 0, pairs_ = 0;
+        return s;
+    }
+
+private:
+    struct Job {
+        m3::Real3dScene scene;
+        uint64_t number = 0, version = 0;
+        bool models = true;
+    };
+    void run() {
+        name_this_thread(L"smooth matching");
+        m3::Real3dScene held; // the frame before (the last one matched)
+        uint64_t held_number = ~0ull;
+        for (;;) {
+            std::unique_ptr<Job> job;
+            std::unique_ptr<Pair> pair;
+            {
+                std::unique_lock guard(lock_);
+                wake_.wait(guard, [&] { return quit_ || job_; });
+                if (quit_) return;
+                job = std::move(job_);
+                pair = std::move(spare_);
+            }
+            if (!pair) pair = std::make_unique<Pair>();
+            const auto start = std::chrono::steady_clock::now();
+            pair->b = std::move(job->scene);
+            pair->number = job->number, pair->version = job->version;
+            const bool follows = held_number != ~0ull && held_number + 1 == job->number;
+            pair->before = follows ? held_number : ~0ull;
+            if (follows) pair->a = std::move(held);
+            held = pair->b; // (the next pair's frame before)
+            held_number = job->number;
+            pair->on = follows && pair->blend.prepare(pair->a, pair->b, job->models);
+            pair->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::lock_guard guard(lock_);
+            seconds_ += pair->seconds;
+            ++pairs_;
+            ready_ = std::move(pair);
+        }
+    }
+    std::mutex lock_;
+    std::condition_variable wake_;
+    std::unique_ptr<Job> job_;
+    std::unique_ptr<Pair> ready_, spare_;
+    double seconds_ = 0;
+    uint64_t pairs_ = 0;
+    bool quit_ = false;
+    std::thread thread_; // (last: started once the rest is made)
+};
 
 struct Stop {}; // thrown from the frame callback to end the run
 
@@ -1112,6 +1230,10 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         }
     };
     m3::Real3dSceneBuilder builder;
+    m3::games::SpikeoutCamera game_camera;
+    m3::games::SpikeoutModels model_names; // which models make one animation (smooth motion)
+    model_names.load(roms);
+    builder.set_model_nodes(model_names.nodes());
     builder.set_fog_over_nothing(shared.fog_over_nothing);
     m3::WideLayer wide_bottom, wide_top;
     Shared::GpuFrame gpu_frame;
@@ -1121,7 +1243,10 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
     auto build_gpu_frame = [&] {
         built_extend = shared.extend;
         builder.set_extend(built_extend);
+        model_names.refresh(bus.ram());
         builder.build(bus.real3d(), gpu_frame.scene);
+        model_names.tag(gpu_frame.scene);
+        game_camera.read(bus.ram(), gpu_frame.scene); // (smooth motion's camera)
         gpu_frame.extend = builder.extend();
         gpu_frame.bottom.assign(tilegen.bottom().begin(), tilegen.bottom().end());
         gpu_frame.top.assign(tilegen.top().begin(), tilegen.top().end());
@@ -3031,8 +3156,21 @@ int main(int argc, char** argv) {
         int move_x = 0, move_y = 0;
         std::chrono::steady_clock::time_point arrived{}, last_picture{}, due{};
         double clock = 0;
-        double picture_seconds = 1.0 / 60; // the display's refresh, at most 120 a second
+        double picture_seconds = 1.0 / 60; // the display's refresh
         double picture_average = 1.0 / 60; // the pictures' time apart, averaged: the clock's step
+        // The two frames matched once, on the matching's own thread (SmoothMatcher, made when first needed), and
+        // the pair the pictures blend from (its own copies of the two frames and their match).
+        std::unique_ptr<SmoothMatcher> matcher;
+        std::unique_ptr<SmoothMatcher::Pair> pair;
+        // Half the display's rate when it can't keep up (each picture then two refreshes: even): refreshes missed
+        // (a picture more than 1.5 refreshes after the last) over 5% of them for 2 seconds in a row, on a display
+        // of 119 Hz or more (half still 60 or so). Full rate tried again after `back_off` seconds, doubled (up to
+        // 160) each time it has to halve again within a minute of trying.
+        bool halved = false;
+        int missed = 0, missing_seconds = 0;
+        double back_off = 10;
+        std::chrono::steady_clock::time_point full_again{}, full_since{};
+        double period() const { return picture_seconds * (halved ? 2 : 1); }
     } smooth;
     // Texture RAM as the game thread's rows have brought it (`textures`: some
     // came); a renderer made afresh takes it whole (its version differs), then
@@ -3193,7 +3331,10 @@ int main(int argc, char** argv) {
             shared.one_board_wanted = shared.one_board == Shared::OneBoard::always;
         }
         for (std::size_t i = 0; i < boards; ++i)
-            games.emplace_back([&, i] { run_game(roms, i, ring.get(), *turns, shared); });
+            games.emplace_back([&, i] {
+                name_this_thread(i == 0 ? L"game" : L"game (another board)");
+                run_game(roms, i, ring.get(), *turns, shared);
+            });
     };
     auto stop_games = [&] {
         shared.quit = true;
@@ -3305,6 +3446,8 @@ int main(int argc, char** argv) {
     const bool smooth_log = cli_smooth_log || std::getenv("SPIKEOUT_SMOOTH_LOG") != nullptr;
     double smooth_log_clock = 0, smooth_log_sum = 0, smooth_log_sq = 0, smooth_log_draw = 0, smooth_log_present = 0,
            smooth_log_longest = 0;
+    double smooth_log_blend = 0;       // (of the 3D's time: blending)
+    uint64_t smooth_log_unmatched = 0; // (pictures drawn as the frame before: their pair not matched yet)
     uint64_t smooth_log_n = 0, smooth_log_between = 0;
     // The arcade's test and service buttons, held for a moment from the menu.
     auto test_until = std::chrono::steady_clock::time_point{}, service_until = test_until;
@@ -3944,6 +4087,16 @@ int main(int argc, char** argv) {
                                shared.quads = settings.quads;
                                changed();
                                set_up_3d();
+                           }});
+        p.items.push_back({"Smooth motion",
+                           "A picture each refresh of your screen, the 3D placed between the game's frames, so motion "
+                           "looks smooth on a fast screen (100 Hz and more). The game still runs at the arcade's 57.5 "
+                           "frames a second. Adds up to one frame (17 ms) of delay. GPU renderer only. Off: the "
+                           "arcade's own pictures.",
+                           [&] { return on_off(settings.smooth_motion); },
+                           [&](int) {
+                               settings.smooth_motion = !settings.smooth_motion;
+                               changed();
                            }});
         p.items.push_back({"3D renderer",
                            "Which part of your computer draws the 3D: the graphics card (GPU), or the processor "
@@ -5695,7 +5848,15 @@ int main(int argc, char** argv) {
 
     uint64_t frames_seen = 0;
     uint64_t loops_run = 0;
+    // Tests (SPIKEOUT_SMOOTH_LOG): a pass of the loop that takes over 100 ms, its steps' times printed
+    std::vector<std::pair<const char*, std::chrono::steady_clock::time_point>> loop_laps;
+    auto lap = [&](const char* step) {
+        if (smooth_log) loop_laps.emplace_back(step, std::chrono::steady_clock::now());
+    };
+    name_this_thread(L"window");
     while (running) {
+        loop_laps.clear();
+        lap("start");
         if (++loops_run == 2) start_went_well(); // (the first picture shown: an update to this version went well)
 #ifdef SPIKEOUT_GPU
         // (F12's picture, drawn again by the presenter at the last present: written on a thread of its own, the game not
@@ -5752,15 +5913,18 @@ int main(int argc, char** argv) {
             // (each picture's time a refresh after the last's; fallen behind
             // by more than a refresh: from now)
             const auto period =
-                std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(smooth.picture_seconds));
+                std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(smooth.period()));
             smooth.due += period;
             if (smooth.due + period < clock::now()) smooth.due = clock::now();
             const auto due = smooth.due;
             const auto rest = due - clock::now() - std::chrono::milliseconds(1);
             if (rest > clock::duration::zero())
                 SDL_DelayPrecise(static_cast<Uint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(rest).count()));
+            lap("before the wait");
             while (clock::now() < due) std::this_thread::yield();
+            lap("waited");
             std::lock_guard<std::mutex> guard(shared.lock);
+            lap("the game's lock");
             frames_seen = shared.frames_done;
         } else {
             // The keys and pads read just before the game's next frame starts (Shared::next_due; a little before: the
@@ -6962,18 +7126,25 @@ int main(int argc, char** argv) {
 #ifdef SPIKEOUT_GPU
             // A newer frame for the GPU to draw (the swap leaves the older one
             // in its place, for the game thread to fill next).
+            lap("events, screens");
             const bool remade = shared.gpu_frame.number == gpu_frame.number && shared.gpu_frame.version > gpu_frame.version;
             if (shared.gpu_3d && (shared.gpu_frame.number > gpu_frame.number || remade)) {
                 if (remade) drawn_number = 0; // (its 3D drawn again)
                 const bool keep = settings.smooth_motion && !remade;
+                static const bool guess = std::getenv("SPIKEOUT_SMOOTH_GUESS") != nullptr; // (the old matching: below)
                 if (keep) { // kept, to draw between it and the newest
-                    smooth.before = gpu_frame.scene;
+                    if (guess) smooth.before = gpu_frame.scene; // (else the matching thread keeps it)
                     smooth.before_number = gpu_frame.number;
                     smooth.before_bottom = gpu_frame.bottom;
                     smooth.arrived = now;
                 }
                 const uint32_t sky_before = gpu_frame.tile_scroll[3];
                 std::swap(gpu_frame, shared.gpu_frame);
+                if (settings.smooth_motion && !guess) { // to the matching thread (SPIKEOUT_SMOOTH_CAMERA_ONLY=1: the
+                    static const bool camera_only = std::getenv("SPIKEOUT_SMOOTH_CAMERA_ONLY") != nullptr; // camera only)
+                    if (!smooth.matcher) smooth.matcher = std::make_unique<SmoothMatcher>();
+                    smooth.matcher->submit(gpu_frame.scene, gpu_frame.number, gpu_frame.version, !camera_only);
+                }
                 // The sky's move: layer 3 below the 3D, its scroll the register's (not a value a line).
                 smooth.move_x = smooth.move_y = 0;
                 const uint32_t sky = gpu_frame.tile_scroll[3];
@@ -6989,6 +7160,7 @@ int main(int argc, char** argv) {
                 }
                 shared.texture_rows.clear();
             }
+            lap("new frame taken");
 #endif
             const bool all_reported = shared.netplay ? (reported & (1u << shared.local)) != 0 : reported == (1u << boards) - 1;
             if (max_frames && all_reported) { // a test run: keep the last frames and close
@@ -7013,6 +7185,8 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
             }
             SDL_SetWindowTitle(window, title);
+            const int missed = smooth.missed; // (smooth motion's refreshes missed in this second)
+            smooth.missed = 0;
 #ifdef SPIKEOUT_GPU
             // Show FPS: the frames the window showed (the title: the frames the game ran).
             // With smooth motion: the pictures, each between two frames.
@@ -7024,25 +7198,66 @@ int main(int argc, char** argv) {
                 menu.set_fps(shown_rate);
             }
             // The display's refresh (it may have moved to another): smooth
-            // motion's pictures, at most 120 a second.
-            if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)))
-                smooth.picture_seconds = 1.0 / std::clamp(mode->refresh_rate > 0 ? static_cast<double>(mode->refresh_rate) : 60.0,
-                                                          30.0, 120.0);
+            // motion's pictures, one a refresh, whatever the rate (no cap of
+            // our own: a cap that isn't a whole part of the rate shows some
+            // pictures twice; docs/smooth-motion.md "No frame limit setting").
+            // Tests: SPIKEOUT_SMOOTH_HZ=N draws N a second.
+            static const double forced_hz = [] {
+                const char* v = std::getenv("SPIKEOUT_SMOOTH_HZ");
+                return v ? std::atof(v) : 0.0;
+            }();
+            if (forced_hz > 0) smooth.picture_seconds = 1.0 / std::clamp(forced_hz, 30.0, 1000.0);
+            else if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)))
+                smooth.picture_seconds =
+                    1.0 / std::max(mode->refresh_rate > 0 ? static_cast<double>(mode->refresh_rate) : 60.0, 30.0);
+            // Half the rate when the pictures can't keep up (Smooth::halved), full again after a while.
+            if (!smoothing) smooth.halved = false, smooth.missing_seconds = 0;
+            else if (!smooth.halved) {
+                static const bool always_full = std::getenv("SPIKEOUT_SMOOTH_FULL") != nullptr; // (tests: never halved)
+                const bool may_halve = smooth.picture_seconds <= 1.0 / 119 && !always_full;
+                if (may_halve && missed * 100 > 5 * static_cast<int>(std::max<uint64_t>(pictures_shown, 1))) {
+                    if (++smooth.missing_seconds >= 2) {
+                        if (smooth.full_since != std::chrono::steady_clock::time_point{} &&
+                            now - smooth.full_since < std::chrono::seconds(60))
+                            smooth.back_off = std::min(smooth.back_off * 2, 160.0); // (halved again soon after)
+                        else smooth.back_off = 10;
+                        smooth.halved = true;
+                        smooth.missing_seconds = 0;
+                        smooth.full_again = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                      std::chrono::duration<double>(smooth.back_off));
+                        std::printf("smooth motion: half the display's rate (%.0f pictures a second): %d refreshes missed "
+                                    "in a second; full again in %.0f s\n", 0.5 / smooth.picture_seconds, missed, smooth.back_off);
+                        std::fflush(stdout);
+                    }
+                } else smooth.missing_seconds = 0;
+            } else if (now >= smooth.full_again) {
+                smooth.halved = false;
+                smooth.full_since = now;
+                std::printf("smooth motion: the display's full rate again (%.0f pictures a second)\n", 1.0 / smooth.picture_seconds);
+                std::fflush(stdout);
+            }
 #endif
             if (smooth_log && smoothing && smooth_log_n > 1) {
                 const double mean = smooth_log_sum / static_cast<double>(smooth_log_n);
                 const double spread = std::sqrt(std::max(0.0, smooth_log_sq / static_cast<double>(smooth_log_n) - mean * mean));
                 const double pictures = static_cast<double>(std::max<uint64_t>(pictures_shown, 1));
-                std::fprintf(smooth_log_file, "smooth motion: %llu pictures (%llu between frames) a second; the clock %.3f frames a picture, "
-                            "spread %.3f; a picture %.2f ms drawing the 3D, %.2f presenting, %.1f apart at most; the display "
-                            "%.1f Hz; frames %llu; %zu polygons, render scale %d\n",
+                uint64_t pairs = 0;
+                const double match_seconds = smooth.matcher ? smooth.matcher->take_seconds(pairs) : 0;
+                std::fprintf(smooth_log_file, "smooth motion: %llu pictures (%llu between frames, %llu of them the frame before: their match not ready) a "
+                            "second%s; refreshes missed %d; the clock %.3f frames a picture, spread %.3f; a picture %.2f ms "
+                            "drawing the 3D (%.2f blending), %.2f presenting, %.1f apart at most; matching (its own thread) "
+                            "%.2f ms a frame; the display %.1f Hz; frames %llu; %zu polygons, render scale %d\n",
                             static_cast<unsigned long long>(pictures_shown), static_cast<unsigned long long>(smooth_log_between),
-                            mean, spread, 1000.0 * smooth_log_draw / pictures, 1000.0 * smooth_log_present / pictures,
-                            1000.0 * smooth_log_longest, 1.0 / smooth.picture_seconds,
+                            static_cast<unsigned long long>(smooth_log_unmatched), smooth.halved ? " (half rate)" : "", missed,
+                            mean, spread, 1000.0 * smooth_log_draw / pictures, 1000.0 * smooth_log_blend / pictures,
+                            1000.0 * smooth_log_present / pictures, 1000.0 * smooth_log_longest,
+                            pairs ? 1000.0 * match_seconds / static_cast<double>(pairs) : 0.0, 1.0 / smooth.picture_seconds,
                             static_cast<unsigned long long>(fps_frames), gpu_frame.scene.polygons.size(), draw_scale);
                 std::fflush(smooth_log_file);
             }
             smooth_log_sum = smooth_log_sq = smooth_log_draw = smooth_log_present = smooth_log_longest = 0;
+            smooth_log_blend = 0;
+            smooth_log_unmatched = 0;
             smooth_log_n = smooth_log_between = 0;
             fps_start = now;
             fps_frames = 0;
@@ -7067,7 +7282,8 @@ int main(int argc, char** argv) {
                     const double target = newest - 1 + std::chrono::duration<double>(at - smooth.arrived).count() / kFrame;
                     const double apart = std::chrono::duration<double>(at - smooth.last_picture).count();
                     if (smooth_log && apart < 1) smooth_log_longest = std::max(smooth_log_longest, apart);
-                    if (apart < 3 * smooth.picture_seconds) smooth.picture_average += 0.05 * (apart - smooth.picture_average);
+                    if (apart < 3 * smooth.period()) smooth.picture_average += 0.05 * (apart - smooth.picture_average);
+                    if (apart > 1.5 * smooth.period() && apart < 0.25) ++smooth.missed; // (a refresh missed; not a pause)
                     smooth.clock += smooth.picture_average / kFrame;
                     smooth.clock = std::fabs(smooth.clock - target) > 2 ? target : smooth.clock + 0.1 * (target - smooth.clock);
                     smooth.last_picture = at;
@@ -7082,14 +7298,40 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (smooth.before_number + 1 == gpu_frame.number && t < 1 && !gpu_frame.covered) {
-                        between = m3::interpolate(smooth.before, gpu_frame.scene, static_cast<float>(std::max(t, 0.0)),
-                                                  smooth.between);
+                        // (the game's camera blended, the rest as in the newer frame; SPIKEOUT_SMOOTH_GUESS=1:
+                        // the models matched between frames, the old way)
+                        // SPIKEOUT_SMOOTH_CAMERA_ONLY=1: the camera only, every model where it is in the newer frame)
+                        static const bool guess = std::getenv("SPIKEOUT_SMOOTH_GUESS") != nullptr;
+                        const float tf = static_cast<float>(std::max(t, 0.0));
+                        const m3::Real3dScene* between_scene = &smooth.between; // (what's drawn, and where between)
+                        double between_t = t;
+                        if (guess) between = m3::interpolate(smooth.before, gpu_frame.scene, tf, smooth.between);
+                        else if (smooth.matcher) {
+                            // The matching thread's newest pair; blended only if it's these two frames (not yet:
+                            // the newer frame as it is, as at a cut).
+                            smooth.matcher->take(smooth.pair);
+                            const auto blend_at = std::chrono::steady_clock::now();
+                            const SmoothMatcher::Pair* p = smooth.pair.get();
+                            between = p && p->on && p->before == smooth.before_number && p->number == gpu_frame.number &&
+                                      p->version == gpu_frame.version;
+                            if (between) p->blend.draw(tf, smooth.between);
+                            else if (p && p->number == smooth.before_number && p->number + 1 == gpu_frame.number) {
+                                // Its match not ready yet (just after a new frame, so near the frame before): the
+                                // frame before, which the last pair holds whole, rather than a jump to the newer.
+                                between_scene = &p->b;
+                                between_t = 0;
+                                between = true;
+                                ++smooth_log_unmatched;
+                            }
+                            if (smooth_log)
+                                smooth_log_blend += std::chrono::duration<double>(std::chrono::steady_clock::now() - blend_at).count();
+                        }
                         if (between) {
-                            real3d_gpu->render(smooth.between, texture_copy, textures_version);
+                            real3d_gpu->render(*between_scene, texture_copy, textures_version);
                             drawn_number = 0; // the frame itself drawn again when it's shown
                             ++smooth_log_between;
                             // the sky where it was then: now's, back by the rest of the move
-                            const double back = 1 - std::max(t, 0.0);
+                            const double back = 1 - std::max(between_t, 0.0);
                             sky_shift_x = static_cast<float>(back * smooth.move_x);
                             sky_shift_y = static_cast<float>(back * smooth.move_y);
                         }
@@ -7101,6 +7343,7 @@ int main(int argc, char** argv) {
                     drawn_number = gpu_frame.number;
                 }
                 const auto drawn_at = std::chrono::steady_clock::now();
+                lap("3D drawn");
                 const int extend = real3d_gpu->extend();
                 const bool wide = extend > 0 && extend == gpu_frame.extend &&
                                   gpu_frame.bottom_wide.size() == static_cast<std::size_t>(kWidth + 2 * extend) * kHeight;
@@ -7112,6 +7355,16 @@ int main(int argc, char** argv) {
                                               sky_shift_x, sky_shift_y);
                 if (smooth_log && smoothing) {
                     const auto presented_at = std::chrono::steady_clock::now();
+                    lap("presented");
+                    if (presented_at - loop_laps.front().second > std::chrono::milliseconds(100)) {
+                        std::string steps;
+                        for (size_t k = 1; k < loop_laps.size(); ++k)
+                            steps += std::string(k > 1 ? ", " : "") + loop_laps[k].first + " +" +
+                                     std::to_string(static_cast<int>(std::chrono::duration<double, std::milli>(
+                                         loop_laps[k].second - loop_laps[k - 1].second).count())) + " ms";
+                        std::fprintf(smooth_log_file, "smooth motion: a slow pass (frame %llu): %s\n",
+                                     static_cast<unsigned long long>(gpu_frame.number), steps.c_str());
+                    }
                     smooth_log_draw += std::chrono::duration<double>(drawn_at - smooth.last_picture).count();
                     smooth_log_present += std::chrono::duration<double>(presented_at - drawn_at).count();
                 }

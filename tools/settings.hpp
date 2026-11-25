@@ -68,10 +68,11 @@ struct Settings {
     // question; asked again, as the question grew), 2 yes to any problem too (a crash, the start or a game alone standing
     // still; asked at the first start since 2026-11-12)
     int send_reports = -1;
-    // Smooth motion: a picture each refresh of the screen (up to 120 a
-    // second), the 3D placed between the arcade's last two frames, a frame
-    // behind them (m3::interpolate). Off: the arcade's own frames. Still
-    // being tested: not kept in settings.ini, only spikeout --smooth turns it on.
+    // Smooth motion: a picture each refresh of the screen, the 3D placed
+    // between the arcade's last two frames, a frame behind them
+    // (m3::CameraBlend, docs/smooth-motion.md). Off (the default): the
+    // arcade's own frames. The menu's Smooth motion; spikeout --smooth turns
+    // it on for that run.
     bool smooth_motion = false;
     // Speakers (SpeakerSetup in spikeout.cpp): 0 stereo, 1 front and rear on one
     // output of four channels, 2 each pair on an output of its own (by name)
@@ -162,6 +163,7 @@ inline Settings load_settings(const std::string& path) {
     get("picture_shape", s.picture_shape, 0, 4);
     get("antialiasing", s.antialiasing, 1, 4);
     get_bool("quads", s.quads);
+    get_bool("smooth_motion", s.smooth_motion);
     get_bool("gpu_3d", s.gpu_3d);
     get_bool("fullscreen", s.fullscreen);
     get("window_w", s.window_w, 0, 16384);
@@ -211,6 +213,7 @@ inline std::string settings_text(const Settings& s) {
     o << "picture_shape = " << s.picture_shape << "\n";
     o << "antialiasing = " << s.antialiasing << "\n";
     o << "quads = " << (s.quads ? 1 : 0) << "\n";
+    o << "smooth_motion = " << (s.smooth_motion ? 1 : 0) << "\n";
     o << "gpu_3d = " << (s.gpu_3d ? 1 : 0) << "\n";
     o << "fullscreen = " << (s.fullscreen ? 1 : 0) << "\n";
     o << "window_w = " << s.window_w << "\n";

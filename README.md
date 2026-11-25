@@ -437,6 +437,9 @@ Every report helps: most of the network fixes so far came from a game that went 
 - Smarter guessing of the other players' buttons, learnt from real games' presses (fewer corrections, fewer stutters)
 - macOS: signed and notarized apps
 - Smooth motion: pictures made between the game's frames, for high-refresh screens
+- VRR screens (G-Sync, FreeSync): the arcade's own 57.5 frames a second with no picture ever repeated, and with
+  smooth motion an exact multiple of it (115, 230). **Testers wanted:** if you have a VRR screen, please say so in an
+  issue; it can't be checked without one
 - Your own look for your character: outfits, colours, hairstyles and props, seen by the others online (see
   [Understanding the whole game](#understanding-the-whole-game))
 - HD texture packs: the game's textures replaced by sharper ones you make or share (off by default; packs are never

@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace m3 {
@@ -47,6 +48,14 @@ struct Real3dScene {
         // 3D (word 0x20 low byte; 0x24 low byte the scroll attenuation; 0x25
         // bits 16-23 the fog ambient).
         float scroll_fog = 0, scroll_attenuation = 0, fog_ambient = 1;
+        // Smooth motion: the matrix of the first culling node under the
+        // viewport (its camera, on Model 3 games: the world to eye space,
+        // with the eye's axes turned), its index in the matrix table (-1:
+        // none) and that entry's 12 words as stored (translation, then the
+        // rotation's rows), to tell the game's camera by.
+        int camera_index = -1;
+        Mat4 camera;
+        std::array<uint32_t, 12> camera_words{};
     };
 
     // A vertex in eye space (z < 0 in front), with its texture position (in
@@ -109,7 +118,12 @@ struct Real3dScene {
     // viewport's first), as far as kAncestors deep; a model not found in the
     // other frame moves with the one found nearest it in the tree (a wheel
     // with its car).
+    // number: the game's own number for the model, when the game says which
+    // culling node each model of its starts at (set_model_nodes: the nearest
+    // such node above it), else kNoModel; animation: filled by the game's
+    // code (0: none), the same for the models of one animation (a flipbook).
     static constexpr int kAncestors = 24;
+    static constexpr uint32_t kNoModel = 0xFFFFFFFFu;
     struct Model {
         uint32_t address = 0, path = 0;
         uint16_t viewport = 0;
@@ -117,10 +131,63 @@ struct Real3dScene {
         uint32_t first_polygon = 0, polygon_count = 0;
         std::array<uint32_t, kAncestors> ancestors{};
         uint8_t depth = 0; // ancestors in use
+        uint32_t number = kNoModel;
+        uint32_t animation = 0;
     };
     std::vector<Model> models;
     bool block_culled = false; // the Real3D's block culling was on: white, no scene
     bool fog_over_nothing = false; // scroll fog with no polygons too (Supermodel's; background_fog)
+
+    // Smooth motion: the game's camera after the frame the scene was built
+    // from, read from its RAM by the game's own code (games/spikeofe_camera:
+    // nothing set by the builder, cleared by it). view: the camera's matrix
+    // as the game stores it (its viewports' camera_words hold the same
+    // floats); eye, look: where it is and the point it looks at, without the
+    // shake; shake: how far the shake lifted the eye for the view; driver:
+    // what moves it (a change: a cut); shot_timer, shot: a win pose's shots
+    // (a new one: a cut).
+    struct GameCamera {
+        bool known = false;
+        std::array<uint32_t, 12> view{};
+        std::array<float, 3> eye{}, look{}; // without the shake
+        float shake = 0;                    // the shake added to the eye's height (and the look-at's) for the view
+        uint32_t driver = 0;
+        uint16_t shot_timer = 0; // a win pose's shots: kShotOn while one runs
+        uint8_t shot = 0;        // and its index
+        static constexpr uint16_t kShotOn = 640;
+        bool operator==(const GameCamera&) const = default;
+    };
+    // The 3D drawn is usually made with the camera of the same frame, but in
+    // some places (seen after an area change) with the frame before's: both
+    // are kept, and smooth motion takes the one the viewports hold.
+    GameCamera game_camera, game_camera_before;
+    // Smooth motion: where the game put a body down in one jump since the
+    // frame before (made, lifted, respawned, snapped back), in the world, as
+    // its code reads them (games/spikeofe_camera); cleared by the builder.
+    std::vector<std::array<float, 3>> placed;
+    // Smooth motion: the game's bodies (players, enemies) with their bones'
+    // matrices in the world (the game's layout: the turn column by column,
+    // then the place), as read after this scene's frame and after the one
+    // before (the 3D draws bodies a frame late; which one a model was drawn
+    // with is told by comparing); cleared by the builder.
+    static constexpr int kGameBones = 20; // the root, then the 19 drawn
+    struct GameBody {
+        uint8_t slot = 0;
+        std::array<std::array<float, 12>, kGameBones> bones{};
+        bool operator==(const GameBody&) const = default;
+    };
+    std::vector<GameBody> bodies, bodies_before;
+    // The game's effects (sparks, dust, trails: each drawn turned to the camera, games/spikeofe_camera), this read's
+    // and the one before: the record's index (of the game's list), kind, frames left, its place, its own heading (a
+    // 16-bit angle) and how far it's drawn toward the eye (its kind's).
+    struct GameEffect {
+        uint8_t index = 0, kind = 0, left = 0;
+        uint16_t heading = 0;
+        std::array<float, 3> place{};
+        float pull = 0;
+        bool operator==(const GameEffect&) const = default;
+    };
+    std::vector<GameEffect> effects, effects_before;
 
     struct Stats {
         uint32_t viewports = 0, nodes = 0, models = 0, polygons = 0;
@@ -187,11 +254,16 @@ public:
     // Scroll fog drawn when the frame has no polygons too, as Supermodel
     // (Real3dScene::background_fog; --fog-over-nothing).
     void set_fog_over_nothing(bool on) { fog_over_nothing_ = on; }
+    // The culling nodes (24-bit addresses) where the game's models start, and
+    // each one's number (Real3dScene::Model::number); null: none. Must outlive
+    // the builds that use it.
+    void set_model_nodes(const std::unordered_map<uint32_t, uint32_t>* nodes) { model_nodes_ = nodes; }
 
 private:
     struct ModelRef {
         Mat4 matrix;
         uint32_t addr = 0;
+        uint32_t number = Real3dScene::kNoModel;
         uint32_t path = 0; // the culling nodes above it, hashed (Real3dScene::Model)
         std::array<uint32_t, Real3dScene::kAncestors> ancestors{};
         uint8_t depth = 0;
@@ -243,6 +315,8 @@ private:
     std::vector<uint32_t> ancestors_; // path_ at each of them, the viewport's first
     int extend_ = 0; // set_extend
     bool fog_over_nothing_ = false; // set_fog_over_nothing
+    const std::unordered_map<uint32_t, uint32_t>* model_nodes_ = nullptr; // set_model_nodes
+    uint32_t model_number_ = Real3dScene::kNoModel;                       // the nearest above, walking down
     // The viewport's frustum planes (words 0x0C-0x13): left u, v; top u, w;
     // right u, v; bottom u, w.
     std::array<float, 8> planes_{};
