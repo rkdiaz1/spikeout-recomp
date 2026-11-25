@@ -6,7 +6,7 @@
 
 #include <thread>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
 #include <pthread.h>
 
 #include <cstddef>
@@ -19,7 +19,7 @@
 
 namespace tools {
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
 class GameThread {
 public:
     static constexpr std::size_t kStackSize = std::size_t{64} << 20;

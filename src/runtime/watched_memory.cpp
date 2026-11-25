@@ -98,7 +98,7 @@ void os_forget_written(void* base, std::size_t bytes) {
 #include <linux/userfaultfd.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
-#if defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC) && defined(UFFD_FEATURE_WP_UNPOPULATED) && defined(UFFD_USER_MODE_ONLY)
+#if !defined(__ANDROID__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC) && defined(UFFD_FEATURE_WP_UNPOPULATED) && defined(UFFD_USER_MODE_ONLY)
 #define M3_PAGEMAP_SCAN 1
 #endif
 #endif

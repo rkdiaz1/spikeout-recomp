@@ -1998,6 +1998,23 @@ std::string rom_problem(const std::filesystem::path& path) {
     return path_utf8(p.root_path()) + "..." + sep + path_utf8(parts[parts.size() - 2]) + sep + path_utf8(parts.back());
 }
 
+#ifdef __ANDROID__
+// The picker gives a content:// URI, which std::ifstream can't open: copy it into the app's folder.
+std::string android_import(const char* picked) {
+    const std::string uri = picked;
+    if (!uri.starts_with("content://")) return uri;
+    const std::string to = tools::data_folder() + "spikeofe.zip", part = to + ".part";
+    std::size_t size = 0;
+    void* data = SDL_LoadFile(picked, &size);
+    if (!data) return {};
+    const bool ok = SDL_SaveFile(part.c_str(), data, size) && SDL_RenamePath(part.c_str(), to.c_str());
+    SDL_free(data);
+    return ok ? to : std::string();
+}
+#else
+std::string android_import(const char* picked) { return picked; }
+#endif
+
 // The start's screens: the ROM set chosen in the window (no location set yet, or the one set can't be used), "loading"
 // while it's read, the JIT's "preparing the game". One drawing system owns the window for its whole life (issue 16:
 // the window drawn into with SDL's 2D renderer, then handed to the GPU, was refused by Vulkan on some PCs,
@@ -2313,7 +2330,7 @@ private:
     static void SDLCALL picked(void* self, const char* const* files, int) {
         auto* s = static_cast<RomScreen*>(self);
         std::lock_guard guard(s->lock_);
-        s->picked_ = files && files[0] ? std::string(files[0]) : std::string();
+        s->picked_ = files && files[0] ? android_import(files[0]) : std::string();
     }
     std::optional<std::string> take_picked() {
         std::lock_guard guard(lock_);
@@ -4463,7 +4480,7 @@ int main(int argc, char** argv) {
         auto answer = +[](void* u, const char* const* files, int) {
             auto* pick = static_cast<RomPick*>(u);
             std::lock_guard guard(pick->lock);
-            pick->path = files && files[0] ? std::string(files[0]) : std::string();
+            pick->path = files && files[0] ? android_import(files[0]) : std::string();
         };
         static const SDL_DialogFileFilter kZip[] = {{"Zip files", "zip"}, {"All files", "*"}};
         SDL_ShowOpenFileDialog(answer, &rom_pick, window, kZip, 2, nullptr, false);

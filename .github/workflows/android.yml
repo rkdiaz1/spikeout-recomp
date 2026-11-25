@@ -1,0 +1,86 @@
+name: Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [android]
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      LLVM_VERSION: 18.1.8
+      LLVM_SHA256: 0b58557a6d32ceee97c8d533a59b9212d87e0fc4d2833924eb6c611247db2f2a
+      LLVM_PREFIX: ${{ github.workspace }}/.llvm-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          echo "NDK=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: LLVM from the cache
+        id: llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_PREFIX }}
+          key: llvm-android-arm64-api33-${{ env.LLVM_VERSION }}-v1
+      - name: Build LLVM for Android (first run only, slow)
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-project-$LLVM_VERSION.src.tar.xz
+          echo "$LLVM_SHA256  llvm.tar.xz" | sha256sum -c
+          tar -xf llvm.tar.xz
+          cmake -G Ninja -S llvm-project-$LLVM_VERSION.src/llvm -B llvm-build \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-33 -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$LLVM_PREFIX \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 -DLLVM_TARGET_ARCH=AArch64 \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-android33 -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android33 \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_BUILD_TOOLS=OFF -DLLVM_BUILD_UTILS=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF -DLLVM_ENABLE_CURL=OFF -DLLVM_ENABLE_HTTPLIB=OFF
+          cmake --build llvm-build --target install --parallel 4
+      - if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LLVM_PREFIX }}
+          key: ${{ steps.llvm.outputs.cache-primary-key }}
+      - name: Shader tools for the build machine
+        run: |
+          git clone --depth 1 --branch 16.4.0 https://github.com/KhronosGroup/glslang.git /tmp/glslang
+          git clone --depth 1 --branch vulkan-sdk-1.4.350.0 https://github.com/KhronosGroup/SPIRV-Cross.git /tmp/spirv-cross
+          cmake -G Ninja -S /tmp/glslang -B /tmp/glslang/b -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF
+          cmake --build /tmp/glslang/b --target glslang-standalone
+          cmake -G Ninja -S /tmp/spirv-cross -B /tmp/spirv-cross/b -DCMAKE_BUILD_TYPE=Release -DSPIRV_CROSS_ENABLE_TESTS=OFF
+          cmake --build /tmp/spirv-cross/b --target spirv-cross
+      - name: Build the game
+        run: |
+          cmake -G Ninja -S . -B build-android \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-33 -DANDROID_STL=c++_shared \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON -DCMAKE_BUILD_TYPE=Release \
+            -DSPIKEOUT_BUILD_TESTS=OFF -DSPIKEOUT_INTERP=OFF -DSPIKEOUT_LOBBY=OFF \
+            -DSPIKEOUT_LLVM_JIT=ON -DSPIKEOUT_LLVM_SYSTEM=ON -DLLVM_DIR=$LLVM_PREFIX/lib/cmake/llvm \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DSPIKEOUT_HOST_GLSLANG=$(find /tmp/glslang/b -type f -executable -name glslang | head -1) \
+            -DSPIKEOUT_HOST_SPIRV_CROSS=/tmp/spirv-cross/b/spirv-cross
+          cmake --build build-android --target spikeout-jit SDL3-shared --parallel 4
+      - name: Put the libraries and SDL's Java sources into the app
+        run: |
+          app=android/app/src/main
+          mkdir -p $app/jniLibs/arm64-v8a $app/java
+          cp "$(find build-android -name libmain.so | head -1)" "$(find build-android -name libSDL3.so | head -1)" $app/jniLibs/arm64-v8a/
+          cp $NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so $app/jniLibs/arm64-v8a/
+          $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip $app/jniLibs/arm64-v8a/*.so
+          cp -r build-android/_deps/sdl3-src/android-project/app/src/main/java/. $app/java/
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.10.2' }
+      - name: APK
+        run: gradle -p android assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spikeout-android-apk
+          path: android/app/build/outputs/apk/debug/*.apk

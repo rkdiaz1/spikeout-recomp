@@ -13,6 +13,10 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
 endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(ANDROID)
+    # NDK libc++: std::jthread / std::stop_token are behind this switch
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SPIKEOUT_BUILD_TESTS "Build unit tests" ON)
@@ -314,8 +318,13 @@ include(FetchContent)
 if(SPIKEOUT_FRONTEND OR SPIKEOUT_GPU)
     find_package(SDL3 CONFIG QUIET)
     if(NOT SDL3_FOUND)
-        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        if(ANDROID) # SDL's Java side loads libSDL3.so
+            set(SDL_SHARED ON CACHE BOOL "" FORCE)
+            set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+        else()
+            set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        endif()
         set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
         set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
         FetchContent_Declare(SDL3
@@ -382,7 +391,22 @@ if(SPIKEOUT_GPU)
         GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
         GIT_TAG vulkan-sdk-1.4.350.0
         GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(glslang spirv_cross)
+    if(ANDROID)
+        # cross build: these tools run on the build machine, so take host builds of them
+        set(SPIKEOUT_HOST_GLSLANG "" CACHE FILEPATH "Host glslang")
+        set(SPIKEOUT_HOST_SPIRV_CROSS "" CACHE FILEPATH "Host spirv-cross")
+        if(NOT SPIKEOUT_HOST_GLSLANG OR NOT SPIKEOUT_HOST_SPIRV_CROSS)
+            message(FATAL_ERROR "Android: set SPIKEOUT_HOST_GLSLANG and SPIKEOUT_HOST_SPIRV_CROSS")
+        endif()
+        set(glslang_cmd ${SPIKEOUT_HOST_GLSLANG})
+        set(spirv_cross_cmd ${SPIKEOUT_HOST_SPIRV_CROSS})
+        set(shader_tool_deps)
+    else()
+        FetchContent_MakeAvailable(glslang spirv_cross)
+        set(glslang_cmd $<TARGET_FILE:glslang-standalone>)
+        set(spirv_cross_cmd $<TARGET_FILE:spirv-cross>)
+        set(shader_tool_deps glslang-standalone spirv-cross)
+    endif()
 
     set(shader_dir ${CMAKE_SOURCE_DIR}/src/gpu/shaders)
     set(shader_out ${CMAKE_BINARY_DIR}/shaders)
@@ -413,15 +437,15 @@ if(SPIKEOUT_GPU)
         set(cpp ${shader_out}/${name}.cpp)
         add_custom_command(
             OUTPUT ${cpp}
-            COMMAND $<TARGET_FILE:glslang-standalone> -V --target-env vulkan1.0 -I${shader_dir} ${defines}
+            COMMAND ${glslang_cmd} -V --target-env vulkan1.0 -I${shader_dir} ${defines}
                     -o ${spv} ${shader_dir}/${shader}
-            COMMAND $<TARGET_FILE:glslang-standalone> -V --target-env vulkan1.0 -I${shader_dir} ${defines} -DMETAL
+            COMMAND ${glslang_cmd} -V --target-env vulkan1.0 -I${shader_dir} ${defines} -DMETAL
                     -o ${metal_spv} ${shader_dir}/${shader}
-            COMMAND $<TARGET_FILE:spirv-cross> ${metal_spv} --msl --msl-version 20100 --msl-decoration-binding --output ${msl}
+            COMMAND ${spirv_cross_cmd} ${metal_spv} --msl --msl-version 20100 --msl-decoration-binding --output ${msl}
             COMMAND ${CMAKE_COMMAND} -DNAME=${name} -DSPV=${spv} -DMSL=${msl} -DOUT=${cpp}
                     -P ${CMAKE_SOURCE_DIR}/cmake/embed_shader.cmake
             DEPENDS ${shader_dir}/${shader} ${shader_includes} ${CMAKE_SOURCE_DIR}/cmake/embed_shader.cmake
-                    glslang-standalone spirv-cross
+                    ${shader_tool_deps}
             COMMENT "Compiling shader ${name}"
             VERBATIM)
         list(APPEND shader_sources ${cpp})
@@ -642,7 +666,12 @@ if(SPIKEOUT_LLVM_JIT)
     # The window with the JIT: the game translated behind a "preparing the
     # game" screen on its first start, from the ROM set chosen in the window.
     if(SPIKEOUT_FRONTEND)
-        add_executable(spikeout-jit tools/spikeout.cpp)
+        if(ANDROID) # SDLActivity loads libmain.so and calls SDL_main
+            add_library(spikeout-jit SHARED tools/spikeout.cpp)
+            set_target_properties(spikeout-jit PROPERTIES OUTPUT_NAME main)
+        else()
+            add_executable(spikeout-jit tools/spikeout.cpp)
+        endif()
         target_link_libraries(spikeout-jit PRIVATE spikeout_jit m3net m3install SDL3::SDL3 spikeout_warnings)
         spikeout_window_app(spikeout-jit)
         target_compile_definitions(spikeout-jit PRIVATE SPIKEOUT_JIT)
