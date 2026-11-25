@@ -7,6 +7,6 @@
 4. Quando terminar, baixe o artefato `spikeout-android-apk`, instale o APK e escolha o seu `spikeofe.zip`.
 5. Se falhar, envie o log da etapa com erro.
 
-Requisitos: Android 13+, ARM de 64 bits, Vulkan. Primeira fase: um jogador, com controle físico.
-Sem lobby de internet e sem controles por toque.
+Requisitos: Android 13+, ARM de 64 bits, Vulkan. Primeira fase: um jogador.
+Controles por toque (botão TOQUE mostra ou esconde) ou controle físico. Sem lobby de internet.
 Não coloque ROMs no repositório. Licença: GPL-3.0.
