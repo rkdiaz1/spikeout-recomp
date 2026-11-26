@@ -93,6 +93,7 @@ public class LauncherActivity extends Activity {
         } catch (Exception e) {
             out.append("Motivo indisponível: ").append(e).append('\n');
         }
+        appendCrash(out);
         appendLog(out, "spikeout.log");
         return out.toString();
     }
@@ -112,6 +113,23 @@ public class LauncherActivity extends Activity {
                     && lines.add(s)) size += s.length() + 1;
         }
         return String.join("\n", lines) + "\n";
+    }
+
+    /** The game's own newest crash report (crash-<time>.txt): what failed, where, the log's last lines. */
+    private void appendCrash(StringBuilder out) {
+        final File[] files = getFilesDir().listFiles(
+                (dir, n) -> n.startsWith("crash-") && n.endsWith(".txt"));
+        out.append("\n== relatório de erro do jogo ==\n");
+        if (files == null || files.length == 0) { out.append("(nenhum)\n"); return; }
+        File newest = files[0];
+        for (File f : files) if (f.lastModified() > newest.lastModified()) newest = f;
+        try (RandomAccessFile f = new RandomAccessFile(newest, "r")) {
+            final byte[] head = new byte[(int) Math.min(f.length(), 7000)]; // (the cause and stack come first)
+            f.readFully(head);
+            out.append(new String(head, StandardCharsets.UTF_8)).append('\n');
+        } catch (IOException e) {
+            out.append(e).append('\n');
+        }
     }
 
     private void appendLog(StringBuilder out, String name) {
