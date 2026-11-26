@@ -3551,7 +3551,7 @@ int main(int argc, char** argv) {
     // that differs, or none said: tools::StateFile::matches), offered with a warning (the owner's choice).
     const std::string undo_state = shared.saves_dir + "spikeout-undo.state";
     std::chrono::steady_clock::time_point load_armed_until{}, undo_until{};
-    auto check_state = [&](const std::string& path, std::optional<uint64_t>& frame, bool& other) -> std::string {
+    auto check_state_here = [&](const std::string& path, std::optional<uint64_t>& frame, bool& other) -> std::string {
         tools::StateFile f;
         try {
             f = tools::read_state_file(tools::read_file(path));
@@ -3593,6 +3593,23 @@ int main(int argc, char** argv) {
         }
         return {};
     };
+    auto check_state = [&](const std::string& path, std::optional<uint64_t>& frame, bool& other) -> std::string {
+#ifdef __ANDROID__
+        // (the spare board is some 180 KB of stack: more than the window's thread can be trusted with here)
+        std::string why = "NOT ENOUGH MEMORY TO CHECK IT";
+        tools::GameThread checker([&] {
+            try {
+                why = check_state_here(path, frame, other);
+            } catch (const std::exception& e) {
+                std::printf("spikeout: %s can't be checked: %s\n", path.c_str(), e.what());
+            }
+        });
+        checker.join();
+        return why;
+#else
+        return check_state_here(path, frame, other);
+#endif
+    };
     // A save loaded (checked already): the game as it is kept first (F9 goes back to it 5 s), then the reset into it.
     // F10's second press, and the Saves page (once the menu has closed: the game paused under it can't save).
     auto load_save = [&](const std::string& path, const std::string& which) {
@@ -3615,6 +3632,9 @@ int main(int argc, char** argv) {
                     kept ? ")" : "");
     };
     std::string pending_load, pending_load_which; // (the Saves page's choice: loaded once the menu has closed)
+#ifdef __ANDROID__
+    bool pending_save = false; // (the menu's SALVAR touch button: saved once the menu has closed)
+#endif
     // The Saves page's rows (release 6, docs/ROADMAP.md): F9's saves in the saves folder (spikeout-<frame>.state, not the
     // undo's nor a network game's), newest first, each header read once (kept by its time and size).
     struct SaveInfo {
@@ -6093,6 +6113,22 @@ int main(int argc, char** argv) {
                 SDL_SetWindowFullscreen(window, true);
             }
 #endif
+#if defined(__ANDROID__) && defined(SPIKEOUT_GPU)
+            // The touch controls' SALVAR (F9) and CARREGAR (F10), shown with the menu open: the menu takes keys, so
+            // they are read here. Saving needs the game running: the menu closes first.
+            if (menu_ready && menu.is_open() && e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
+                (e.key.scancode == SDL_SCANCODE_F9 || e.key.scancode == SDL_SCANCODE_F10)) {
+                if (e.key.scancode == SDL_SCANCODE_F9) {
+                    menu.close();
+                    pending_save = true;
+                } else if (boards == 1 && !shared.netplay && !shared.direct) {
+                    if (menu.top_name() != "Saves") menu.push(saves_page());
+                } else {
+                    shared.say("SAVE STATES ARE FOR SINGLE-PLAYER GAMES");
+                }
+                continue;
+            }
+#endif
             if (menu_ready && menu.handle_event(e)) continue;
             if (menu_ready && e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
                 SDL_Gamepad* pad = SDL_GetGamepadFromID(e.gbutton.which);
@@ -6337,11 +6373,24 @@ int main(int argc, char** argv) {
                 reset_game(apply_arcade_settings);
             }
             menu_was_open = menu_open;
+#ifdef __ANDROID__
+            SDL_SendAndroidMessage(0x8000, menu_open ? 1 : 0); // (the touch controls change with it: SpikeoutActivity)
+#endif
         }
         // (a save chosen on the Saves page: loaded now the menu has closed and the game runs again)
         if (!pending_load.empty() && !menu_open && !shared.paused) {
             load_save(std::exchange(pending_load, {}), pending_load_which);
         }
+#ifdef __ANDROID__
+        if (pending_save && !menu_open && !shared.paused) { // (as F9, now the menu has closed: its handling below)
+            pending_save = false;
+            undo_until = {}; // (SALVAR always saves: F9 right after a load goes back instead)
+            SDL_Event press{};
+            press.type = SDL_EVENT_KEY_DOWN;
+            press.key.scancode = SDL_SCANCODE_F9;
+            SDL_PushEvent(&press);
+        }
+#endif
 #endif
         const auto now = std::chrono::steady_clock::now();
         read_inputs(shared, focus, settings, player_pads(), now < test_until, now < service_until);

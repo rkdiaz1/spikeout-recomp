@@ -16,6 +16,8 @@ import java.util.Set;
 /**
  * On-screen stick and buttons. They send the game's default keyboard keys:
  * arrows, Z beat, X charge, C jump, V shift, 5 coin, 1 start, Esc menu.
+ * With the game's menu open: a D-pad instead of the stick, OK, back, save (F9) and load (F10).
+ * With a controller connected they go away (but save and load in the menu, which a pad has no button for).
  * Touches outside the controls go on to the game (SDL), so its menus can be tapped.
  */
 public class TouchControls extends View {
@@ -39,8 +41,12 @@ public class TouchControls extends View {
     private final Button menu = new Button("MENU", KeyEvent.KEYCODE_ESCAPE);
     private final Button ok = new Button("OK", KeyEvent.KEYCODE_ENTER);           // the menu: choose
     private final Button back = new Button("VOLTAR", KeyEvent.KEYCODE_DEL);       // the menu: back (Backspace)
-    private final Button[] buttons = {beat, charge, jump, shift, special, combo, coin, start, menu, ok, back};
-    private final Button toggle = new Button("TOQUE"); // shows or hides the rest
+    private final Button save = new Button("SALVAR", KeyEvent.KEYCODE_F9);
+    private final Button load = new Button("CARREGAR", KeyEvent.KEYCODE_F10);
+    private final Button[] playButtons = {beat, charge, jump, shift, special, combo, coin, start, menu};
+    private final Button[] menuButtons = {menu, ok, back, save, load};
+    private final Button[] padMenuButtons = {save, load}; // the menu, with a controller
+    private final Button[] none = {};
     private final Set<Button> pressed = new HashSet<>();
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -48,7 +54,7 @@ public class TouchControls extends View {
     private final SparseIntArray owners = new SparseIntArray(); // pointer id -> STICK or BUTTON
     private static final int STICK = 1, BUTTON = 2;
     private float stickX, stickY, stickR, knobX, knobY;
-    private boolean visible = true;
+    private boolean menuOpen, controller;
 
     public TouchControls(Context context) { super(context); }
 
@@ -68,16 +74,44 @@ public class TouchControls extends View {
         place(shift, w - 55 * u, h - 13 * u, 7.5f * u);
         place(coin, w * 0.5f - 13 * u, h - 7 * u, 5.5f * u);
         place(start, w * 0.5f + 13 * u, h - 7 * u, 5.5f * u);
-        place(menu, w - 24 * u, 8 * u, 5.5f * u);
-        place(toggle, w - 10 * u, 8 * u, 5.5f * u);
-        place(ok, w - 38 * u, 8 * u, 5.5f * u);
-        place(back, w - 52 * u, 8 * u, 5.5f * u);
+        place(menu, w - 10 * u, 8 * u, 5.5f * u);
+        place(ok, w - 16 * u, h - 22 * u, 9 * u);
+        place(back, w - 38 * u, h - 15 * u, 8 * u);
+        place(save, w - 13 * u, h - 52 * u, 8.5f * u);
+        place(load, w - 33 * u, h - 52 * u, 8.5f * u);
+    }
+
+    private Button[] shown() {
+        if (menuOpen) return controller ? padMenuButtons : menuButtons;
+        return controller ? none : playButtons;
+    }
+
+    /** The game's menu opened or closed. */
+    void setMenuOpen(boolean open) {
+        if (open == menuOpen) return;
+        releaseAll();
+        menuOpen = open;
+        invalidate();
+    }
+
+    /** A controller connected, or the last one gone. */
+    void setController(boolean connected) {
+        if (connected == controller) return;
+        releaseAll();
+        controller = connected;
+        invalidate();
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
-        circle(canvas, toggle, false);
-        if (!visible) return;
+        if (!controller) {
+            if (menuOpen) drawDpad(canvas);
+            else drawStick(canvas);
+        }
+        for (Button b : shown()) circle(canvas, b, pressed.contains(b));
+    }
+
+    private void drawStick(Canvas canvas) {
         // the stick: a dark base with a ring and four arrows, a glossy knob
         fill(canvas, stickX, stickY, stickR, 0x55101218);
         ring(canvas, stickX, stickY, stickR, stickR * 0.03f, 0x99FFFFFF);
@@ -95,7 +129,32 @@ public class TouchControls extends View {
         fill(canvas, knobX, knobY, stickR * 0.45f, 0x66000000);
         fill(canvas, knobX, knobY, stickR * 0.40f, 0xBBD8DCE6);
         fill(canvas, knobX - stickR * 0.08f, knobY - stickR * 0.10f, stickR * 0.20f, 0x66FFFFFF);
-        for (Button b : buttons) circle(canvas, b, pressed.contains(b));
+    }
+
+    /** The menu's D-pad: a black cross, each arm with its arrow, lit while held. */
+    private void drawDpad(Canvas canvas) {
+        final float arm = stickR * 0.34f, corner = stickR * 0.08f, edge = stickR * 0.045f;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xD0E8E8F0);
+        canvas.drawRoundRect(new RectF(stickX - stickR - edge, stickY - arm - edge, stickX + stickR + edge, stickY + arm + edge), corner, corner, paint);
+        canvas.drawRoundRect(new RectF(stickX - arm - edge, stickY - stickR - edge, stickX + arm + edge, stickY + stickR + edge), corner, corner, paint);
+        paint.setColor(0xF0181A20);
+        canvas.drawRoundRect(new RectF(stickX - stickR, stickY - arm, stickX + stickR, stickY + arm), corner, corner, paint);
+        canvas.drawRoundRect(new RectF(stickX - arm, stickY - stickR, stickX + arm, stickY + stickR), corner, corner, paint);
+        final int[] keys = {KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_UP};
+        for (int i = 0; i < 4; i++) {
+            final float dx = i == 0 ? 1 : i == 2 ? -1 : 0, dy = i == 1 ? 1 : i == 3 ? -1 : 0;
+            final float tip = stickR * 0.86f, base = stickR * 0.56f, half = stickR * 0.19f;
+            final Path p = new Path();
+            p.moveTo(stickX + dx * tip, stickY + dy * tip);
+            p.lineTo(stickX + dx * base - dy * half, stickY + dy * base + dx * half);
+            p.lineTo(stickX + dx * base + dy * half, stickY + dy * base - dx * half);
+            p.close();
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(held.contains(keys[i]) ? 0xFFFFE03A : 0xFFE8E8F0);
+            canvas.drawPath(p, paint);
+        }
+        fill(canvas, stickX, stickY, arm * 0.45f, 0xFF30333C);
     }
 
     private void fill(Canvas canvas, float x, float y, float r, int color) {
@@ -114,12 +173,13 @@ public class TouchControls extends View {
     private void circle(Canvas canvas, Button b, boolean down) {
         final float r = down ? b.r * 0.93f : b.r;
         if (b.icon == Icon.NONE) {
-            fill(canvas, b.x, b.y, r, down ? 0xAAFFCF3A : 0x66101218);
+            final int base = b == save ? 0xB01F7A4D : b == load ? 0xB0245FA8 : 0x66101218;
+            fill(canvas, b.x, b.y, r, down ? 0xAAFFCF3A : base);
             ring(canvas, b.x, b.y, r, b.r * 0.06f, 0x99FFFFFF);
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(0xEEFFFFFF);
             paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTextSize(b.r * 0.46f);
+            paint.setTextSize(b.r * (b.label.length() > 6 ? 0.34f : 0.46f));
             canvas.drawText(b.label, b.x, b.y + b.r * 0.16f, paint);
             return;
         }
@@ -382,7 +442,7 @@ public class TouchControls extends View {
     private Button buttonAt(float x, float y) {
         Button best = null;
         double nearest = 1.15;
-        for (Button b : buttons) {
+        for (Button b : shown()) {
             final double d = Math.hypot(x - b.x, y - b.y) / b.r;
             if (d <= nearest) { best = b; nearest = d; }
         }
@@ -396,14 +456,8 @@ public class TouchControls extends View {
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
             final float x = e.getX(index), y = e.getY(index);
             final int id = e.getPointerId(index);
-            if (inside(x, y, toggle.x, toggle.y, toggle.r * 1.15f)) {
-                releaseAll();
-                visible = !visible;
-                invalidate();
-                return true;
-            }
-            if (visible && inside(x, y, stickX, stickY, stickR * 1.4f)) owners.put(id, STICK);
-            else if (visible && buttonAt(x, y) != null) owners.put(id, BUTTON);
+            if (!controller && inside(x, y, stickX, stickY, stickR * 1.4f)) owners.put(id, STICK);
+            else if (buttonAt(x, y) != null) owners.put(id, BUTTON);
             else if (action == MotionEvent.ACTION_DOWN) return false;
         }
         // the keys wanted now, from every finger still down
@@ -435,6 +489,11 @@ public class TouchControls extends View {
         final float scale = distance > stickR ? stickR / distance : 1;
         knobX = stickX + dx * scale; knobY = stickY + dy * scale;
         if (distance < stickR * 0.25f) return;
+        if (menuOpen) { // the D-pad: one direction at a time, so a menu's row isn't changed while moving down
+            if (Math.abs(dx) > Math.abs(dy)) wanted.add(dx > 0 ? KeyEvent.KEYCODE_DPAD_RIGHT : KeyEvent.KEYCODE_DPAD_LEFT);
+            else wanted.add(dy > 0 ? KeyEvent.KEYCODE_DPAD_DOWN : KeyEvent.KEYCODE_DPAD_UP);
+            return;
+        }
         final int slice = ((int) Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) + 8) % 8; // 0 right, 2 down
         if (slice == 7 || slice == 0 || slice == 1) wanted.add(KeyEvent.KEYCODE_DPAD_RIGHT);
         if (slice >= 1 && slice <= 3) wanted.add(KeyEvent.KEYCODE_DPAD_DOWN);
