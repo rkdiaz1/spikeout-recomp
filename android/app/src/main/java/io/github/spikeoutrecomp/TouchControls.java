@@ -142,24 +142,24 @@ public class TouchControls extends View {
                 shape(canvas, 18,-13, 24,-30, 28,-16, 42,-22, 33,-7, 45,0, 33,7, 42,22, 28,16, 24,30, 18,13);
                 fist(canvas);
                 break;
-            case KICK: // a boot kicking, its trail behind
-                shape(canvas, -42,2, -17,-2, -27,6, -12,7, -22,15, -40,19, -27,11);
-                canvas.save();
-                canvas.translate(9, -2);
-                canvas.rotate(-28);
-                boot(canvas);
-                canvas.restore();
-                line(canvas, 4, 27,-26, 32,-30); line(canvas, 4, 31,-17, 38,-18);
+            case KICK: // a leg kicking forward, the other standing
+                canvas.translate(-3, 1); // (inside the ring; the outer restore undoes it)
+                canvas.scale(0.88f, 0.88f);
+                shape(canvas, -32,5, -17,11, -21,31, -9,31, -9,39, -33,39);
+                shape(canvas, -33,3, 9,-17, 13,-3, -21,17);
+                kickingFoot(canvas, 20, -12);
+                shape(canvas, 31,-20, 37,-31, 37,-20, 48,-22, 40,-12, 48,-3, 37,-5, 38,6, 31,-3);
                 break;
-            case JUMP: // a boot taking off, streaks under it
+            case JUMP: // up: an arrow over a boot leaving the ground
+                shape(canvas, 0,-43, 19,-23, 8,-23, 8,-11, -8,-11, -8,-23, -19,-23);
                 canvas.save();
-                canvas.translate(2, -11);
-                canvas.rotate(-9);
+                canvas.translate(-2, 10);
+                canvas.scale(0.70f, 0.70f);
+                canvas.rotate(-10);
                 boot(canvas);
                 canvas.restore();
-                shape(canvas, -19,15, -12,15, -17,37);
-                shape(canvas, -4,17, 5,17, -1,43);
-                shape(canvas, 12,14, 19,14, 13,35);
+                line(canvas, 4, -27,37, 27,37);
+                line(canvas, 3, -23,28, -30,23); line(canvas, 3, 25,28, 32,23);
                 break;
             case SHIFT: // a boot stepping to either side
                 canvas.save();
@@ -173,19 +173,19 @@ public class TouchControls extends View {
                 flames(canvas);
                 frontFist(canvas);
                 break;
-            default: // a punch and a kick at once
+            default: // a punch above, a kick below, at once
                 canvas.save();
-                canvas.translate(-6, -17);
+                canvas.translate(-3, -19);
                 canvas.scale(0.68f, 0.68f);
                 fist(canvas);
                 canvas.restore();
+                shape(canvas, -31,21, -1,10, 3,23, -25,32);
                 canvas.save();
-                canvas.translate(7, 18);
-                canvas.scale(0.70f, 0.70f);
-                canvas.rotate(-16);
-                boot(canvas);
+                canvas.translate(9, 14);
+                canvas.scale(0.82f, 0.82f);
+                kickingFoot(canvas, 0, 0);
                 canvas.restore();
-                shape(canvas, 15,-22, 29,-34, 26,-21, 41,-18, 27,-12, 34,0, 20,-8);
+                shape(canvas, 18,-22, 31,-34, 28,-21, 43,-17, 29,-11, 36,0, 22,-8);
                 break;
         }
         canvas.restore();
@@ -234,6 +234,16 @@ public class TouchControls extends View {
         box(canvas, -15,-18, 10,17, 8);                   // the hand
         for (int i = 0; i < 4; i++) box(canvas, 1, -19 + i * 9.4f, 20, -9.6f + i * 9.4f, 4.7f); // the fingers
         box(canvas, -11,3, 9,14, 5.5f);                   // the thumb across them
+    }
+
+    /** The boot of a kick: its sole forward, its toe up. */
+    private void kickingFoot(Canvas canvas, float x, float y) {
+        canvas.save();
+        canvas.translate(x, y);
+        canvas.scale(0.62f, 0.62f);
+        canvas.rotate(-90);
+        boot(canvas);
+        canvas.restore();
     }
 
     /** A boot in profile, its toe to the right. */
