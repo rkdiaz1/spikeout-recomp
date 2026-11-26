@@ -29,6 +29,8 @@ public:
     // shaders we have (Vulkan or Metal). Presents in mailbox mode when the
     // window can (fifo: always plain vsync).
     bool open(SDL_Window* window, bool fifo = false);
+    // The window's swapchain and surface made again (Android: its surface is destroyed while the app is away).
+    bool reclaim();
     // Without a window: drawing only off screen (gamerun).
     bool open_headless();
     ~Device();

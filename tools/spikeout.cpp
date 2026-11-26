@@ -2815,6 +2815,9 @@ int main(int argc, char** argv) {
         SDL_SetWindowIcon(window, icon);
         SDL_DestroySurface(icon);
     }
+#ifdef __ANDROID__
+    settings.fullscreen = true; // (a phone: always, the system's bars hidden)
+#endif
     if (settings.fullscreen && !test_run) SDL_SetWindowFullscreen(window, true);
 
     // Shown through the GPU (Vulkan, Direct3D 12, Metal) when there is one SDL can use, otherwise through SDL's 2D
@@ -6079,6 +6082,14 @@ int main(int argc, char** argv) {
                 default: break;
                 }
             }
+#if defined(__ANDROID__) && defined(SPIKEOUT_GPU)
+            // Back from another app: the surface is a new one, and so must the swapchain be.
+            if (e.type == SDL_EVENT_DID_ENTER_FOREGROUND && gpu_device) {
+                if (gpu_device->reclaim()) std::printf("spikeout: back in the foreground: the window claimed again\n");
+                else std::printf("spikeout: back in the foreground: the window not claimed: %s\n", gpu_device->error().c_str());
+                SDL_SetWindowFullscreen(window, true);
+            }
+#endif
             if (menu_ready && menu.handle_event(e)) continue;
             if (menu_ready && e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
                 SDL_Gamepad* pad = SDL_GetGamepadFromID(e.gbutton.which);

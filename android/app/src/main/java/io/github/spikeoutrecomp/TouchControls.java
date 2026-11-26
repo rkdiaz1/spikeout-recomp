@@ -29,7 +29,9 @@ public class TouchControls extends View {
     private final Button coin = new Button("FICHA", KeyEvent.KEYCODE_5);
     private final Button start = new Button("START", KeyEvent.KEYCODE_1);
     private final Button menu = new Button("MENU", KeyEvent.KEYCODE_ESCAPE);
-    private final Button[] buttons = {beat, charge, jump, shift, coin, start, menu};
+    private final Button ok = new Button("OK", KeyEvent.KEYCODE_ENTER);           // the menu: choose
+    private final Button back = new Button("VOLTAR", KeyEvent.KEYCODE_DEL);       // the menu: back (Backspace)
+    private final Button[] buttons = {beat, charge, jump, shift, coin, start, menu, ok, back};
     private final Button toggle = new Button("TOQUE", 0); // shows or hides the rest
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -58,6 +60,8 @@ public class TouchControls extends View {
         place(start, w * 0.5f + 13 * u, h - 7 * u, 5.5f * u);
         place(menu, w - 24 * u, 8 * u, 5.5f * u);
         place(toggle, w - 10 * u, 8 * u, 5.5f * u);
+        place(ok, w - 38 * u, 8 * u, 5.5f * u);
+        place(back, w - 52 * u, 8 * u, 5.5f * u);
     }
 
     @Override

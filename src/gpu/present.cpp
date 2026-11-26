@@ -57,6 +57,20 @@ bool Device::open(SDL_Window* window, bool fifo) {
     return true;
 }
 
+bool Device::reclaim() {
+    if (!device_ || !window_) return false;
+    SDL_WaitForGPUIdle(device_);
+    SDL_ReleaseWindowFromGPUDevice(device_, window_);
+    if (!SDL_ClaimWindowForGPUDevice(device_, window_)) {
+        error_ = SDL_GetError();
+        return false;
+    }
+    if (mailbox_)
+        mailbox_ = SDL_SetGPUSwapchainParameters(device_, window_, SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                                                 SDL_GPU_PRESENTMODE_MAILBOX);
+    return true;
+}
+
 bool Device::open_headless() {
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { // SDL's GPU wants it, window or not
         error_ = SDL_GetError();
