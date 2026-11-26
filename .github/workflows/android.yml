@@ -77,6 +77,8 @@ jobs:
           cp $NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so $app/jniLibs/arm64-v8a/
           $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip $app/jniLibs/arm64-v8a/*.so
           cp -r build-android/_deps/sdl3-src/android-project/app/src/main/java/. $app/java/
+          # only the Java sources are used: drop SDL's unused Gradle wrapper (setup-gradle rejects its unknown jar)
+          rm -f build-android/_deps/sdl3-src/android-project/gradle/wrapper/gradle-wrapper.jar
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.10.2' }
       - name: APK
