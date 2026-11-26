@@ -1,5 +1,6 @@
 package io.github.spikeoutrecomp;
 
+import android.content.pm.ActivityInfo;
 import android.os.Bundle;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
@@ -25,6 +26,11 @@ public class SpikeoutActivity extends SDLActivity {
         if (bars == null) return;
         bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         bars.hide(WindowInsets.Type.systemBars());
+    }
+
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 
     @Override

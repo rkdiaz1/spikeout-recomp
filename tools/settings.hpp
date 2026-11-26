@@ -46,12 +46,20 @@ constexpr bool valid_pad_input(int code) {
 
 struct Settings {
     // Display
+#ifdef __ANDROID__
+    int render_scale = 2;  // a phone: lighter (the menu can change it)
+#else
     int render_scale = 0;  // the 3D's size: 0 Auto (fits the window), else 1-6 times the arcade's 384 lines
+#endif
     // Picture shape: 0 the arcade's (496 x 384), 1 the window's, 2 16:10, 3 16:9,
     // 4 21:9 (widescreen: the gameplay's 3D wider, the 2D in the middle)
     int picture_shape = 0;
     int antialiasing = 1;  // drawn this many times larger each way and averaged down (1: off)
+#ifdef __ANDROID__
+    bool quads = false;    // a phone: off, a much cheaper pixel shader
+#else
     bool quads = true;     // quads drawn whole (on by default: the owner's choice, 2026-11-05)
+#endif
     bool gpu_3d = true;    // the 3D on the GPU (else in software)
     bool fullscreen = false;
     // The window as it was last left (not fullscreen): its size and place (0 x 0: the first start's, centred; the place

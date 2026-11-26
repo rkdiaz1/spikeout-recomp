@@ -87,6 +87,20 @@ jobs:
           $readelf -d android/app/src/main/jniLibs/arm64-v8a/*.so | grep -E "File:|NEEDED"
           if $readelf -d android/app/src/main/jniLibs/arm64-v8a/*.so | grep -q libc++_shared; then exit 1; fi
           $readelf --dyn-syms android/app/src/main/jniLibs/arm64-v8a/libmain.so | grep -E "SDL_main|__register_frame|_Unwind_|__cxa_throw" || true
+      # the test APK's signing key, kept in this repository's Actions cache: updates install over the app
+      - name: The test signing key
+        id: key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+      - name: Make the key (first time)
+        if: steps.key.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.android
+          rm -f ~/.android/debug.keystore
+          keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.10.2' }
       - name: APK

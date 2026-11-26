@@ -6,9 +6,10 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <application android:label="Spikeout" android:hasCode="true" android:appCategory="game"
+    <application android:label="Spikeout" android:icon="@drawable/ic_launcher" android:hasCode="true" android:appCategory="game"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
-        <activity android:name="io.github.spikeoutrecomp.LauncherActivity" android:exported="true">
+        <activity android:name="io.github.spikeoutrecomp.LauncherActivity" android:exported="true"
+            android:screenOrientation="sensorLandscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
