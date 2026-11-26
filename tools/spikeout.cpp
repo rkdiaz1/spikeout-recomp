@@ -2003,7 +2003,9 @@ std::string rom_problem(const std::filesystem::path& path) {
 std::string android_import(const char* picked) {
     const std::string uri = picked;
     if (!uri.starts_with("content://")) return uri;
-    const std::string to = tools::data_folder() + "spikeofe.zip", part = to + ".part";
+    // (a name of its own until it's found good, android_keep: a wrong file chosen never replaces the app's copy, which
+    // may be the player's only one)
+    const std::string to = tools::data_folder() + "spikeofe-new.zip", part = to + ".part";
     std::size_t size = 0;
     void* data = SDL_LoadFile(picked, &size);
     if (!data) return {};
@@ -2011,8 +2013,15 @@ std::string android_import(const char* picked) {
     SDL_free(data);
     return ok ? to : std::string();
 }
+// A chosen set found good: the new copy takes the place of the app's copy.
+std::filesystem::path android_keep(const std::filesystem::path& good) {
+    if (good.filename() != "spikeofe-new.zip") return good;
+    const std::filesystem::path to = good.parent_path() / "spikeofe.zip";
+    return SDL_RenamePath(good.c_str(), to.c_str()) ? to : good;
+}
 #else
 std::string android_import(const char* picked) { return picked; }
+std::filesystem::path android_keep(const std::filesystem::path& good) { return good; }
 #endif
 
 // The start's screens: the ROM set chosen in the window (no location set yet, or the one set can't be used), "loading"
@@ -2943,7 +2952,7 @@ int main(int argc, char** argv) {
                 SDL_Quit();
                 return 0;
             }
-            rom_path = *picked;
+            rom_path = android_keep(*picked);
         }
         const std::string chosen = path_utf8(rom_path);
         if (!given && chosen != settings.rom_path) { // (one chosen here kept; the command line's never written)
@@ -3634,6 +3643,7 @@ int main(int argc, char** argv) {
     std::string pending_load, pending_load_which; // (the Saves page's choice: loaded once the menu has closed)
 #ifdef __ANDROID__
     bool pending_save = false; // (the menu's SALVAR touch button: saved once the menu has closed)
+    int touch_menu = 0;        // (what the touch controls were last told of the menu)
 #endif
     // The Saves page's rows (release 6, docs/ROADMAP.md): F9's saves in the saves folder (spikeout-<frame>.state, not the
     // undo's nor a network game's), newest first, each header read once (kept by its time and size).
@@ -6304,6 +6314,7 @@ int main(int argc, char** argv) {
                 std::filesystem::path p = utf8_path(*picked);
                 const std::string why = rom_problem(p);
                 if (why.empty()) {
+                    p = android_keep(p);
                     settings.rom_path = path_utf8(p);
                     changed();
                     rom_pick.status = path_utf8(p.filename()) + ", from the next start";
@@ -6373,10 +6384,14 @@ int main(int argc, char** argv) {
                 reset_game(apply_arcade_settings);
             }
             menu_was_open = menu_open;
-#ifdef __ANDROID__
-            SDL_SendAndroidMessage(0x8000, menu_open ? 1 : 0); // (the touch controls change with it: SpikeoutActivity)
-#endif
         }
+#ifdef __ANDROID__
+        // (the touch controls change with the menu, SpikeoutActivity: 0 closed, 1 open, 2 on the Saves page)
+        if (const int shows = !menu_open ? 0 : menu.top_name() == "Saves" ? 2 : 1; shows != touch_menu) {
+            touch_menu = shows;
+            SDL_SendAndroidMessage(0x8000, shows);
+        }
+#endif
         // (a save chosen on the Saves page: loaded now the menu has closed and the game runs again)
         if (!pending_load.empty() && !menu_open && !shared.paused) {
             load_save(std::exchange(pending_load, {}), pending_load_which);

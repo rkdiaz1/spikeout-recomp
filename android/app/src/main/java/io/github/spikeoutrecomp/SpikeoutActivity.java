@@ -11,7 +11,7 @@ import org.libsdl.app.SDLActivity;
 
 /** SDL's activity plus the on-screen controls. */
 public class SpikeoutActivity extends SDLActivity implements InputManager.InputDeviceListener {
-    /** Sent by the game (tools/spikeout.cpp) as its menu opens (1) or closes (0). */
+    /** Sent by the game (tools/spikeout.cpp) as its menu changes: 0 closed, 1 open, 2 on the list of saves. */
     private static final int MESSAGE_MENU = COMMAND_USER;
 
     private TouchControls controls;
@@ -28,7 +28,8 @@ public class SpikeoutActivity extends SDLActivity implements InputManager.InputD
     @Override
     protected boolean onUnhandledMessage(int command, Object param) {
         if (command != MESSAGE_MENU || !(param instanceof Integer)) return false;
-        if (controls != null) controls.setMenuOpen((Integer) param != 0);
+        final int shows = (Integer) param;
+        if (controls != null) controls.setMenu(shows != 0, shows == 2);
         return true;
     }
 

@@ -16,7 +16,8 @@ import java.util.Set;
 /**
  * On-screen stick and buttons. They send the game's default keyboard keys:
  * arrows, Z beat, X charge, C jump, V shift, 5 coin, 1 start, Esc menu.
- * With the game's menu open: a D-pad instead of the stick, OK, back, save (F9) and load (F10).
+ * With the game's menu open: a D-pad instead of the stick, OK, back, save (F9) and load (F10); on its list of
+ * saves, delete too.
  * With a controller connected they go away (but save and load in the menu, which a pad has no button for).
  * Touches outside the controls go on to the game (SDL), so its menus can be tapped.
  */
@@ -43,8 +44,10 @@ public class TouchControls extends View {
     private final Button back = new Button("VOLTAR", KeyEvent.KEYCODE_DEL);       // the menu: back (Backspace)
     private final Button save = new Button("SALVAR", KeyEvent.KEYCODE_F9);
     private final Button load = new Button("CARREGAR", KeyEvent.KEYCODE_F10);
+    private final Button delete = new Button("APAGAR", KeyEvent.KEYCODE_FORWARD_DEL); // the Saves page (Delete)
     private final Button[] playButtons = {beat, charge, jump, shift, special, combo, coin, start, menu};
     private final Button[] menuButtons = {menu, ok, back, save, load};
+    private final Button[] savesButtons = {menu, ok, back, save, load, delete};
     private final Button[] padMenuButtons = {save, load}; // the menu, with a controller
     private final Button[] none = {};
     private final Set<Button> pressed = new HashSet<>();
@@ -54,7 +57,7 @@ public class TouchControls extends View {
     private final SparseIntArray owners = new SparseIntArray(); // pointer id -> STICK or BUTTON
     private static final int STICK = 1, BUTTON = 2;
     private float stickX, stickY, stickR, knobX, knobY;
-    private boolean menuOpen, controller;
+    private boolean menuOpen, savesPage, controller;
 
     public TouchControls(Context context) { super(context); }
 
@@ -79,18 +82,19 @@ public class TouchControls extends View {
         place(back, w - 38 * u, h - 15 * u, 8 * u);
         place(save, w - 13 * u, h - 52 * u, 8.5f * u);
         place(load, w - 33 * u, h - 52 * u, 8.5f * u);
+        place(delete, w - 13 * u, h - 71 * u, 8 * u);
     }
 
     private Button[] shown() {
-        if (menuOpen) return controller ? padMenuButtons : menuButtons;
+        if (menuOpen) return controller ? padMenuButtons : savesPage ? savesButtons : menuButtons; // (a pad deletes with Y)
         return controller ? none : playButtons;
     }
 
-    /** The game's menu opened or closed. */
-    void setMenuOpen(boolean open) {
-        if (open == menuOpen) return;
-        releaseAll();
+    /** The game's menu opened or closed, or went to or from its list of saves. */
+    void setMenu(boolean open, boolean saves) {
+        if (open != menuOpen) releaseAll();
         menuOpen = open;
+        savesPage = saves;
         invalidate();
     }
 
@@ -173,7 +177,7 @@ public class TouchControls extends View {
     private void circle(Canvas canvas, Button b, boolean down) {
         final float r = down ? b.r * 0.93f : b.r;
         if (b.icon == Icon.NONE) {
-            final int base = b == save ? 0xB01F7A4D : b == load ? 0xB0245FA8 : 0x66101218;
+            final int base = b == save ? 0xB01F7A4D : b == load ? 0xB0245FA8 : b == delete ? 0xB0A8242C : 0x66101218;
             fill(canvas, b.x, b.y, r, down ? 0xAAFFCF3A : base);
             ring(canvas, b.x, b.y, r, b.r * 0.06f, 0x99FFFFFF);
             paint.setStyle(Paint.Style.FILL);

@@ -8,5 +8,5 @@
 5. Se falhar, envie o log da etapa com erro.
 
 Requisitos: Android 13+, ARM de 64 bits, Vulkan. Primeira fase: um jogador.
-Controles por toque ou controle físico (com um controle conectado, os de toque somem; abra o menu com Select + Start). No menu: direcional, OK, Voltar, Salvar e Carregar. Sem lobby de internet.
+Controles por toque ou controle físico (com um controle conectado, os de toque somem; abra o menu com Select + Start). No menu: direcional, OK, Voltar, Salvar e Carregar; na lista de saves, Apagar. O app guarda uma cópia própria da ROM: depois que o jogo abrir, o arquivo escolhido pode ser apagado do celular (desinstalar o app ou limpar os dados dele apaga a cópia). Sem lobby de internet.
 Não coloque ROMs no repositório. Licença: GPL-3.0.
