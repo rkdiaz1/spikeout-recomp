@@ -123,15 +123,50 @@ public class TouchControls extends View {
             canvas.drawText(b.label, b.x, b.y + b.r * 0.16f, paint);
             return;
         }
-        final int rgb = b.color & 0x00FFFFFF;
-        fill(canvas, b.x, b.y, r, (down ? 0xE6000000 : 0x80000000) | rgb);
-        fill(canvas, b.x, b.y, r * 0.80f, 0x30000000);
-        ring(canvas, b.x, b.y, r, r * 0.08f, down ? 0xFFFFFFFF : 0xCCFFFFFF);
-        figure(canvas, b.icon, b.x, b.y, r / 50f);
+        // an arcade cabinet's button of the nineties: a black bezel, a domed face, a glint
+        final int rgb = b.color & 0x00FFFFFF, alpha = down ? 0xF2000000 : 0xC8000000;
+        fill(canvas, b.x, b.y, r * 1.06f, 0xC0101014);
+        ring(canvas, b.x, b.y, r * 0.97f, r * 0.05f, down ? 0xFFFFE45C : 0xD0E8E8F0);
+        fill(canvas, b.x, b.y, r * 0.90f, alpha | darker(rgb));
+        fill(canvas, b.x, b.y - r * 0.05f, r * 0.82f, alpha | (down ? lighter(rgb) : rgb));
+        glint(canvas, b.x, b.y - r * 0.05f, r * 0.82f);
+        figure(canvas, b.icon, b.x, b.y - r * 0.03f, r / 62f);
     }
 
-    // The icons: white shapes drawn in a circle of radius 50 around (0, 0), their creases in a dark line.
-    private static final int CREASE = 0xB0101218;
+    private static int darker(int rgb) { return (rgb >> 1) & 0x7F7F7F; }
+
+    private static int lighter(int rgb) { return rgb + ((0xFFFFFF - rgb) >> 2 & 0x3F3F3F); }
+
+    private void glint(Canvas canvas, float x, float y, float r) {
+        final Path p = new Path();
+        p.moveTo(x - r * 0.72f, y - r * 0.34f);
+        p.quadTo(x - r * 0.52f, y - r * 0.92f, x + r * 0.16f, y - r * 0.90f);
+        p.quadTo(x - r * 0.40f, y - r * 0.72f, x - r * 0.72f, y - r * 0.34f);
+        p.close();
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0x80FFFFFF);
+        canvas.drawPath(p, paint);
+    }
+
+    // The icons, drawn as comic stickers in a circle of radius 50 around (0, 0): each piece has a hard
+    // shadow, a thick black outline and a flat colour.
+    private static final int CREASE = 0xE0121014;
+    private static final int INK = 0xFF121014, WHITE = 0xFFFFFFFF, YELLOW = 0xFFFFE03A, RED = 0xFFE8291C,
+            ORANGE = 0xFFFF8A14, SKIN_SHADE = 0xFFBFD0EA;
+    private boolean inking;      // drawing a piece's shadow or outline
+    private int tone = WHITE;    // the piece's colour
+
+    private void sticker(Canvas canvas, int color, Runnable piece) {
+        inking = true;
+        canvas.save();
+        canvas.translate(3.5f, 4.5f);
+        piece.run();
+        canvas.restore();
+        piece.run();
+        inking = false;
+        tone = color;
+        piece.run();
+    }
 
     private void figure(Canvas canvas, Icon icon, float cx, float cy, float s) {
         canvas.save();
@@ -139,53 +174,95 @@ public class TouchControls extends View {
         canvas.scale(s, s);
         switch (icon) {
             case PUNCH: // a fist from the left, hitting
-                shape(canvas, 18,-13, 24,-30, 28,-16, 42,-22, 33,-7, 45,0, 33,7, 42,22, 28,16, 24,30, 18,13);
-                fist(canvas);
+                sticker(canvas, YELLOW, () -> shape(canvas, 6,-17, 17,-39, 22,-19, 44,-27, 31,-8, 47,1,
+                        31,9, 43,28, 22,20, 17,39, 6,17));
+                sticker(canvas, WHITE, () -> {
+                    canvas.save();
+                    canvas.translate(1, 0);
+                    canvas.scale(1.08f, 1.08f);
+                    fist(canvas);
+                    canvas.restore();
+                });
+                sticker(canvas, WHITE, () -> { // speed streaks, pointed behind
+                    shape(canvas, -46,-23, -15,-27, -15,-20); shape(canvas, -44,25, -17,21, -17,28);
+                });
                 break;
-            case KICK: // a leg kicking forward, the other standing
-                canvas.translate(-3, 1); // (inside the ring; the outer restore undoes it)
-                canvas.scale(0.88f, 0.88f);
-                shape(canvas, -32,5, -17,11, -21,31, -9,31, -9,39, -33,39);
-                shape(canvas, -33,3, 9,-17, 13,-3, -21,17);
-                kickingFoot(canvas, 20, -12);
-                shape(canvas, 31,-20, 37,-31, 37,-20, 48,-22, 40,-12, 48,-3, 37,-5, 38,6, 31,-3);
+            case KICK: // a leg kicking up and forward, its sole first
+                sticker(canvas, YELLOW, () -> shape(canvas, 14,-22, 19,-46, 27,-27, 47,-35, 36,-15, 50,-5,
+                        35,-2, 40,17, 24,5));
+                sticker(canvas, WHITE, () -> {
+                    shape(canvas, -42,15, -14,6, 8,-15, 20,0, -4,20, -28,35);
+                    canvas.save();
+                    canvas.translate(15, -10);
+                    canvas.rotate(-122);
+                    canvas.scale(0.78f, 0.78f);
+                    boot(canvas);
+                    canvas.restore();
+                });
+                stroke(canvas, 2.6f, CREASE, -15, 8, -5, 21); // the knee
                 break;
-            case JUMP: // up: an arrow over a boot leaving the ground
-                shape(canvas, 0,-43, 19,-23, 8,-23, 8,-11, -8,-11, -8,-23, -19,-23);
-                canvas.save();
-                canvas.translate(-2, 10);
-                canvas.scale(0.70f, 0.70f);
-                canvas.rotate(-10);
-                boot(canvas);
-                canvas.restore();
-                line(canvas, 4, -27,37, 27,37);
-                line(canvas, 3, -23,28, -30,23); line(canvas, 3, 25,28, 32,23);
+            case JUMP: // a boot springing off the ground, an arrow up
+                sticker(canvas, YELLOW, () -> shape(canvas, 0,-46, 24,-21, 10,-21, 10,-6, -10,-6, -10,-21, -24,-21));
+                sticker(canvas, WHITE, () -> {
+                    canvas.save();
+                    canvas.translate(-2, 10);
+                    canvas.scale(0.76f, 0.76f);
+                    canvas.rotate(-14);
+                    boot(canvas);
+                    canvas.restore();
+                });
+                sticker(canvas, WHITE, () -> { // the dust
+                    dot(canvas, -27, 33, 6); dot(canvas, -17, 35, 4.5f); dot(canvas, 27, 33, 6); dot(canvas, 17, 35, 4.5f);
+                    line(canvas, 4, -9,38, 9,38);
+                });
                 break;
             case SHIFT: // a boot stepping to either side
-                canvas.save();
-                canvas.translate(0, -10);
-                canvas.scale(0.82f, 0.82f);
-                boot(canvas);
-                canvas.restore();
-                shape(canvas, -37,24, -22,13, -22,20, 22,20, 22,13, 37,24, 22,35, 22,28, -22,28, -22,35);
+                sticker(canvas, WHITE, () -> {
+                    canvas.save();
+                    canvas.translate(0, -12);
+                    canvas.scale(0.86f, 0.86f);
+                    boot(canvas);
+                    canvas.restore();
+                });
+                sticker(canvas, YELLOW, () -> shape(canvas, -42,24, -24,10, -24,19, 24,19, 24,10, 42,24,
+                        24,38, 24,29, -24,29, -24,38));
                 break;
             case SPECIAL: // a fist wrapped in flames
-                flames(canvas);
-                frontFist(canvas);
+                sticker(canvas, RED, () -> flames(canvas));
+                sticker(canvas, ORANGE, () -> {
+                    canvas.save();
+                    canvas.translate(0, 6);
+                    canvas.scale(0.72f, 0.72f);
+                    flames(canvas);
+                    canvas.restore();
+                });
+                sticker(canvas, WHITE, () -> {
+                    canvas.save();
+                    canvas.translate(0, 3);
+                    canvas.scale(0.94f, 0.94f);
+                    frontFist(canvas);
+                    canvas.restore();
+                });
                 break;
             default: // a punch above, a kick below, at once
-                canvas.save();
-                canvas.translate(-3, -19);
-                canvas.scale(0.68f, 0.68f);
-                fist(canvas);
-                canvas.restore();
-                shape(canvas, -31,21, -1,10, 3,23, -25,32);
-                canvas.save();
-                canvas.translate(9, 14);
-                canvas.scale(0.82f, 0.82f);
-                kickingFoot(canvas, 0, 0);
-                canvas.restore();
-                shape(canvas, 18,-22, 31,-34, 28,-21, 43,-17, 29,-11, 36,0, 22,-8);
+                sticker(canvas, YELLOW, () -> shape(canvas, 9,-5, 25,-22, 24,-6, 47,-9, 32,3, 48,15,
+                        27,13, 30,30, 13,13));
+                sticker(canvas, WHITE, () -> {
+                    canvas.save();
+                    canvas.translate(-6, -21);
+                    canvas.scale(0.74f, 0.74f);
+                    fist(canvas);
+                    canvas.restore();
+                });
+                sticker(canvas, WHITE, () -> {
+                    shape(canvas, -40,23, -12,11, -3,25, -29,40);
+                    canvas.save();
+                    canvas.translate(7, 17);
+                    canvas.rotate(-102);
+                    canvas.scale(0.58f, 0.58f);
+                    boot(canvas);
+                    canvas.restore();
+                });
                 break;
         }
         canvas.restore();
@@ -196,31 +273,45 @@ public class TouchControls extends View {
         path.moveTo(p[0], p[1]);
         for (int i = 2; i + 1 < p.length; i += 2) path.lineTo(p[i], p[i + 1]);
         path.close();
-        filled(canvas, path, 0xFFFFFFFF);
+        filled(canvas, path);
     }
 
-    private void filled(Canvas canvas, Path path, int color) {
+    private void filled(Canvas canvas, Path path) {
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(color);
+        paint.setColor(inking ? INK : tone);
         canvas.drawPath(path, paint);
+        if (!inking) return;
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        paint.setStrokeWidth(7);
+        canvas.drawPath(path, paint);
+    }
+
+    private void dot(Canvas canvas, float x, float y, float r) {
+        fill(canvas, x, y, inking ? r + 3 : r, inking ? INK : tone);
     }
 
     private void box(Canvas canvas, float left, float top, float right, float bottom, float corner) {
         final RectF r = new RectF(left, top, right, bottom);
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(0xFFFFFFFF);
+        paint.setColor(inking ? INK : tone);
         canvas.drawRoundRect(r, corner, corner, paint);
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(2.6f);
-        paint.setColor(CREASE);
+        paint.setStrokeWidth(inking ? 7 : 2.6f);
+        paint.setColor(inking ? INK : CREASE);
         canvas.drawRoundRect(r, corner, corner, paint);
     }
 
     private void line(Canvas canvas, float width, float x0, float y0, float x1, float y1) {
-        stroke(canvas, width, 0xFFFFFFFF, x0, y0, x1, y1);
+        draw(canvas, inking ? width + 6 : width, inking ? INK : tone, x0, y0, x1, y1);
     }
 
+    /** A crease, drawn only over a piece's colour. */
     private void stroke(Canvas canvas, float width, int color, float x0, float y0, float x1, float y1) {
+        if (!inking) draw(canvas, width, color, x0, y0, x1, y1);
+    }
+
+    private void draw(Canvas canvas, float width, int color, float x0, float y0, float x1, float y1) {
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeCap(Paint.Cap.ROUND);
         paint.setStrokeWidth(width);
@@ -231,19 +322,10 @@ public class TouchControls extends View {
     /** A closed fist seen from the side, its knuckles to the right. */
     private void fist(Canvas canvas) {
         shape(canvas, -34,-10, -13,-13, -13,13, -34,11); // the wrist
+        stroke(canvas, 2.6f, CREASE, -23, -11, -23, 11); // the glove's cuff
         box(canvas, -15,-18, 10,17, 8);                   // the hand
         for (int i = 0; i < 4; i++) box(canvas, 1, -19 + i * 9.4f, 20, -9.6f + i * 9.4f, 4.7f); // the fingers
         box(canvas, -11,3, 9,14, 5.5f);                   // the thumb across them
-    }
-
-    /** The boot of a kick: its sole forward, its toe up. */
-    private void kickingFoot(Canvas canvas, float x, float y) {
-        canvas.save();
-        canvas.translate(x, y);
-        canvas.scale(0.62f, 0.62f);
-        canvas.rotate(-90);
-        boot(canvas);
-        canvas.restore();
     }
 
     /** A boot in profile, its toe to the right. */
@@ -257,31 +339,36 @@ public class TouchControls extends View {
         p.lineTo(-19, 15);
         p.quadTo(-22, 5, -17, -3);
         p.close();
-        filled(canvas, p, 0xFFFFFFFF);
-        stroke(canvas, 3, CREASE, -19, 8, 29, 8);     // the sole
-        stroke(canvas, 2.6f, CREASE, -17, -18, 4, -18); // the top
+        filled(canvas, p);
+        if (inking) return;
+        final int was = tone;
+        tone = SKIN_SHADE; // the sole, in the second tone
+        shape(canvas, -19.5f,8, 29,8, 30,15, -19,15);
+        tone = was;
+        stroke(canvas, 3, CREASE, -19, 8, 29, 8);
+        stroke(canvas, 2.6f, CREASE, -17, -18, 4, -18);
         stroke(canvas, 2.4f, CREASE, -3, -6, 6, -9);    // the laces
         stroke(canvas, 2.4f, CREASE, 0, 0, 10, -3);
     }
 
     private void flames(Canvas canvas) {
         final Path p = new Path();
-        p.moveTo(-21, 22);
-        p.quadTo(-45, 4, -27, -22);
-        p.quadTo(-27, -10, -19, -8);
-        p.quadTo(-24, -28, -4, -43);
-        p.quadTo(-8, -27, 5, -19);
-        p.quadTo(8, -31, 19, -35);
-        p.quadTo(14, -22, 24, -13);
-        p.quadTo(27, -20, 34, -22);
-        p.quadTo(46, 5, 21, 22);
+        p.moveTo(-21, 28);
+        p.quadTo(-46, 8, -31, -22);
+        p.quadTo(-29, -9, -20, -8);
+        p.quadTo(-27, -29, -4, -46);
+        p.quadTo(-9, -28, 6, -19);
+        p.quadTo(8, -33, 21, -38);
+        p.quadTo(15, -23, 25, -13);
+        p.quadTo(28, -21, 35, -24);
+        p.quadTo(47, 7, 21, 28);
         p.close();
-        filled(canvas, p, 0xFFFFFFFF);
+        filled(canvas, p);
     }
 
-    /** A fist coming at the viewer, outlined so that it stands out from the flames. */
+    /** A fist coming at the viewer. */
     private void frontFist(Canvas canvas) {
-        box(canvas, -12,20, 13,37, 4);                   // the wrist
+        box(canvas, -12,20, 13,35, 4);                   // the wrist
         for (int i = 0; i < 4; i++) box(canvas, -22 + i * 11, -9, -11 + i * 11, 15, 5.5f); // the knuckles
         box(canvas, -19,10, 20,27, 8);                   // the palm
         box(canvas, -21,9, 7,21, 6);                     // the thumb
