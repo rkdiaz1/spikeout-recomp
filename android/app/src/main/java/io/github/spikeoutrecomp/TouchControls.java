@@ -3,6 +3,8 @@ package io.github.spikeoutrecomp;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.RectF;
 import android.util.SparseIntArray;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -58,12 +60,12 @@ public class TouchControls extends View {
         final float u = h / 100f; // one percent of the height (landscape)
         stickR = 18 * u; stickX = 34 * u; stickY = h - 28 * u;
         knobX = stickX; knobY = stickY;
-        place(beat, w - 38 * u, h - 22 * u, 10 * u);
-        place(charge, w - 17 * u, h - 28 * u, 10 * u);
-        place(jump, w - 14 * u, h - 52 * u, 9 * u);
-        place(combo, w - 36 * u, h - 46 * u, 9 * u);
-        place(special, w - 58 * u, h - 38 * u, 9 * u);
-        place(shift, w - 60 * u, h - 14 * u, 9 * u);
+        place(beat, w - 36 * u, h - 20 * u, 8.5f * u);
+        place(charge, w - 16 * u, h - 26 * u, 8.5f * u);
+        place(jump, w - 13 * u, h - 47 * u, 7.5f * u);
+        place(combo, w - 33 * u, h - 41 * u, 7.5f * u);
+        place(special, w - 53 * u, h - 34 * u, 7.5f * u);
+        place(shift, w - 55 * u, h - 13 * u, 7.5f * u);
         place(coin, w * 0.5f - 13 * u, h - 7 * u, 5.5f * u);
         place(start, w * 0.5f + 13 * u, h - 7 * u, 5.5f * u);
         place(menu, w - 24 * u, 8 * u, 5.5f * u);
@@ -128,66 +130,151 @@ public class TouchControls extends View {
         figure(canvas, b.icon, b.x, b.y, r / 50f);
     }
 
-    // The figures, in a circle of radius 50 around (0, 0). Each row: a limb as a line of points x,y,x,y...
-    private static final float[][] PUNCH = {{-8,-8, -10,12}, {-10,12, -22,22, -24,35}, {-10,12, 3,21, 7,35},
-            {-8,-6, 10,-9, 30,-10}, {-8,-6, -21,1, -13,-12}};
-    private static final float[][] KICK = {{-14,-10, -8,10}, {-8,10, -13,23, -12,37}, {-8,10, 11,6, 31,-2},
-            {-13,-6, -27,-2, -31,-14}, {-13,-6, 1,1, 8,-9}};
-    private static final float[][] JUMP = {{0,-13, 0,5}, {0,5, -15,9, -12,22}, {0,5, 15,12, 7,23},
-            {0,-9, -15,-12, -23,-27}, {0,-9, 15,-12, 23,-27}};
-    private static final float[][] SHIFT = {{0,-10, 0,9}, {0,9, -9,21, -12,35}, {0,9, 9,21, 12,35},
-            {0,-6, -11,1, -4,-11}, {0,-6, 11,1, 4,-11}};
-    private static final float[][] SPECIAL = {{0,-9, 0,8}, {0,8, -10,18, -17,29}, {0,8, 10,18, 17,29},
-            {0,-5, -14,-8, -21,-18}, {0,-5, 14,-8, 21,-18}};
-    private static final float[][] COMBO = {{-13,-11, -9,10}, {-9,10, -14,23, -13,36}, {-9,10, 9,12, 29,13},
-            {-12,-8, 7,-12, 29,-13}, {-12,-8, -26,-3, -29,-15}};
+    // The icons: white shapes drawn in a circle of radius 50 around (0, 0), their creases in a dark line.
+    private static final int CREASE = 0xB0101218;
 
     private void figure(Canvas canvas, Icon icon, float cx, float cy, float s) {
-        final float[][] limbs;
-        float headX = 0, headY = -24;
+        canvas.save();
+        canvas.translate(cx, cy);
+        canvas.scale(s, s);
         switch (icon) {
-            case PUNCH: limbs = PUNCH; headX = -7; headY = -22; break;
-            case KICK: limbs = KICK; headX = -17; headY = -23; break;
-            case JUMP: limbs = JUMP; headY = -27; break;
-            case SHIFT: limbs = SHIFT; break;
-            case SPECIAL: limbs = SPECIAL; headY = -23; break;
-            default: limbs = COMBO; headX = -15; headY = -24; break;
+            case PUNCH: // a fist from the left, hitting
+                shape(canvas, 18,-13, 24,-30, 28,-16, 42,-22, 33,-7, 45,0, 33,7, 42,22, 28,16, 24,30, 18,13);
+                fist(canvas);
+                break;
+            case KICK: // a boot kicking, its trail behind
+                shape(canvas, -42,2, -17,-2, -27,6, -12,7, -22,15, -40,19, -27,11);
+                canvas.save();
+                canvas.translate(9, -2);
+                canvas.rotate(-28);
+                boot(canvas);
+                canvas.restore();
+                line(canvas, 4, 27,-26, 32,-30); line(canvas, 4, 31,-17, 38,-18);
+                break;
+            case JUMP: // a boot taking off, streaks under it
+                canvas.save();
+                canvas.translate(2, -11);
+                canvas.rotate(-9);
+                boot(canvas);
+                canvas.restore();
+                shape(canvas, -19,15, -12,15, -17,37);
+                shape(canvas, -4,17, 5,17, -1,43);
+                shape(canvas, 12,14, 19,14, 13,35);
+                break;
+            case SHIFT: // a boot stepping to either side
+                canvas.save();
+                canvas.translate(0, -10);
+                canvas.scale(0.82f, 0.82f);
+                boot(canvas);
+                canvas.restore();
+                shape(canvas, -37,24, -22,13, -22,20, 22,20, 22,13, 37,24, 22,35, 22,28, -22,28, -22,35);
+                break;
+            case SPECIAL: // a fist wrapped in flames
+                flames(canvas);
+                frontFist(canvas);
+                break;
+            default: // a punch and a kick at once
+                canvas.save();
+                canvas.translate(-6, -17);
+                canvas.scale(0.68f, 0.68f);
+                fist(canvas);
+                canvas.restore();
+                canvas.save();
+                canvas.translate(7, 18);
+                canvas.scale(0.70f, 0.70f);
+                canvas.rotate(-16);
+                boot(canvas);
+                canvas.restore();
+                shape(canvas, 15,-22, 29,-34, 26,-21, 41,-18, 27,-12, 34,0, 20,-8);
+                break;
         }
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeCap(Paint.Cap.ROUND);
-        paint.setColor(0xFFFFFFFF);
-        paint.setStrokeWidth(7 * s);
-        for (float[] limb : limbs) lines(canvas, cx, cy, s, limb);
-        fill(canvas, cx + headX * s, cy + headY * s, 8 * s, 0xFFFFFFFF);
-        // fists, impact marks, motion lines, arrows, the burst
-        if (icon == Icon.PUNCH) fill(canvas, cx + 30 * s, cy - 10 * s, 6 * s, 0xFFFFFFFF);
-        if (icon == Icon.COMBO) fill(canvas, cx + 29 * s, cy - 13 * s, 5.5f * s, 0xFFFFFFFF);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setColor(0xFFFFFFFF);
-        paint.setStrokeWidth(3 * s);
-        if (icon == Icon.PUNCH) {
-            lines(canvas, cx, cy, s, 38,-20, 43,-25); lines(canvas, cx, cy, s, 40,-10, 46,-10); lines(canvas, cx, cy, s, 38,0, 43,5);
-        } else if (icon == Icon.KICK) {
-            lines(canvas, cx, cy, s, 37,-12, 41,-18); lines(canvas, cx, cy, s, 39,-2, 45,-2); lines(canvas, cx, cy, s, 36,8, 41,13);
-        } else if (icon == Icon.COMBO) {
-            lines(canvas, cx, cy, s, 38,-17, 44,-21); lines(canvas, cx, cy, s, 39,0, 46,0); lines(canvas, cx, cy, s, 38,17, 44,21);
-        } else if (icon == Icon.JUMP) {
-            lines(canvas, cx, cy, s, -14,34, -14,40); lines(canvas, cx, cy, s, 0,31, 0,41); lines(canvas, cx, cy, s, 14,34, 14,40);
-        } else if (icon == Icon.SHIFT) {
-            lines(canvas, cx, cy, s, -29,2, -39,12, -29,22); lines(canvas, cx, cy, s, 29,2, 39,12, 29,22);
-        } else if (icon == Icon.SPECIAL) {
-            for (int i = 0; i < 8; i++) {
-                final double a = Math.PI / 8 + i * Math.PI / 4;
-                final float ax = (float) Math.cos(a), ay = (float) Math.sin(a);
-                lines(canvas, cx, cy, s, ax * 34, ay * 34, ax * 44, ay * 44);
-            }
-        }
+        canvas.restore();
     }
 
-    private void lines(Canvas canvas, float cx, float cy, float s, float... p) {
+    private void shape(Canvas canvas, float... p) {
+        final Path path = new Path();
+        path.moveTo(p[0], p[1]);
+        for (int i = 2; i + 1 < p.length; i += 2) path.lineTo(p[i], p[i + 1]);
+        path.close();
+        filled(canvas, path, 0xFFFFFFFF);
+    }
+
+    private void filled(Canvas canvas, Path path, int color) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(color);
+        canvas.drawPath(path, paint);
+    }
+
+    private void box(Canvas canvas, float left, float top, float right, float bottom, float corner) {
+        final RectF r = new RectF(left, top, right, bottom);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xFFFFFFFF);
+        canvas.drawRoundRect(r, corner, corner, paint);
         paint.setStyle(Paint.Style.STROKE);
-        for (int i = 0; i + 3 < p.length; i += 2)
-            canvas.drawLine(cx + p[i] * s, cy + p[i + 1] * s, cx + p[i + 2] * s, cy + p[i + 3] * s, paint);
+        paint.setStrokeWidth(2.6f);
+        paint.setColor(CREASE);
+        canvas.drawRoundRect(r, corner, corner, paint);
+    }
+
+    private void line(Canvas canvas, float width, float x0, float y0, float x1, float y1) {
+        stroke(canvas, width, 0xFFFFFFFF, x0, y0, x1, y1);
+    }
+
+    private void stroke(Canvas canvas, float width, int color, float x0, float y0, float x1, float y1) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeWidth(width);
+        paint.setColor(color);
+        canvas.drawLine(x0, y0, x1, y1, paint);
+    }
+
+    /** A closed fist seen from the side, its knuckles to the right. */
+    private void fist(Canvas canvas) {
+        shape(canvas, -34,-10, -13,-13, -13,13, -34,11); // the wrist
+        box(canvas, -15,-18, 10,17, 8);                   // the hand
+        for (int i = 0; i < 4; i++) box(canvas, 1, -19 + i * 9.4f, 20, -9.6f + i * 9.4f, 4.7f); // the fingers
+        box(canvas, -11,3, 9,14, 5.5f);                   // the thumb across them
+    }
+
+    /** A boot in profile, its toe to the right. */
+    private void boot(Canvas canvas) {
+        final Path p = new Path();
+        p.moveTo(-18, -26);
+        p.lineTo(4, -26);
+        p.lineTo(5, -6);
+        p.quadTo(9, 0, 22, 2);
+        p.quadTo(31, 5, 30, 15);
+        p.lineTo(-19, 15);
+        p.quadTo(-22, 5, -17, -3);
+        p.close();
+        filled(canvas, p, 0xFFFFFFFF);
+        stroke(canvas, 3, CREASE, -19, 8, 29, 8);     // the sole
+        stroke(canvas, 2.6f, CREASE, -17, -18, 4, -18); // the top
+        stroke(canvas, 2.4f, CREASE, -3, -6, 6, -9);    // the laces
+        stroke(canvas, 2.4f, CREASE, 0, 0, 10, -3);
+    }
+
+    private void flames(Canvas canvas) {
+        final Path p = new Path();
+        p.moveTo(-21, 22);
+        p.quadTo(-45, 4, -27, -22);
+        p.quadTo(-27, -10, -19, -8);
+        p.quadTo(-24, -28, -4, -43);
+        p.quadTo(-8, -27, 5, -19);
+        p.quadTo(8, -31, 19, -35);
+        p.quadTo(14, -22, 24, -13);
+        p.quadTo(27, -20, 34, -22);
+        p.quadTo(46, 5, 21, 22);
+        p.close();
+        filled(canvas, p, 0xFFFFFFFF);
+    }
+
+    /** A fist coming at the viewer, outlined so that it stands out from the flames. */
+    private void frontFist(Canvas canvas) {
+        box(canvas, -12,20, 13,37, 4);                   // the wrist
+        for (int i = 0; i < 4; i++) box(canvas, -22 + i * 11, -9, -11 + i * 11, 15, 5.5f); // the knuckles
+        box(canvas, -19,10, 20,27, 8);                   // the palm
+        box(canvas, -21,9, 7,21, 6);                     // the thumb
     }
 
     private static boolean inside(float x, float y, float cx, float cy, float r) {

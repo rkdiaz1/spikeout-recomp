@@ -3091,6 +3091,9 @@ int main(int argc, char** argv) {
     shared.quads = settings.quads;
     shared.midi_burst = midi_burst;
     shared.dma_instant = dma_instant;
+#ifdef __ANDROID__
+    sleep_pacing = true; // a phone: sleep through most of the wait between frames (a busy wait heats it)
+#endif
     shared.sleep_pacing = sleep_pacing;
     std::unique_ptr<Sound> sound;
     auto speaker_setup = [&] { return SpeakerSetup{settings.speakers, settings.front_output, settings.rear_output}; };
