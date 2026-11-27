@@ -4,15 +4,20 @@ import android.content.pm.ActivityInfo;
 import android.hardware.input.InputManager;
 import android.os.Bundle;
 import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import org.libsdl.app.SDLActivity;
 
 /** SDL's activity plus the on-screen controls. */
 public class SpikeoutActivity extends SDLActivity implements InputManager.InputDeviceListener {
     /** Sent by the game (tools/spikeout.cpp) as its menu changes: 0 closed, 1 open, 2 on the list of saves. */
     private static final int MESSAGE_MENU = COMMAND_USER;
+
+    /** The game menu's "Touch buttons": the editor of their places and sizes. */
+    private static final int MESSAGE_EDIT_CONTROLS = COMMAND_USER + 1;
 
     private TouchControls controls;
 
@@ -27,10 +32,24 @@ public class SpikeoutActivity extends SDLActivity implements InputManager.InputD
 
     @Override
     protected boolean onUnhandledMessage(int command, Object param) {
+        if (command == MESSAGE_EDIT_CONTROLS) {
+            if (controls != null) controls.startEditing();
+            return true;
+        }
         if (command != MESSAGE_MENU || !(param instanceof Integer)) return false;
         final int shows = (Integer) param;
         if (controls != null) controls.setMenu(shows != 0, shows == 2);
         return true;
+    }
+
+    /**
+     * Asks for the screen at 60 Hz: the game makes 57.5 pictures a second, and a 120 Hz screen showing them
+     * only takes more power (and heat). The system may keep its own rate.
+     */
+    private void askFor60Hz() {
+        final WindowManager.LayoutParams window = getWindow().getAttributes();
+        window.preferredRefreshRate = 60;
+        getWindow().setAttributes(window);
     }
 
     /** The touch controls go away while a real controller (USB or Bluetooth) is connected. */
@@ -47,6 +66,22 @@ public class SpikeoutActivity extends SDLActivity implements InputManager.InputD
     @Override public void onInputDeviceAdded(int id) { lookForControllers(); }
     @Override public void onInputDeviceRemoved(int id) { lookForControllers(); }
     @Override public void onInputDeviceChanged(int id) { lookForControllers(); }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && controls != null && controls.isEditing()) {
+            if (event.getAction() == KeyEvent.ACTION_UP) controls.stopEditing(); // the back gesture: done
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // The game closed (its menu's Quit): its process ends too, so the next start is a fresh one.
+        if (isFinishing()) android.os.Process.killProcess(android.os.Process.myPid());
+    }
 
     /** The system's bars hidden (swipe from an edge to show them for a moment). */
     private void hideSystemBars() {
@@ -65,6 +100,7 @@ public class SpikeoutActivity extends SDLActivity implements InputManager.InputD
     protected void onResume() {
         super.onResume();
         hideSystemBars();
+        askFor60Hz();
         final InputManager inputs = getSystemService(InputManager.class);
         inputs.registerInputDeviceListener(this, null);
         lookForControllers(); // (one may have come or gone while the game was away)

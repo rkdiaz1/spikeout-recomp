@@ -368,6 +368,12 @@ struct Shared {
     bool midi_burst = false;        // Supermodel's MIDI timing
     bool dma_instant = false;       // Real3D DMA done at once (Supermodel, MAME)
     bool sleep_pacing = false;      // board 0 sleeps between frames, not waits busy
+#ifdef __ANDROID__
+    // The app away (minimised, the screen locked): a game alone waits, as under the menu (SDL holds only the window's
+    // thread then; the game ran on unseen, heating the phone). Set as Android says so (watch_background).
+    std::atomic<bool> background{false};
+    std::function<void()> background_beat; // (waiting there isn't a hang)
+#endif
     Sound* sound = nullptr;         // nullptr: muted
 
     // The 3D drawn by the GPU (one board): the game thread leaves each
@@ -1216,8 +1222,14 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         // a hitch. --sleep-pacing sleeps (saves power; sleeping also wakes up
         // to a millisecond or two late, so the last of it is waited out).
         shared.next_due = std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count();
-        if (shared.sleep_pacing && due - now > std::chrono::milliseconds(2))
-            std::this_thread::sleep_until(due - std::chrono::milliseconds(2));
+#ifdef __ANDROID__
+        // (Linux wakes a sleeping thread within a fraction of a millisecond: much less left to wait out busy)
+        constexpr auto kWakeEarly = std::chrono::microseconds(300);
+#else
+        constexpr auto kWakeEarly = std::chrono::microseconds(2000);
+#endif
+        if (shared.sleep_pacing && due - now > kWakeEarly)
+            std::this_thread::sleep_until(due - kWakeEarly);
         while (clock::now() < due) std::this_thread::yield();
         speed.frame_end(timing.frames());
         // (SPIKEOUT_NET_DEBUG: a long wait here said, with the time sync's view: a frame held back)
@@ -1431,7 +1443,16 @@ void run_game(const m3::RomSet& roms, std::size_t index, m3::LinkRing* ring, too
         // shape changed meanwhile: this frame made again for it (its 3D from
         // the Real3D's memory as it is, its 2D's sides from the layers; those
         // the tile generator draws itself come with the next frame).
-        while (shared.paused && !networked && !shared.direct && !shared.quit) { // (network play goes on: the others play)
+        for (;;) {
+#ifdef __ANDROID__
+            if (shared.background && !networked && !shared.direct && !shared.quit) { // (nothing drawn: the app is away)
+                repace = true;
+                if (shared.background_beat) shared.background_beat();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+#endif
+            if (!shared.paused || networked || shared.direct || shared.quit) break; // (network play goes on: the others play)
             repace = true;
             if (shared.gpu_3d && index == shown && shared.extend != built_extend) {
                 build_gpu_frame();
@@ -3104,6 +3125,22 @@ int main(int argc, char** argv) {
     sleep_pacing = true; // a phone: sleep through most of the wait between frames (a busy wait heats it)
 #endif
     shared.sleep_pacing = sleep_pacing;
+#ifdef __ANDROID__
+    shared.background_beat = [&watchdog] { watchdog.beat(); };
+    // (a watch, not the event loop: SDL holds the window's thread as soon as the app is away)
+    const SDL_EventFilter watch_background = [](void* data, SDL_Event* e) {
+        auto& game = *static_cast<Shared*>(data);
+        if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) game.background = true;
+        else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) game.background = false;
+        return true;
+    };
+    SDL_AddEventWatch(watch_background, &shared);
+    struct Unwatch {
+        SDL_EventFilter watch;
+        Shared* game;
+        ~Unwatch() { SDL_RemoveEventWatch(watch, game); }
+    } unwatch{watch_background, &shared};
+#endif
     std::unique_ptr<Sound> sound;
     auto speaker_setup = [&] { return SpeakerSetup{settings.speakers, settings.front_output, settings.rear_output}; };
     start_step("setting up the sound");
@@ -5857,7 +5894,24 @@ int main(int argc, char** argv) {
         p.items.push_back({"Display", "Render scale, antialiasing, quads, the 3D renderer, CRT colours, screen filter, fullscreen.", {}, {},
                            [&] { menu.push(display_page()); }});
         p.items.push_back({"Sound", "The volumes, and the speakers: stereo, or the cabinet's front and rear apart.", {}, {}, [&] { menu.push(sound_page()); }});
+#ifdef __ANDROID__
+        // Android: the touch buttons' places and sizes, edited on the screen itself (SpikeoutActivity, message
+        // 0x8001); with a pad connected, its buttons too.
+        const auto edit_touch = [] { SDL_SendAndroidMessage(0x8001, 0); };
+        if (gamepads.empty())
+            p.items.push_back({"Controls", "Move and resize the touch buttons.", {}, {}, edit_touch});
+        else
+            p.items.push_back({"Controls", "The touch buttons, or your pad's.", {}, {}, [&, edit_touch] {
+                                   ui::MenuPage c{"Touch or pad", "", {}};
+                                   c.items.push_back({"Touch buttons", "Move and resize them.", {}, {}, edit_touch});
+                                   c.items.push_back({"Pad buttons", "What your pad's buttons do.", {}, {},
+                                                      [&] { menu.push(controls_page(0)); }});
+                                   c.items.push_back(back_item());
+                                   menu.push(c);
+                               }});
+#else
         p.items.push_back({"Controls", "Your keys or pad buttons.", {}, {}, [&] { menu.push(controls_page(0)); }});
+#endif
         if (!(netgame && netgame->running)) // (not in a network game: the same for everyone)
             p.items.push_back({"Game", "Reset, the arcade's test menu, a service credit.", {}, {}, [&] { menu.push(game_page()); }});
         p.items.push_back({"Quit", "Saves the settings and closes the game.", {}, {}, [&] {
@@ -5990,7 +6044,12 @@ int main(int argc, char** argv) {
                 constexpr int64_t kReadLead = 1'500'000; // ns
                 const int64_t wait = due - kReadLead - now;
                 if (wait > 0 && wait < 25'000'000) {
+#ifdef __ANDROID__
+                    // (one sleep: SDL's precise delay wakes every millisecond on the way, keeping the CPU from resting)
+                    SDL_DelayNS(static_cast<Uint64>(wait));
+#else
                     SDL_DelayPrecise(static_cast<Uint64>(wait));
+#endif
                     SDL_PumpEvents();
                     const auto at = std::chrono::steady_clock::now();
                     read_inputs(shared, focus, settings, player_pads(), at < test_until, at < service_until);

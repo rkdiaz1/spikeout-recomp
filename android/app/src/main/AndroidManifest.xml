@@ -8,16 +8,17 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <application android:label="Spikeout" android:icon="@drawable/ic_launcher" android:hasCode="true" android:appCategory="game"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
-        <activity android:name="io.github.spikeoutrecomp.LauncherActivity" android:exported="true"
-            android:screenOrientation="sensorLandscape">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
         <activity android:name="io.github.spikeoutrecomp.SpikeoutActivity" android:exported="false"
             android:process=":game"
             android:screenOrientation="sensorLandscape" android:launchMode="singleTask"
             android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+        <!-- The app's icon opens the game at once. (The name the icon had in earlier builds: shortcuts stay.) -->
+        <activity-alias android:name="io.github.spikeoutrecomp.LauncherActivity" android:exported="true"
+            android:targetActivity="io.github.spikeoutrecomp.SpikeoutActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

@@ -6,7 +6,7 @@ android {
         applicationId 'io.github.spikeoutrecomp.android'
         minSdk 33          // execinfo's backtrace() in bionic
         targetSdk 35
-        versionCode 11
+        versionCode 12
         versionName '0.1-android-test'
         ndk { abiFilters 'arm64-v8a' }
     }

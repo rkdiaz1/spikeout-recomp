@@ -1,6 +1,8 @@
 package io.github.spikeoutrecomp;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -10,7 +12,9 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import org.libsdl.app.SDLActivity;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -20,12 +24,19 @@ import java.util.Set;
  * saves, delete too.
  * With a controller connected they go away (but save and load in the menu, which a pad has no button for).
  * Touches outside the controls go on to the game (SDL), so its menus can be tapped.
+ * The game menu's "Touch buttons" opens the editor: the play controls dragged, resized and made see-through, kept
+ * between starts.
+ * To spare the battery each button is drawn once into a picture, and the screen again only when something shows.
  */
 public class TouchControls extends View {
     private enum Icon { NONE, PUNCH, KICK, JUMP, SHIFT, SPECIAL, COMBO }
 
     private static final class Button {
         final String label; final Icon icon; final int color; final int[] keys; float x, y, r;
+        String id;                  // the name its place is kept under (null: not movable)
+        float homeX, homeY, homeR;  // its default place
+        Bitmap up, down;            // its pictures, drawn when first wanted, at the size artR
+        float artR;
         Button(String label, int... keys) { this.label = label; this.icon = Icon.NONE; this.color = 0xFFFFFFFF; this.keys = keys; }
         Button(Icon icon, int color, int... keys) { this.label = ""; this.icon = icon; this.color = color; this.keys = keys; }
     }
@@ -59,16 +70,84 @@ public class TouchControls extends View {
     private float stickX, stickY, stickR, knobX, knobY;
     private boolean menuOpen, savesPage, controller;
 
-    public TouchControls(Context context) { super(context); }
+    // The player's layout: for a moved or resized control, its centre (fractions of the screen) and its size
+    // (times the default). Used in play and in the editor; the menu's controls stay where they are.
+    private final Button lever = new Button("");
+    private final Button[] movable = {lever, beat, charge, jump, shift, special, combo, coin, start, menu};
+    private final Map<String, float[]> custom = new HashMap<>();
+    private SharedPreferences store;
+    private int width, height;
 
-    private static void place(Button b, float x, float y, float r) { b.x = x; b.y = y; b.r = r; }
+    // How solid the play controls are: 1 as designed, down to 1 - MAX_CLEAR (the editor's bar).
+    private static final float MAX_CLEAR = 0.8f;
+    private static final int DPAD_ALPHA = 0x78; // the menu's D-pad, over the menu: see-through
+    private float opacity = 1, fade = 1;        // fade: applied to the colours being drawn
+    private final Paint art = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private String shownState = "";
+
+    // the editor
+    private RectF clearBar;
+    private float trackLeft, trackRight;
+    private int sliderId = -1;
+    private static final float MIN_SCALE = 0.6f, MAX_SCALE = 1.8f;
+    private final String[] tools = {"\u2212", "+", "PADR\u00C3O", "PRONTO"};
+    private final RectF[] toolBoxes = new RectF[4];
+    private float toolsLeft, toolsTop, toolsRight, toolsBottom;
+    private boolean editing;
+    private Button selected;
+    private int dragId = -1, pinchId = -1;
+    private float grabX, grabY, pinchDistance, pinchScale;
+
+    public TouchControls(Context context) {
+        super(context);
+        final String[] ids = {"stick", "beat", "charge", "jump", "shift", "special", "combo", "coin", "start", "menu"};
+        for (int i = 0; i < movable.length; i++) movable[i].id = ids[i];
+        if (context == null) return;
+        store = context.getSharedPreferences("touch_layout", Context.MODE_PRIVATE);
+        opacity = clamp(store.getFloat("opacity", 1), 1 - MAX_CLEAR, 1);
+        for (String id : ids) {
+            if (store.contains(id + ".x"))
+                custom.put(id, new float[] {store.getFloat(id + ".x", 0.5f), store.getFloat(id + ".y", 0.5f),
+                        store.getFloat(id + ".size", 1)});
+        }
+    }
+
+    private static void place(Button b, float x, float y, float r) { b.homeX = x; b.homeY = y; b.homeR = r; }
+
+    private static float clamp(float v, float low, float high) { return Math.max(low, Math.min(high, v)); }
+
+    /** Every control put where it belongs now. */
+    private void applyLayout() {
+        final Button[] all = {lever, beat, charge, jump, shift, special, combo, coin, start, menu, ok, back, save, load, delete};
+        for (Button b : all) {
+            final float[] own = (editing || !menuOpen) && b.id != null ? custom.get(b.id) : null;
+            b.r = own == null ? b.homeR : b.homeR * own[2];
+            b.x = own == null ? b.homeX : clamp(own[0] * width, b.r, width - b.r);
+            b.y = own == null ? b.homeY : clamp(own[1] * height, b.r, height - b.r);
+        }
+        stickX = lever.x; stickY = lever.y; stickR = lever.r;
+        knobX = stickX; knobY = stickY;
+    }
 
     @Override
     protected void onSizeChanged(int w, int h, int oldW, int oldH) {
         releaseAll();
+        width = w; height = h;
         final float u = h / 100f; // one percent of the height (landscape)
-        stickR = 18 * u; stickX = 34 * u; stickY = h - 28 * u;
-        knobX = stickX; knobY = stickY;
+        place(lever, 34 * u, h - 28 * u, 18 * u);
+        // the editor's row of tools, in the upper middle, clear of the default controls
+        final float[] wide = {14 * u, 14 * u, 30 * u, 30 * u};
+        toolsTop = 19 * u; toolsBottom = 31 * u;
+        toolsLeft = (w - (88 * u + 3 * 3 * u)) / 2;
+        float at = toolsLeft;
+        for (int i = 0; i < 4; i++) {
+            toolBoxes[i] = new RectF(at, toolsTop, at + wide[i], toolsBottom);
+            at += wide[i] + 3 * u;
+        }
+        toolsRight = at - 3 * u;
+        // under them, the transparency's bar
+        clearBar = new RectF(toolsLeft, 34 * u, toolsRight, 45 * u);
+        trackLeft = toolsLeft + 47 * u; trackRight = toolsRight - 6 * u;
         place(beat, w - 36 * u, h - 20 * u, 8.5f * u);
         place(charge, w - 16 * u, h - 26 * u, 8.5f * u);
         place(jump, w - 13 * u, h - 47 * u, 7.5f * u);
@@ -83,19 +162,210 @@ public class TouchControls extends View {
         place(save, w - 13 * u, h - 52 * u, 8.5f * u);
         place(load, w - 33 * u, h - 52 * u, 8.5f * u);
         place(delete, w - 13 * u, h - 71 * u, 8 * u);
+        applyLayout();
+        send(new HashSet<>());
     }
 
     private Button[] shown() {
+        if (editing) return playButtons;
         if (menuOpen) return controller ? padMenuButtons : savesPage ? savesButtons : menuButtons; // (a pad deletes with Y)
         return controller ? none : playButtons;
     }
 
     /** The game's menu opened or closed, or went to or from its list of saves. */
     void setMenu(boolean open, boolean saves) {
-        if (open != menuOpen) releaseAll();
+        if (!open && editing) stopEditing(); // (the menu closed under the editor)
+        final boolean changed = open != menuOpen;
+        if (changed) releaseAll();
         menuOpen = open;
         savesPage = saves;
+        if (changed) applyLayout();
         invalidate();
+    }
+
+    boolean isEditing() { return editing; }
+
+    /** The editor, over the game's menu. */
+    void startEditing() {
+        releaseAll();
+        editing = true;
+        selected = null;
+        dragId = pinchId = sliderId = -1;
+        applyLayout();
+        invalidate();
+    }
+
+    void stopEditing() {
+        editing = false;
+        selected = null;
+        dragId = pinchId = sliderId = -1;
+        saveLayout();
+        applyLayout();
+        invalidate();
+    }
+
+    private void saveLayout() {
+        if (store == null) return;
+        final SharedPreferences.Editor e = store.edit();
+        e.clear();
+        e.putFloat("opacity", opacity);
+        for (Map.Entry<String, float[]> c : custom.entrySet()) {
+            e.putFloat(c.getKey() + ".x", c.getValue()[0]);
+            e.putFloat(c.getKey() + ".y", c.getValue()[1]);
+            e.putFloat(c.getKey() + ".size", c.getValue()[2]);
+        }
+        e.apply();
+    }
+
+    /** A control moved to (x, y) at this size: kept on the screen and out from under the tools. */
+    private void move(Button b, float x, float y, float scale) {
+        scale = clamp(scale, MIN_SCALE, MAX_SCALE);
+        final float r = b.homeR * scale, margin = height * 0.03f;
+        x = clamp(x, r, width - r);
+        y = clamp(y, r, height - r);
+        if (x > toolsLeft - margin && x < toolsRight + margin && y > toolsTop - margin && y < clearBar.bottom + margin)
+            y = clearBar.bottom + margin;
+        custom.put(b.id, new float[] {x / width, y / height, scale});
+        applyLayout();
+    }
+
+    private float scaleOf(Button b) { return b.r / b.homeR; }
+
+    /** The control under the finger in the editor: the one whose centre is nearest, for its size. */
+    private Button movableAt(float x, float y) {
+        Button best = null;
+        double nearest = 1.2;
+        for (Button b : movable) {
+            final double d = Math.hypot(x - b.x, y - b.y) / b.r;
+            if (d <= nearest) { best = b; nearest = d; }
+        }
+        return best;
+    }
+
+    /** One finger drags a control; the tools or a second finger (a pinch) resize it. */
+    private void edit(MotionEvent e) {
+        final int action = e.getActionMasked(), index = e.getActionIndex();
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+            final float x = e.getX(index), y = e.getY(index);
+            if (sliderId >= 0) return;
+            if (dragId < 0 && clearBar.contains(x, y)) {
+                sliderId = e.getPointerId(index);
+                slide(x);
+                return;
+            }
+            if (dragId >= 0) { // a second finger: pinch the dragged control
+                if (pinchId >= 0) return;
+                for (int i = 0; i < e.getPointerCount(); i++) {
+                    if (e.getPointerId(i) != dragId) continue;
+                    pinchId = e.getPointerId(index);
+                    pinchDistance = (float) Math.max(1, Math.hypot(x - e.getX(i), y - e.getY(i)));
+                    pinchScale = scaleOf(selected);
+                }
+                return;
+            }
+            for (int i = 0; i < 4; i++) {
+                if (!toolBoxes[i].contains(x, y)) continue;
+                if (i == 3) { stopEditing(); return; }
+                if (i == 2) { custom.clear(); opacity = 1; selected = null; applyLayout(); }
+                else if (selected != null) move(selected, selected.x, selected.y, scaleOf(selected) + (i == 0 ? -0.1f : 0.1f));
+                saveLayout();
+                invalidate();
+                return;
+            }
+            final Button hit = movableAt(x, y);
+            if (hit != null) {
+                selected = hit;
+                dragId = e.getPointerId(index);
+                grabX = hit.x - x; grabY = hit.y - y;
+                invalidate();
+            }
+            return;
+        }
+        if (action == MotionEvent.ACTION_MOVE && sliderId >= 0) {
+            for (int i = 0; i < e.getPointerCount(); i++)
+                if (e.getPointerId(i) == sliderId) slide(e.getX(i));
+            return;
+        }
+        if (action == MotionEvent.ACTION_MOVE && dragId >= 0) {
+            int first = -1, second = -1;
+            for (int i = 0; i < e.getPointerCount(); i++) {
+                if (e.getPointerId(i) == dragId) first = i;
+                if (e.getPointerId(i) == pinchId) second = i;
+            }
+            if (first < 0) return;
+            if (second >= 0) {
+                final double d = Math.hypot(e.getX(second) - e.getX(first), e.getY(second) - e.getY(first));
+                move(selected, selected.x, selected.y, (float) (pinchScale * d / pinchDistance));
+            } else if (pinchId < 0) {
+                move(selected, e.getX(first) + grabX, e.getY(first) + grabY, scaleOf(selected));
+            }
+            invalidate();
+            return;
+        }
+        final boolean cancelled = action == MotionEvent.ACTION_CANCEL;
+        if (cancelled || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+            final int id = e.getPointerId(index);
+            if (cancelled || id == sliderId) {
+                sliderId = -1;
+                saveLayout();
+            }
+            if (cancelled || id == dragId || id == pinchId) { // (after a pinch, lift and touch again to drag)
+                dragId = pinchId = -1;
+                saveLayout();
+            }
+        }
+    }
+
+    /** The finger at x on the transparency's bar. */
+    private void slide(float x) {
+        final float clear = clamp((x - trackLeft) / (trackRight - trackLeft), 0, 1) * MAX_CLEAR;
+        opacity = 1 - Math.round(clear * 20) / 20f; // (steps of five percent)
+        invalidate();
+    }
+
+    private void drawClearBar(Canvas canvas) {
+        final float u = height / 100f, middle = (clearBar.top + clearBar.bottom) / 2;
+        final float at = trackLeft + (1 - opacity) / MAX_CLEAR * (trackRight - trackLeft);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xFF2C2F38);
+        canvas.drawRoundRect(clearBar, 2.5f * u, 2.5f * u, paint);
+        paint.setColor(0xFFFFFFFF);
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setTextSize(3.8f * u);
+        canvas.drawText("Transpar\u00EAncia: " + Math.round((1 - opacity) * 100) + "%", clearBar.left + 22 * u, middle + 1.4f * u, paint);
+        paint.setColor(0xFF6A7080);
+        canvas.drawRoundRect(new RectF(trackLeft, middle - u, trackRight, middle + u), u, u, paint);
+        paint.setColor(0xFFFFE03A);
+        canvas.drawRoundRect(new RectF(trackLeft, middle - u, at, middle + u), u, u, paint);
+        fill(canvas, at, middle, 3.6f * u, 0xFFFFE03A);
+    }
+
+    private void drawEditor(Canvas canvas) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xB8101218);
+        canvas.drawRect(0, 0, width, height, paint);
+        fade = opacity;
+        drawStick(canvas);
+        fade = 1;
+        for (Button b : playButtons) button(canvas, b, false, opacity);
+        drawClearBar(canvas);
+        if (selected != null) ring(canvas, selected.x, selected.y, selected.r * 1.16f, height * 0.008f, 0xFFFFE03A);
+        final float u = height / 100f;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setColor(0xFFFFFFFF);
+        paint.setTextSize(3.8f * u);
+        canvas.drawText("Arraste um bot\u00E3o para mover.", width / 2f, 8 * u, paint);
+        canvas.drawText("Toque nele e use \u2212 e + (ou pin\u00E7a) para mudar o tamanho.", width / 2f, 14 * u, paint);
+        for (int i = 0; i < 4; i++) {
+            final RectF box = toolBoxes[i];
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(i == 3 ? 0xFF1F7A4D : i == 2 ? 0xFFA8242C : selected == null ? 0xFF2C2F38 : 0xFF3C4250);
+            canvas.drawRoundRect(box, 2.5f * u, 2.5f * u, paint);
+            paint.setColor(i < 2 && selected == null ? 0x70FFFFFF : 0xFFFFFFFF);
+            paint.setTextSize((i < 2 ? 8 : 4.6f) * u);
+            canvas.drawText(tools[i], (box.left + box.right) / 2, (box.top + box.bottom) / 2 + (i < 2 ? 2.8f : 1.7f) * u, paint);
+        }
     }
 
     /** A controller connected, or the last one gone. */
@@ -108,18 +378,47 @@ public class TouchControls extends View {
 
     @Override
     protected void onDraw(Canvas canvas) {
+        if (editing) { drawEditor(canvas); return; }
         if (!controller) {
-            if (menuOpen) drawDpad(canvas);
-            else drawStick(canvas);
+            if (menuOpen) {
+                canvas.saveLayerAlpha(new RectF(stickX - stickR * 1.1f, stickY - stickR * 1.1f,
+                        stickX + stickR * 1.1f, stickY + stickR * 1.1f), DPAD_ALPHA);
+                drawDpad(canvas);
+                canvas.restore();
+            } else {
+                fade = opacity;
+                drawStick(canvas);
+                fade = 1;
+            }
         }
-        for (Button b : shown()) circle(canvas, b, pressed.contains(b));
+        for (Button b : shown()) button(canvas, b, pressed.contains(b), menuOpen ? 1 : opacity);
+    }
+
+    /** A button's picture put on the screen (drawn the first time, or after its size changes). */
+    private void button(Canvas canvas, Button b, boolean down, float solid) {
+        if (b.artR != b.r) {
+            b.up = b.down = null;
+            b.artR = b.r;
+        }
+        final int half = (int) Math.ceil(b.r * 1.2f);
+        Bitmap picture = down ? b.down : b.up;
+        if (picture == null) {
+            picture = Bitmap.createBitmap(2 * half, 2 * half, Bitmap.Config.ARGB_8888);
+            final Canvas into = new Canvas(picture);
+            into.translate(half - b.x, half - b.y);
+            circle(into, b, down);
+            if (down) b.down = picture;
+            else b.up = picture;
+        }
+        art.setAlpha(Math.round(255 * solid));
+        canvas.drawBitmap(picture, b.x - half, b.y - half, art);
     }
 
     private void drawStick(Canvas canvas) {
         // the stick: a dark base with a ring and four arrows, a glossy knob
         fill(canvas, stickX, stickY, stickR, 0x55101218);
         ring(canvas, stickX, stickY, stickR, stickR * 0.03f, 0x99FFFFFF);
-        paint.setColor(0x99FFFFFF);
+        paint.setColor(faded(0x99FFFFFF));
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeCap(Paint.Cap.ROUND);
         paint.setStrokeWidth(stickR * 0.05f);
@@ -161,16 +460,18 @@ public class TouchControls extends View {
         fill(canvas, stickX, stickY, arm * 0.45f, 0xFF30333C);
     }
 
+    private int faded(int color) { return (Math.round((color >>> 24) * fade) << 24) | (color & 0x00FFFFFF); }
+
     private void fill(Canvas canvas, float x, float y, float r, int color) {
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(color);
+        paint.setColor(faded(color));
         canvas.drawCircle(x, y, r, paint);
     }
 
     private void ring(Canvas canvas, float x, float y, float r, float width, int color) {
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(width);
-        paint.setColor(color);
+        paint.setColor(faded(color));
         canvas.drawCircle(x, y, r, paint);
     }
 
@@ -237,19 +538,17 @@ public class TouchControls extends View {
         canvas.translate(cx, cy);
         canvas.scale(s, s);
         switch (icon) {
-            case PUNCH: // a fist from the left, hitting
-                sticker(canvas, YELLOW, () -> shape(canvas, 6,-17, 17,-39, 22,-19, 44,-27, 31,-8, 47,1,
-                        31,9, 43,28, 22,20, 17,39, 6,17));
-                sticker(canvas, WHITE, () -> {
-                    canvas.save();
-                    canvas.translate(1, 0);
-                    canvas.scale(1.08f, 1.08f);
-                    fist(canvas);
-                    canvas.restore();
-                });
-                sticker(canvas, WHITE, () -> { // speed streaks, pointed behind
-                    shape(canvas, -46,-23, -15,-27, -15,-20); shape(canvas, -44,25, -17,21, -17,28);
-                });
+            case PUNCH: // a fist thrown at the viewer: four knuckles leading, the thumb tucked behind
+                sticker(canvas, YELLOW, () -> shape(canvas, 14,-48, 20,-33, 31,-40, 30,-27, 49,-31, 36,-17, 49,-11, 36,-5, 50,10, 30,5, 31,18, 20,11, 14,28, 8,11, -2,18, -2,5, -17,7, -8,-5, -20,-11, -8,-17, -18,-30, -2,-27, -3,-40, 8,-33));
+                canvas.save();
+                canvas.translate(-4, 4);
+                canvas.scale(0.92f, 0.92f);
+                sticker(canvas, WHITE, () -> punchThumb(canvas));
+                sticker(canvas, WHITE, () -> punchHand(canvas));
+                stroke(canvas, 4.2f, INK, -8, -13, -21, 21); // between the fingers
+                stroke(canvas, 4.2f, INK, 8, -8, -6, 27);
+                stroke(canvas, 4.2f, INK, 23, -1, 9, 29);
+                canvas.restore();
                 break;
             case KICK: // a leg kicking up and forward, its sole first
                 sticker(canvas, YELLOW, () -> shape(canvas, 14,-22, 19,-46, 27,-27, 47,-35, 36,-15, 50,-5,
@@ -383,6 +682,34 @@ public class TouchControls extends View {
         canvas.drawLine(x0, y0, x1, y1, paint);
     }
 
+    private void punchThumb(Canvas canvas) {
+        final Path p = new Path();
+        p.moveTo(-28, -5);
+        p.quadTo(-41, 12, -40, 25);
+        p.quadTo(-25, 39, -9, 35);
+        p.lineTo(-18, 22);
+        p.close();
+        filled(canvas, p);
+    }
+
+    private void punchHand(Canvas canvas) {
+        final Path p = new Path();
+        p.moveTo(-35, 15);
+        p.lineTo(-21, -24);
+        p.quadTo(-18, -34, -10, -33);
+        p.quadTo(-3, -33, -2, -24);   // the first knuckle
+        p.quadTo(5, -31, 11, -27);
+        p.quadTo(15, -25, 15, -18);   // the second
+        p.quadTo(22, -24, 27, -19);
+        p.quadTo(30, -17, 30, -12);   // the third
+        p.quadTo(42, -12, 40, -1);    // the fourth
+        p.quadTo(36, 17, 24, 30);
+        p.quadTo(10, 36, -6, 31);
+        p.quadTo(-23, 26, -35, 15);
+        p.close();
+        filled(canvas, p);
+    }
+
     /** A closed fist seen from the side, its knuckles to the right. */
     private void fist(Canvas canvas) {
         shape(canvas, -34,-10, -13,-13, -13,13, -34,11); // the wrist
@@ -455,12 +782,15 @@ public class TouchControls extends View {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
+        if (editing) { edit(e); return true; } // (every touch is the editor's)
         final int action = e.getActionMasked(), index = e.getActionIndex();
         if (action == MotionEvent.ACTION_CANCEL) { releaseAll(); return true; }
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
             final float x = e.getX(index), y = e.getY(index);
             final int id = e.getPointerId(index);
-            if (!controller && inside(x, y, stickX, stickY, stickR * 1.4f)) owners.put(id, STICK);
+            final Button under = buttonAt(x, y);
+            final boolean onButton = under != null && inside(x, y, under.x, under.y, under.r); // (one moved by the stick)
+            if (!controller && !onButton && inside(x, y, stickX, stickY, stickR * 1.4f)) owners.put(id, STICK);
             else if (buttonAt(x, y) != null) owners.put(id, BUTTON);
             else if (action == MotionEvent.ACTION_DOWN) return false;
         }
@@ -510,7 +840,17 @@ public class TouchControls extends View {
         for (int key : wanted) if (!held.contains(key)) SDLActivity.onNativeKeyDown(key);
         held.clear();
         held.addAll(wanted);
-        invalidate();
+        // The screen again only when what shows has changed (a finger resting sends moves up to 240 times a second;
+        // the stick's knob is redrawn each time it has gone a little way).
+        final float step = Math.max(1, stickR * 0.04f);
+        final StringBuilder state = new StringBuilder().append(held).append(Math.round(knobX / step))
+                .append(',').append(Math.round(knobY / step));
+        for (Button b : shown()) state.append(pressed.contains(b) ? '1' : '0');
+        final String now = state.toString();
+        if (!now.equals(shownState)) {
+            shownState = now;
+            invalidate();
+        }
     }
 
     void releaseAll() {
